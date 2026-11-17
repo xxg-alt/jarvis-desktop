@@ -1,0 +1,226 @@
+/* ============================================================
+   贾维斯 主控胶囊 · 全息玻璃皮肤
+   窗口本身由 DWM 提供平滑圆角, 页面负责质感
+   ============================================================ */
+
+:root {
+  --bg-deep: #070D18;
+  --accent: #2E7F92;
+  --accent-soft: rgba(0, 240, 255, .35);
+  --text-dim: #6FA8C4;
+  --spring: cubic-bezier(.34, 1.56, .64, 1);
+}
+
+body[data-state="IDLE"]       { --accent: #2E7F92; }
+body[data-state="LISTENING"]  { --accent: #00F0FF; }
+body[data-state="THINKING"]   { --accent: #FFB020; }
+body[data-state="ACTING"]     { --accent: #00FFA3; }
+body[data-state="PERCEIVING"] { --accent: #B06CFF; }
+body[data-state="GUARD"]      { --accent: #FF3B5C; }
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  width: 100%; height: 100%;
+  background: var(--bg-deep);
+  overflow: hidden;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+/* ── 外壳 ── */
+.shell {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 16px;
+  border-radius: 16px;
+  background:
+    radial-gradient(120% 180% at 0% 0%, rgba(0, 240, 255, .10), transparent 55%),
+    radial-gradient(120% 200% at 100% 120%, rgba(0, 110, 255, .10), transparent 60%),
+    linear-gradient(135deg, rgba(10, 18, 32, .85), rgba(6, 11, 20, .92));
+  border: 1px solid var(--accent-soft);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, .45),
+    0 0 18px -2px color-mix(in srgb, var(--accent) 55%, transparent),
+    0 0 42px -8px color-mix(in srgb, var(--accent) 40%, transparent),
+    inset 0 0 22px -6px color-mix(in srgb, var(--accent) 45%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, .07);
+  transition: box-shadow .45s ease, border-color .45s ease, border-radius .4s var(--spring);
+  overflow: hidden;
+}
+
+/* 顶部高光 */
+.shell::before {
+  content: "";
+  position: absolute; left: 8%; right: 8%; top: 0; height: 1px;
+  background: linear-gradient(90deg, transparent,
+              color-mix(in srgb, var(--accent) 70%, transparent), transparent);
+  opacity: .85;
+}
+
+/* 扫光 */
+.sweep {
+  position: absolute; top: 0; bottom: 0; width: 38%;
+  background: linear-gradient(90deg, transparent,
+              color-mix(in srgb, var(--accent) 14%, transparent), transparent);
+  transform: skewX(-18deg);
+  animation: sweep 3.6s linear infinite;
+  pointer-events: none;
+}
+@keyframes sweep {
+  0%   { left: -45%; }
+  100% { left: 115%; }
+}
+
+.edge-glow {
+  position: absolute; inset: 0;
+  background: radial-gradient(60% 100% at 50% 50%,
+              color-mix(in srgb, var(--accent) 10%, transparent), transparent 70%);
+  pointer-events: none;
+  transition: background .45s ease;
+}
+
+/* ── 核心画布 ── */
+.core-wrap {
+  flex: 0 0 auto;
+  width: 56px; height: 56px;
+  display: grid; place-items: center;
+  transition: width .4s var(--spring), height .4s var(--spring);
+}
+#core {
+  width: 56px; height: 56px;
+  display: block;
+  transition: transform .4s var(--spring);
+}
+
+/* ── 文案 ── */
+.meta {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; justify-content: center;
+  transition: opacity .28s ease;
+}
+.row { display: flex; align-items: center; gap: 8px; }
+.title {
+  font-size: 16px; font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--accent);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--accent) 75%, transparent);
+  transition: color .35s ease, text-shadow .35s ease;
+}
+.tag {
+  font-family: Consolas, monospace;
+  font-size: 9px; letter-spacing: 1px;
+  color: color-mix(in srgb, var(--accent) 80%, #ffffff 20%);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 3px;
+  padding: 1px 5px;
+  opacity: .8;
+}
+.sub {
+  margin-top: 4px;
+  font-size: 11px; letter-spacing: .5px;
+  color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ── 电平条 ── */
+.bars {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 3px;
+  height: 34px; padding-right: 4px;
+}
+.bars i {
+  display: block; width: 3px; height: 4px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: .5;
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 60%, transparent);
+  transition: height .09s linear, opacity .2s ease, background .35s ease;
+}
+
+/* ── 确认按钮 ── */
+.guard { display: none; gap: 8px; flex: 0 0 auto; }
+.btn {
+  font-family: inherit; font-size: 12px; font-weight: 700;
+  letter-spacing: 1px;
+  padding: 7px 16px;
+  color: #fff;
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 85%, transparent);
+  clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px);
+  box-shadow: 0 0 14px -3px color-mix(in srgb, var(--accent) 70%, transparent);
+  cursor: pointer;
+  transition: background .2s ease, transform .15s ease, box-shadow .2s ease;
+}
+.btn:hover {
+  background: color-mix(in srgb, var(--accent) 48%, transparent);
+  box-shadow: 0 0 20px -2px var(--accent);
+}
+.btn:active { transform: scale(.95); }
+
+/* ============================================================
+   四形态: 点 / 条 / 卡 / 确认
+   ============================================================ */
+
+/* 待命: 只有核心 */
+body.mode-dot .shell { padding: 0; justify-content: center; border-radius: 50%; }
+body.mode-dot .meta,
+body.mode-dot .bars,
+body.mode-dot .guard { display: none; }
+body.mode-dot .core-wrap { width: 100%; height: 100%; }
+body.mode-dot #core { width: 62px; height: 62px; }
+
+/* 卡片态: 允许两行字幕 */
+body.mode-card .shell { align-items: flex-start; padding: 16px; gap: 14px; }
+body.mode-card .core-wrap { width: 64px; height: 64px; margin-top: 4px; }
+body.mode-card #core { width: 64px; height: 64px; }
+body.mode-card .sub {
+  white-space: normal;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  line-height: 1.5;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8FB9CE;
+}
+
+/* 确认态 */
+body.mode-guard .bars { display: none; }
+body.mode-guard .guard { display: flex; }
+body.mode-guard .shell { align-items: flex-start; padding: 16px; gap: 14px; }
+body.mode-guard .core-wrap { width: 64px; height: 64px; margin-top: 4px; }
+body.mode-guard #core { width: 64px; height: 64px; }
+body.mode-guard .sub {
+  white-space: normal; line-height: 1.5; margin-top: 6px; font-size: 12px; color: #FFC2CC;
+}
+body.mode-guard .guard { position: absolute; right: 16px; bottom: 16px; }
+
+/* GUARD 红脉冲 */
+body[data-state="GUARD"] .shell {
+  animation: alarm 1.4s ease-in-out infinite;
+}
+@keyframes alarm {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0,0,0,.45), 0 0 20px -4px rgba(255,59,92,.45),
+                          inset 0 0 22px -8px rgba(255,59,92,.4); }
+  50%      { box-shadow: 0 0 0 1px rgba(0,0,0,.45), 0 0 34px -4px rgba(255,59,92,.75),
+                          inset 0 0 30px -6px rgba(255,59,92,.6); }
+}
+
+/* 思考: 边框跑马灯 */
+body[data-state="THINKING"] .shell::before {
+  background: linear-gradient(90deg, transparent, #FFB020, transparent);
+  animation: run 1.2s linear infinite;
+}
+@keyframes run {
+  0%   { transform: translateX(-60%); }
+  100% { transform: translateX(160%); }
+}
+
+/* 窗口收起/隐藏时暂停 CSS 扫描线和脉冲，避免后台合成耗电 */
+body.anim-suspended *,
+body.anim-suspended *::before,
+body.anim-suspended *::after {
+  animation-play-state: paused !important;
+}

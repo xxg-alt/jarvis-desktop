@@ -1,0 +1,19 @@
+{
+  "apps": {
+    "steam": "steam.exe",
+    "微信": "WeChat.exe",
+    "网易云音乐": "cloudmusic.exe"
+  },
+  "gemini_model": "gemini-flash-latest",
+  "hotkey": "ctrl+alt+j",
+  "wake_words": [
+    "贾维斯",
+    "星光"
+  ],
+  "robot_voice": 0.7,
+  "always_listen": true,
+  "tts_engine": "edge",
+  "tts_voice": "云扬",
+  "ai_provider": "DeepSeek",
+  "api_key": ""
+}

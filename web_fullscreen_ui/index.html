@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S / AIR COMMAND</title>
+<script>window.__JARVIS_ERRORS__=window.__JARVIS_ERRORS__||[];addEventListener("error",function(e){window.__JARVIS_ERRORS__.push(String((e&&e.message)||"error"));});addEventListener("unhandledrejection",function(e){window.__JARVIS_ERRORS__.push(String((e&&e.reason&&e.reason.message)||(e&&e.reason)||"rejection"));});</script>
+<style id="tw-preflight">
+/*
+1. Prevent padding and border from affecting element width. (https://github.com/mozdevs/cssremedy/issues/4)
+2. Allow adding a border to an element by just adding a border-width. (https://github.com/tailwindcss/tailwindcss/pull/116)
+*/
+
+*,
+::before,
+::after {
+  box-sizing: border-box; /* 1 */
+  border-width: 0; /* 2 */
+  border-style: solid; /* 2 */
+  border-color: currentColor; /* 2 */
+}
+
+::before,
+::after {
+  --tw-content: '';
+}
+
+/*
+1. Use a consistent sensible line-height in all browsers.
+2. Prevent adjustments of font size after orientation changes in iOS.
+3. Use a more readable tab size.
+4. Use the user's configured `sans` font-family by default.
+5. Use the user's configured `sans` font-feature-settings by default.
+6. Use the user's configured `sans` font-variation-settings by default.
+7. Disable tap highlights on iOS
+*/
+
+html,
+:host {
+  line-height: 1.5; /* 1 */
+  -webkit-text-size-adjust: 100%; /* 2 */
+  -moz-tab-size: 4; /* 3 */
+  tab-size: 4; /* 3 */
+  font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji"; /* 4 */
+  font-feature-settings: normal; /* 5 */
+  font-variation-settings: normal; /* 6 */
+  -webkit-tap-highlight-color: transparent; /* 7 */
+}
+
+/*
+1. Remove the margin in all browsers.
+2. Inherit line-height from `html` so users can set them as a class directly on the `html` element.
+*/
+
+body {
+  margin: 0; /* 1 */
+  line-height: inherit; /* 2 */
+}
+
+/*
+1. Add the correct height in Firefox.
+2. Correct the inheritance of border color in Firefox. (https://bugzilla.mozilla.org/show_bug.cgi?id=190655)
+3. Ensure horizontal rules are visible by default.
+*/
+
+hr {
+  height: 0; /* 1 */
+  color: inherit; /* 2 */
+  border-top-width: 1px; /* 3 */
+}
+
+/*
+Add the correct text decoration in Chrome, Edge, and Safari.
+*/
+
+abbr:where([title]) {
+  text-decoration: underline dotted;
+}
+
+/*
+Remove the default font size and weight for headings.
+*/
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+/*
+Reset links to optimize for opt-in styling instead of opt-out.
+*/
+
+a {
+  color: inherit;
+  text-decoration: inherit;
+}
+
+/*
+Add the correct font weight in Edge and Safari.
+*/
+
+b,
+strong {
+  font-weight: bolder;
+}
+
+/*
+1. Use the user's configured `mono` font-family by default.
+2. Use the user's configured `mono` font-feature-settings by default.
+3. Use the user's configured `mono` font-variation-settings by default.
+4. Correct the odd `em` font sizing in all browsers.
+*/
+
+code,
+kbd,
+samp,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; /* 1 */
+  font-feature-settings: normal; /* 2 */
+  font-variation-settings: normal; /* 3 */
+  font-size: 1em; /* 4 */
+}
+
+/*
+Add the correct font size in all browsers.
+*/
+
+small {
+  font-size: 80%;
+}
+
+/*
+Prevent `sub` and `sup` elements from affecting the line height in all browsers.
+*/
+
+sub,
+sup {
+  font-size: 75%;
+  line-height: 0;
+  position: relative;
+  vertical-align: baseline;
+}
+
+sub {
+  bottom: -0.25em;
+}
+
+sup {
+  top: -0.5em;
+}
+
+/*
+1. Remove text indentation from table contents in Chrome and Safari. (https://bugs.chromium.org/p/chromium/issues/detail?id=999088, https://bugs.webkit.org/show_bug.cgi?id=201297)
+2. Correct table border color inheritance in all Chrome and Safari. (https://bugs.chromium.org/p/chromium/issues/detail?id=935729, https://bugs.webkit.org/show_bug.cgi?id=195016)
+3. Remove gaps between table borders by default.
+*/
+
+table {
+  text-indent: 0; /* 1 */
+  border-color: inherit; /* 2 */
+  border-collapse: collapse; /* 3 */
+}
+
+/*
+1. Change the font styles in all browsers.
+2. Remove the margin in Firefox and Safari.
+3. Remove default padding in all browsers.
+*/
+
+button,
+input,
+optgroup,
+select,
+textarea {
+  font-family: inherit; /* 1 */
+  font-feature-settings: inherit; /* 1 */
+  font-variation-settings: inherit; /* 1 */
+  font-size: 100%; /* 1 */
+  font-weight: inherit; /* 1 */
+  line-height: inherit; /* 1 */
+  letter-spacing: inherit; /* 1 */
+  color: inherit; /* 1 */
+  margin: 0; /* 2 */
+  padding: 0; /* 3 */
+}
+
+/*
+Remove the inheritance of text transform in Edge and Firefox.
+*/
+
+button,
+select {
+  text-transform: none;
+}
+
+/*
+1. Correct the inability to style clickable types in iOS and Safari.
+2. Remove default button styles.
+*/
+
+button,
+input:where([type='button']),
+input:where([type='reset']),
+input:where([type='submit']) {
+  -webkit-appearance: button; /* 1 */
+  background-color: transparent; /* 2 */
+  background-image: none; /* 2 */
+}
+
+/*
+Use the modern Firefox focus style for all focusable elements.
+*/
+
+:-moz-focusring {
+  outline: auto;
+}
+
+/*
+Remove the additional `:invalid` styles in Firefox. (https://github.com/mozilla/gecko-dev/blob/2f9eacd9d3d995c937b4251a5557d95d494c9be1/layout/style/res/forms.css#L728-L737)
+*/
+
+:-moz-ui-invalid {
+  box-shadow: none;
+}
+
+/*
+Add the correct vertical alignment in Chrome and Firefox.
+*/
+
+progress {
+  vertical-align: baseline;
+}
+
+/*
+Correct the cursor style of increment and decrement buttons in Safari.
+*/
+
+::-webkit-inner-spin-button,
+::-webkit-outer-spin-button {
+  height: auto;
+}
+
+/*
+1. Correct the odd appearance in Chrome and Safari.
+2. Correct the outline style in Safari.
+*/
+
+[type='search'] {
+  -webkit-appearance: textfield; /* 1 */
+  outline-offset: -2px; /* 2 */
+}
+
+/*
+Remove the inner padding in Chrome and Safari on macOS.
+*/
+
+::-webkit-search-decoration {
+  -webkit-appearance: none;
+}
+
+/*
+1. Correct the inability to style clickable types in iOS and Safari.
+2. Change font properties to `inherit` in Safari.
+*/
+
+::-webkit-file-upload-button {
+  -webkit-appearance: button; /* 1 */
+  font: inherit; /* 2 */
+}
+
+/*
+Add the correct display in Chrome and Safari.
+*/
+
+summary {
+  display: list-item;
+}
+
+/*
+Removes the default spacing and border for appropriate elements.
+*/
+
+blockquote,
+dl,
+dd,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+hr,
+figure,
+p,
+pre {
+  margin: 0;
+}
+
+fieldset {
+  margin: 0;
+  padding: 0;
+}
+
+legend {
+  padding: 0;
+}
+
+ol,
+ul,
+menu {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/*
+Reset default styling for dialogs.
+*/
+dialog {
+  padding: 0;
+}
+
+/*
+Prevent resizing textareas horizontally by default.
+*/
+
+textarea {
+  resize: vertical;
+}
+
+/*
+1. Reset the default placeholder opacity in Firefox. (https://github.com/tailwindlabs/tailwindcss/issues/3300)
+2. Set the default placeholder color to the user's configured gray 400 color.
+*/
+
+input::placeholder,
+textarea::placeholder {
+  opacity: 1; /* 1 */
+  color: #9ca3af; /* 2 */
+}
+
+/*
+Set the default cursor for buttons.
+*/
+
+button,
+[role="button"] {
+  cursor: pointer;
+}
+
+/*
+Make sure disabled buttons don't get the pointer cursor.
+*/
+:disabled {
+  cursor: default;
+}
+
+/*
+1. Make replaced elements `display: block` by default. (https://github.com/mozdevs/cssremedy/issues/14)
+2. Add `vertical-align: middle` to align replaced elements more sensibly by default. (https://github.com/jensimmons/cssremedy/issues/14#issuecomment-634934210)
+   This can trigger a poorly considered lint error in some tools but is included by design.
+*/
+
+img,
+svg,
+video,
+canvas,
+audio,
+iframe,
+embed,
+object {
+  display: block; /* 1 */
+  vertical-align: middle; /* 2 */
+}
+
+/*
+Constrain images and videos to the parent width and preserve their intrinsic aspect ratio. (https://github.com/mozdevs/cssremedy/issues/14)
+*/
+
+img,
+video {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Make elements with the HTML hidden attribute stay hidden by default */
+[hidden]:where(:not([hidden="until-found"])) {
+  display: none;
+}
+
+</style>
+<style>
+:root{--c:0,240,255;--cy:#00f0ff;--vi:#a78bfa;--gr:#5af0c0;--tx:#d8fbff}
+html,body{height:100%;margin:0;overflow:hidden;background:#04090f;color:var(--tx);font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif}
+body{background:radial-gradient(ellipse at 50% 40%,#0a1f2c 0%,#050f17 55%,#02070c 100%)}
+#bg{position:fixed;inset:0;width:100%;height:100%;z-index:0;filter:blur(2.5px) brightness(1.1) saturate(1.1);transform:scale(1.04);will-change:transform}
+#fx{position:fixed;inset:0;z-index:0}
+#stage{position:fixed;inset:0;z-index:2;perspective:1600px;transform-style:preserve-3d;pointer-events:none}
+#rig{position:absolute;inset:0;transform-style:preserve-3d;will-change:transform}
+#rig>*{pointer-events:auto}
+.mono{font-family:"JetBrains Mono","SF Mono",Consolas,monospace}
+/* 光学面板：无实体填充，仅微光渐变 + 描边 + 四角角标 */
+.holo{position:absolute;background:linear-gradient(160deg,rgba(var(--c),.06),rgba(var(--c),.015) 60%,rgba(var(--c),.04));border:1px solid rgba(var(--c),.2);box-shadow:0 0 16px rgba(var(--c),.07),inset 0 0 24px rgba(var(--c),.05);padding:16px 18px}
+.holo::before{content:"";position:absolute;inset:-2px;pointer-events:none;--k:linear-gradient(var(--cy),var(--cy));
+background:var(--k) 0 0/16px 2px no-repeat,var(--k) 0 0/2px 16px no-repeat,var(--k) 100% 0/16px 2px no-repeat,var(--k) 100% 0/2px 16px no-repeat,var(--k) 0 100%/16px 2px no-repeat,var(--k) 0 100%/2px 16px no-repeat,var(--k) 100% 100%/16px 2px no-repeat,var(--k) 100% 100%/2px 16px no-repeat;filter:drop-shadow(0 0 2px var(--cy))}
+.ttl{font-size:15px;letter-spacing:.08em;color:#eaffff;text-shadow:0 0 8px rgba(var(--c),.45);margin-bottom:10px;display:flex;justify-content:space-between;align-items:baseline}
+.ttl small{font-size:11px;color:rgba(var(--c),.7)}
+.fld{width:100%;background:rgba(var(--c),.05);border:1px solid rgba(var(--c),.3);color:var(--tx);padding:7px 9px;font-size:13px;outline:none;min-width:0}
+.fld:focus{border-color:var(--cy);box-shadow:0 0 10px rgba(var(--c),.4)}
+.fld option{background:#06121b}
+.btn{background:rgba(var(--c),.14);border:1px solid rgba(var(--c),.55);color:#eaffff;padding:7px 14px;font-size:13px;cursor:pointer;white-space:nowrap;transition:.15s}
+.btn:hover{background:rgba(var(--c),.3);box-shadow:0 0 14px rgba(var(--c),.6)}
+.btn:focus-visible,.fld:focus-visible,.slot:focus-visible,.tog:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.badge{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--gr)}
+.badge i{width:8px;height:8px;border-radius:50%;background:var(--gr);box-shadow:0 0 8px var(--gr)}
+.badge.off{color:#ff7a8a}.badge.off i{background:#ff5a70;box-shadow:0 0 8px #ff5a70}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.mod,.slot{aspect-ratio:1/.92;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;font-size:12px;cursor:pointer;background:rgba(var(--c),.05);border:1px solid rgba(var(--c),.35);color:var(--tx);transition:.15s;position:relative}
+.mod:hover{background:rgba(var(--c),.18);box-shadow:0 0 14px rgba(var(--c),.45)}
+.mod b{font-size:20px;font-weight:400;color:var(--cy);text-shadow:0 0 8px var(--cy)}
+.slot{border:1px dashed rgba(var(--c),.4);color:rgba(var(--c),.65);background:transparent}
+.slot::before,.slot::after{content:"";position:absolute;width:9px;height:9px;border:2px solid var(--cy);opacity:.8}
+.slot::before{top:-1px;left:-1px;border-right:0;border-bottom:0}.slot::after{bottom:-1px;right:-1px;border-left:0;border-top:0}
+.slot:hover{background:rgba(var(--c),.1);color:#fff}
+.slot b{font-size:24px;font-weight:300}
+.tel{display:flex;align-items:center;gap:14px;margin:12px 0}
+.tel svg{width:56px;height:56px;transform:rotate(-90deg);flex:none}
+.tel circle{fill:none;stroke-width:4}
+.tel .bg{stroke:rgba(255,255,255,.1)}
+.tel .fg{stroke-linecap:round;transition:stroke-dashoffset .8s;filter:drop-shadow(0 0 5px currentColor)}
+.tel .v{position:absolute;top:0;left:0;width:56px;text-align:center;font-size:12px;line-height:56px}
+.tel .n{font-size:17px;letter-spacing:.1em}.tel .s{font-size:11px;color:rgba(var(--c),.65)}
+#log{font-size:11px;line-height:1.65;color:rgba(190,245,255,.85);height:112px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end}
+#log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#log div:last-child{color:#fff;text-shadow:0 0 6px var(--cy)}
+/* 中央 */
+#sub{position:absolute;left:50%;top:38%;transform:translate(-50%,-50%);width:min(760px,56vw);text-align:center;font-size:clamp(20px,2.5vw,36px);font-weight:500;color:#f2ffff;letter-spacing:.04em;line-height:1.4;text-shadow:0 0 10px rgba(var(--c),.55),0 0 26px rgba(var(--c),.3),0 2px 4px #000;pointer-events:none;transition:opacity .3s}
+#togs{position:absolute;left:50%;bottom:14.5%;transform:translateX(-50%);display:flex;gap:14px}
+.tog{background:rgba(var(--c),.06);border:1px solid rgba(var(--c),.5);color:var(--tx);padding:8px 16px;font-size:13px;cursor:pointer;position:relative;box-shadow:0 0 14px rgba(var(--c),.2);transition:.15s;white-space:nowrap}
+.tog:hover{background:rgba(var(--c),.2)}
+.tog em{font-style:normal;margin-left:6px;color:#ff7a8a}
+.tog.on em{color:var(--gr);text-shadow:0 0 8px var(--gr)}
+.tog.on{border-color:var(--cy);box-shadow:0 0 18px rgba(var(--c),.5)}
+#cmd{left:50%;bottom:3.5%;width:min(640px,46vw);transform:translateX(-50%) rotateX(16deg);transform-origin:50% 100%;display:flex;gap:10px;padding:10px 12px}
+#top{position:fixed;z-index:3;left:0;right:0;top:0;display:flex;align-items:center;justify-content:space-between;padding:26px 44px;pointer-events:none}
+.logo{width:56px;height:56px;border-radius:50%;border:1.5px solid var(--cy);display:grid;place-items:center;box-shadow:0 0 20px rgba(var(--c),.5),inset 0 0 14px rgba(var(--c),.3);margin-right:18px}
+#pL{width:25%}#pL.collapsed{width:184px}#pR{width:22%}#pR.collapsed{width:176px}
+.holo.side{transition:width .35s cubic-bezier(.2,.8,.2,1),padding .35s}
+.side .mini{display:none}.side.collapsed{padding:10px 14px}.side.collapsed .full{display:none}.side.collapsed .mini{display:flex}
+.mini{align-items:center;justify-content:space-between;gap:10px;font-size:13px;cursor:pointer;white-space:nowrap}
+.cbtn{display:grid;place-items:center;background:none;border:1px solid rgba(var(--c),.45);color:var(--cy);width:22px;height:22px;line-height:1;cursor:pointer;font-size:15px;flex:none;padding:0}
+.cbtn:hover,.mini:hover .cbtn{background:rgba(var(--c),.25);box-shadow:0 0 10px rgba(var(--c),.5)}
+.ttl,.ttl *{white-space:nowrap}.ttl span:last-child{display:flex;align-items:center;gap:10px}
+body::after{content:'';position:fixed;inset:0;z-index:5;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px),radial-gradient(ellipse at 50% 45%,transparent 45%,rgba(0,0,0,.45) 100%)}
+#grid{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(0,240,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(0,240,255,.045) 1px,transparent 1px);background-size:72px 72px;-webkit-mask-image:radial-gradient(ellipse at 50% 45%,#000 15%,transparent 72%);mask-image:radial-gradient(ellipse at 50% 45%,#000 15%,transparent 72%)}
+.hud{position:fixed;z-index:3;font:11px/1.7 "JetBrains Mono","SF Mono",Consolas,monospace;color:rgba(120,235,245,.5);letter-spacing:.08em;pointer-events:none;animation:bootIn 1s ease-out 3.8s backwards}
+#hudL{left:44px;bottom:26px}#hudR{right:44px;bottom:26px;text-align:right}
+.edge{position:fixed;z-index:3;top:22%;bottom:22%;width:7px;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,240,255,.3) 0 1px,transparent 1px 10px);animation:bootIn 1s ease-out 3.8s backwards}
+#eL{left:14px}#eR{right:14px}
+@media(max-width:900px){.edge,.hud{display:none}}
+@keyframes bootIn{from{opacity:0}to{opacity:1}}
+#top{animation:bootIn 1s ease-out .2s backwards}
+.holo,#togs{animation:bootIn 1s ease-out backwards}
+#pL{animation-delay:2.8s}#pR{animation-delay:3.1s}#togs{animation-delay:3.4s}#cmd{animation-delay:3.7s}
+#togs,#cmd{transition:opacity .6s}
+body.calm #togs,body.calm #cmd{opacity:0;pointer-events:none}
+@media(max-width:900px){.holo.side{display:none}#cmd{width:88vw}#togs{flex-wrap:wrap;width:92vw;justify-content:center}}
+@media(prefers-reduced-motion:reduce){#rig{transition:none}}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="grid"></div>
+<canvas id="fx"></canvas>
+
+<div id="top" class="mono">
+  <div style="display:flex;align-items:center">
+    <div class="logo" style="font-size:15px">A·I</div>
+    <div style="font-size:24px;letter-spacing:.14em"><b style="color:#fff;text-shadow:0 0 12px var(--cy)">J.A.R.V.I.S.</b> <span style="color:rgba(var(--c),.6)">/ AIR COMMAND</span></div>
+  </div>
+  <div style="font-size:17px;letter-spacing:.12em;color:#bff;display:flex;gap:30px;align-items:center">
+    <span><i style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--cy);box-shadow:0 0 10px var(--cy);margin-right:8px"></i><span id="stateTxt">SYSTEM ONLINE</span></span>
+    <span id="clock">--:--:--</span><span>V. 4.2.08</span>
+  </div>
+</div>
+
+<div id="stage"><div id="rig">
+
+  <!-- 左翼 -->
+  <section id="pL" class="holo side" style="left:2.5%;top:15%;transform:rotateY(14deg);transform-origin:0 50%">
+    <div class="mini" tabindex="0" role="button" aria-label="展开 AI 大模型配置"><span class="badge off" id="miniM"><i></i><span>未连接</span></span><span class="cbtn">+</span></div>
+    <div class="full">
+    <div class="ttl"><span>AI 大模型配置</span><button class="cbtn" aria-label="收起">–</button></div>
+    <select id="provider" class="fld" aria-label="服务商">
+      <option>DeepSeek</option><option>OpenAI</option><option>Claude</option><option>通义千问</option><option>Kimi</option>
+    </select>
+    <div style="display:flex;gap:8px;margin:9px 0">
+      <input id="apikey" type="password" class="fld" placeholder="输入 API Key" autocomplete="off">
+      <button id="save" class="btn">保存</button>
+    </div>
+    <span id="mstat" class="badge off"><i></i><span>大模型未连接</span></span>
+    <div class="ttl" style="margin-top:22px">功能模块 <small>可扩展</small></div>
+    <div class="grid3" id="mods">
+      <button class="mod" data-k="voice"><b>◉</b>语音唤醒</button>
+      <button class="mod" data-k="search"><b>⌕</b>联网搜索</button>
+      <button class="slot" data-slot="1"><b>+</b>预留槽位</button>
+      <button class="slot" data-slot="2"><b>+</b>预留槽位</button>
+      <button class="slot" data-slot="3"><b>+</b>预留槽位</button>
+      <button class="slot" data-slot="4"><b>+</b>预留槽位</button>
+    </div>
+    </div>
+  </section>
+
+  <!-- 中央字幕与控制 -->
+  <div id="sub">贾维斯已上线，喊贾维斯就能叫我</div>
+  <div id="togs">
+    <button class="tog on" data-k="vision">视觉感知 <em>[ON]</em></button>
+    <button class="tog" data-k="auto">自动接管 <em>[OFF]</em></button>
+    <button class="tog" data-k="voice-style">声线切换 <em>[A]</em></button>
+    <button class="tog" data-k="shot">快速截屏分析</button>
+  </div>
+  <form id="cmd" class="holo" onsubmit="return false">
+    <input id="cmdin" class="fld" placeholder="向贾维斯下达指令…" autocomplete="off">
+    <button class="btn" id="send">发送</button>
+  </form>
+
+  <!-- 右翼 -->
+  <section id="pR" class="holo side" style="right:2.5%;top:15%;transform:rotateY(-14deg);transform-origin:100% 50%">
+    <div class="mini" tabindex="0" role="button" aria-label="展开系统遥测"><div class="mono" style="display:grid;gap:3px;font-size:12px;line-height:1.3"><span style="color:var(--cy)">CPU <b id="m-cpu" style="color:#fff">0%</b></span><span style="color:var(--vi)">RAM <b id="m-ram" style="color:#fff">0%</b></span><span style="color:var(--gr)">DISK <b id="m-disk" style="color:#fff">0%</b></span></div><span class="cbtn">+</span></div>
+    <div class="full">
+    <div class="ttl"><span>系统遥测</span><span><small class="mono">LIVE · 02</small><button class="cbtn" aria-label="收起">–</button></span></div>
+    <div class="tel" style="color:var(--cy)"><div style="position:relative"><svg viewBox="0 0 44 44"><circle class="bg" cx="22" cy="22" r="18"/><circle class="fg" id="r-cpu" cx="22" cy="22" r="18" stroke="currentColor" stroke-dasharray="113.1" stroke-dashoffset="113.1"/></svg><span class="v mono" id="v-cpu" style="color:#fff">0%</span></div><div><div class="n mono">CPU</div><div class="s mono">PROCESS LOAD</div></div></div>
+    <div class="tel" style="color:var(--vi)"><div style="position:relative"><svg viewBox="0 0 44 44"><circle class="bg" cx="22" cy="22" r="18"/><circle class="fg" id="r-ram" cx="22" cy="22" r="18" stroke="currentColor" stroke-dasharray="113.1" stroke-dashoffset="113.1"/></svg><span class="v mono" id="v-ram" style="color:#fff">0%</span></div><div><div class="n mono" style="color:var(--tx)">RAM</div><div class="s mono">MEMORY USAGE</div></div></div>
+    <div class="tel" style="color:var(--gr)"><div style="position:relative"><svg viewBox="0 0 44 44"><circle class="bg" cx="22" cy="22" r="18"/><circle class="fg" id="r-disk" cx="22" cy="22" r="18" stroke="currentColor" stroke-dasharray="113.1" stroke-dashoffset="113.1"/></svg><span class="v mono" id="v-disk" style="color:#fff">0%</span></div><div><div class="n mono" style="color:var(--tx)">DISK</div><div class="s mono">STORAGE USED</div></div></div>
+    <div class="ttl" style="margin-top:16px">系统流水日志 <small class="mono">EVENT STREAM</small></div>
+    <div id="log" class="mono"></div>
+    </div>
+  </section>
+
+</div></div>
+
+<div class="hud" id="hudL"><div id="h-pos">LON --</div><div id="h-az">AZ --</div></div>
+<div class="hud" id="hudR"><div id="h-up">UPTIME --</div><div id="h-link">LINK --</div></div>
+<div class="edge" id="eL"></div><div class="edge" id="eR"></div>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const hue = {idle:186, listening:160, thinking:265, speaking:192};
+const stateLabel = {idle:'SYSTEM ONLINE', listening:'LISTENING', thinking:'PROCESSING', speaking:'SPEAKING'};
+let state='idle', audio=0, audioT=0, ext=false;
+let animating=true,rafId=0,parId=0,lastPaint=0,pageVisible=!document.hidden;
+
+/* ============ Canvas 全息投影 ============ */
+const cv=$('fx'), g=cv.getContext('2d');
+let W,H,DPR;
+function resize(){DPR=Math.min(devicePixelRatio||1,1);W=innerWidth;H=innerHeight;const RS=Math.min(1,1400/W,900/H);cv.width=Math.max(1,Math.round(W*DPR*RS));cv.height=Math.max(1,Math.round(H*DPR*RS));cv.style.width=W+'px';cv.style.height=H+'px';g.setTransform(DPR*RS,0,0,DPR*RS,0,0)}
+addEventListener('resize',resize);resize();
+
+/* ============ 虚化机房背景（低分辨率绘制 + CSS 模糊） ============ */
+const bgc=$('bg'), bg=bgc.getContext('2d'), st=document.createElement('canvas'), sg=st.getContext('2d');
+let leds=[], bw=1, bh=1;
+function drawBG(){
+  bw=bgc.width=st.width=Math.ceil(W/3);bh=bgc.height=st.height=Math.ceil(H/3);
+  sg.setTransform(bw/W,0,0,bh/H,0,0);leds=[];
+  const y0=H*.66, cx=W/2;
+  // 地面
+  let gr=sg.createLinearGradient(0,y0,0,H);gr.addColorStop(0,'rgba(12,34,44,.65)');gr.addColorStop(1,'rgba(2,6,10,.95)');
+  sg.fillStyle=gr;sg.fillRect(0,y0,W,H-y0);
+  sg.strokeStyle='rgba(0,220,240,.12)';sg.lineWidth=2;
+  for(let k=-8;k<=8;k++){sg.beginPath();sg.moveTo(cx+k*W*.02,y0);sg.lineTo(cx+k*W*.17,H);sg.stroke()}
+  for(let j=1;j<8;j++){const y=y0+(H-y0)*Math.pow(j/8,1.8);sg.beginPath();sg.moveTo(0,y);sg.lineTo(W,y);sg.stroke()}
+  // 后墙微光
+  gr=sg.createLinearGradient(0,y0-H*.12,0,y0);gr.addColorStop(0,'transparent');gr.addColorStop(1,'rgba(0,200,230,.1)');
+  sg.fillStyle=gr;sg.fillRect(0,y0-H*.12,W,H*.12);
+  // 顶部垂挂线缆
+  sg.lineCap='round';
+  for(let i=0;i<9;i++){const x=W*(.04+i*.115)+(i%2?20:-20);sg.strokeStyle=`rgba(${40+i%3*8},80,98,.6)`;sg.lineWidth=3+i%3*3;
+    sg.beginPath();sg.moveTo(x,0);sg.bezierCurveTo(x+W*.03,H*.14,x-W*.04,H*.2,x+(i%2?1:-1)*W*.05,H*.3+i%4*H*.03);sg.stroke()}
+  // 机柜（由远及近）
+  for(let i=0;i<5;i++)for(const side of[-1,1]){
+    const w=W*(.05+i*.008), h=H*(.34+i*.07), x=cx+side*(W*.19+i*W*.078)-w/2, b=y0+i*H*.03, t=b-h;
+    gr=sg.createLinearGradient(x,0,x+w,0);gr.addColorStop(side<0?1:0,'rgba(0,80,100,.45)');gr.addColorStop(side<0?0:1,'rgba(4,12,18,.95)');
+    sg.fillStyle=gr;sg.fillRect(x,t,w,h);
+    sg.strokeStyle='rgba(0,200,230,.26)';sg.lineWidth=1.5;sg.strokeRect(x,t,w,h);
+    sg.strokeStyle='rgba(0,200,230,.13)';
+    for(let r=1;r<18;r++){const y=t+h*r/18;sg.beginPath();sg.moveTo(x+3,y);sg.lineTo(x+w-3,y);sg.stroke()}
+    for(let k=0;k<16;k++)leds.push({x:x+w*(.12+Math.random()*.76),y:t+h*(.05+Math.random()*.9),r:1+Math.random()*4,p:Math.random()*6,th:-.3+Math.random()*.9,
+      c:Math.random()<.06?'#ff6a6a':Math.random()<.2?'#ffbe5a':Math.random()<.5?'#5dffd0':'#5ff4ff'});
+  }
+  // 地面倒影光 + 暗角
+  gr=sg.createRadialGradient(cx,H*.76,0,cx,H*.76,W*.3);gr.addColorStop(0,'rgba(0,240,255,.2)');gr.addColorStop(1,'transparent');
+  sg.save();sg.translate(cx,H*.76);sg.scale(1,.3);sg.translate(-cx,-H*.76);sg.fillStyle=gr;sg.fillRect(0,H*.76-W*.3,W,W*.6);sg.restore();
+  gr=sg.createRadialGradient(cx,H*.45,H*.25,cx,H*.45,Math.max(W,H)*.75);gr.addColorStop(0,'transparent');gr.addColorStop(1,'rgba(0,0,0,.78)');
+  sg.fillStyle=gr;sg.fillRect(0,0,W,H);
+  tickBG();
+}
+function tickBG(){if(!animating)return;
+  bg.clearRect(0,0,bw,bh);bg.drawImage(st,0,0);bg.globalCompositeOperation='lighter';
+  const n=performance.now()/1000,sx=bw/W,sy=bh/H;
+  for(const l of leds)if(Math.sin(n*l.r+l.p)>l.th){bg.fillStyle=l.c;bg.globalAlpha=1;bg.fillRect(l.x*sx,l.y*sy,2.2,2.2)}
+  bg.globalAlpha=1;bg.globalCompositeOperation='source-over';
+}
+addEventListener('resize',drawBG);drawBG();setInterval(tickBG,160);
+
+const LM='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHwAfvAAAAAAAAAAAAAAAAAAAAAAAAx37///+AAAAAGoABAAAAAAAAAAAAAIe8P///wAA8AAAAAA0AAAAAAAAAAAwADw////4AAIAAAAAAHAAAAAAAAAAALivwAf//wAAAAADAAP/wAHIAAAAAADsj38AH/+gAAAAAEAH///OAAAAgBgAAfw3/gB/+gAAAgAMHe///+/9gBAP/7/nbdrwD/+AAAH/Ag7H////////8H//////g8H/gAAAf/6//f////////Mf/////9H4D4A+AA+ev///////////AP/////4A0B4AAAD5/////////////Af1////gHgA4AAAP5///////////LwAHgD///gH0AAAAAG4/////////+AMAABAC///4D+AAAAGCx/////////4A4AAAAB////n/gAAAOCR/////////4A4AAAAAf///3/wAAAbH//////////9AgAAAAAP/////gAAADf//////////9AAAAAAAF////0YAAAB///////////8AAAAAAAD////8EAAAB///v///////5AAAAAAAD////+AAAAB/f5f///////wAAAAAAAD////gAAAAfxnwP///////jgAAAAAAD///+AAAAAPCb3///////+AAAAAAAAD///8AAAAAfCJf//////+ECAAAAAAAB///8AAAAAGDRf///////mMAAAAAAAA///8AAAAAH+Ai///////E8AAAAAAAAf//wAAAAAP/AA///////BgAAAAAAAAP//gAAAAAf/73///////gAAAAAAAAAD/AQAAAAAf//9/f/////gAAAAAAAAAF+AQAAAAB///+/n/////AAAAAAAAAAC+AAAAAAB///+fwH///+AAAAAAAAAAAeAwAAAAD////f/D///8gAAAAAAAAAAeGEAAAAD////v+B/j/AAAAAAAAAAAAPMAwAAAD////n+AfB+gAAAAAAAAAAAD8AAAAAD////34AeBfAgAAAAAAAAAAAPAAAAAH////3gAcAfAgAAAAAAAAAAADAAAAAD////6AAcAfgwAAAAAAAAAAABBwAAAD////8wAMATAIAAAAAAAAAAAAr/AAAB/////gAIASAAAAAAAAAAAAAAH/gAAA/////gACAAAIAAAAAAAAAAAAH/8AAAYH///AAAAsGAAAAAAAAAAAAAH/+AAAAB//+AAAAUOAAAAAAAAAAAAAP/+AAAAB//8AAAAc+gAAAAAAAAAAAAP//gAAAD//4AAAAMeBgAAAAAAAAAAAP//8AAAB//wAAAAGdCuAAAAAAAAAAAf///AAAA//wAAAACAAHgAAAAAAAAAAP///gAAA//wAAAAB4AHggAAAAAAAAAH///AAAAf/wAAAAACIDQIAAAAAAAAAH//+AAAAf/wAAAAAAAAAAAAAAAAAAAD//+AAAA//wgAAAAABxAAAAAAAAAAAD//8AAAA//wgAAAAAHxgBAAAAAAAAAA//8AAAA//zgAAAAAf/gAAAAAAAAAAAf/8AAAA//DgAAAAAf/gAAAAAAAAAAAf/8AAAAf/DAAAAAD//4CAAAAAAAAAAf/wAAAAf/DAAAAAH//4AAAAAAAAAAAf/AAAAAf+DAAAAAH//8AAAAAAAAAAAf/AAAAAP8AAAAAAH//+AAAAAAAAAAA/+AAAAAP8AAAAAAH//+AAAAAAAAAAA/8AAAAAH4AAAAAAD//+AAAAAAAAAAA/8AAAAAHwAAAAAADwf8AAAAAAAAAAA/gAAAAAAAAAAAAACAP4AAAAAAAAAAB/wAAAAAAAAAAAAAAAD4AEAAAAAAAAB+AAAAAAAAAAAAAAAAAAAGAAAAAAAAB6AAAAAAAAAAAAAAAAAwAMAAAAAAAAA8AAAAAAAAAAAAAAAAAQAYAAAAAAAAB4AAAAAAAAAAAAAAAAAAAwAAAAAAAAB4AAAAAAAAAAAAAAAAAAAAAAAAAAAABwAAAAAAAAAACAAAAAAAAAAAAAAAAADgAAAAAAAAAAAAAAAAAAAAAAAAAAAABwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAA8AAf/8d/AAAAAAAAAAAAkAAAAAAACP/+H//////AAAAAAAAAAA+AAAAIf////+////////AAAAAAAOMKPAAAB///////////////gAAAH/8D//8AAAH//////////////4AAAF/////8AAAP///////////////4AAIf/////gwBwf///////////////4AAAH//////AAD////////////////wAAA///////+f//////////////////A/wH///////////////////////////////////////////////////////////////////////////////////////', _b=atob(LM), MW=180, MH=90;
+const isLand=(la,lo)=>{const c=Math.floor((((lo+180)%360)+360)%360/2),r=Math.min(MH-1,Math.max(0,Math.floor((90-la)/2))),i=r*MW+c;return (_b.charCodeAt(i>>3)>>(7-(i&7)))&1};
+const N=9000, pts=[], D=180/Math.PI;
+for(let i=0;i<N;i++){const y=1-2*(i+.5)/N, r=Math.sqrt(1-y*y), a=i*2.399963, x=Math.cos(a)*r, z=Math.sin(a)*r;
+  const la=Math.asin(-y)*D, lo=Math.atan2(x,z)*D, land=!!isLand(la,lo);
+  if(!land&&Math.random()>.2)continue;
+  const edge=land&&(!isLand(la+4,lo)||!isLand(la-4,lo)||!isLand(la,lo+4)||!isLand(la,lo-4));
+  pts.push({sc:1+Math.random()*3.5,x,y,z,land,edge:edge&&Math.random()>.45,s:land?Math.random()*.8+.8:Math.random()*.5+.5})}
+const ringsD=[{rot:-.45,a:1.75,b:.52,sp:.55,gold:1},{rot:.6,a:1.6,b:.44,sp:-.42,gold:0},{rot:1.4,a:1.45,b:.38,sp:.33,gold:0}];
+const dust=Array.from({length:150},()=>({a:Math.random()*6.28,d:Math.random()**.7*2.8+.6,y:(Math.random()-.5)*2.6,p:Math.random()*6,s:Math.random()*1.6+.5,v:(Math.random()-.5)*.08}));
+const sparks=Array.from({length:150},()=>({u:Math.random(),x:Math.random()*2-1,v:Math.random()*.25+.08,s:Math.random()*2+.8}));
+const rays=Array.from({length:100},()=>({a:Math.random()*2-1,b:Math.random()*2-1,w:Math.random()*.7+.3,p:Math.random()*6}));
+
+function proj(x,y,z,ay,ax,R,cx,cy){
+  let c=Math.cos(ay),s=Math.sin(ay),x1=x*c+z*s,z1=-x*s+z*c;
+  c=Math.cos(ax);s=Math.sin(ax);const y1=y*c-z1*s,z2=y*s+z1*c;
+  const k=1/(1-z2*.22);return{x:cx+x1*R*k,y:cy+y1*R*k,z:z2,k};
+}
+const ripples=[];let lastRip=-9;
+function toObj(vx,vy,vz,ay,ax){let c=Math.cos(ax),s=Math.sin(ax);const y=vy*c+vz*s,z1=-vy*s+vz*c;c=Math.cos(ay);s=Math.sin(ay);return[vx*c-z1*s,y,vx*s+z1*c]}
+const flare=(x,y,len,th,ang,col)=>{g.save();g.translate(x,y);g.rotate(ang);const f=g.createLinearGradient(-len,0,len,0);f.addColorStop(0,'transparent');f.addColorStop(.5,col);f.addColorStop(1,'transparent');g.fillStyle=f;g.fillRect(-len,-th/2,len*2,th);g.restore()};
+
+let bootT=null,lastT=0,hs=186,ang=-1.75,rph=0,pph=0,aph=0;
+const P={sc:1,spin:.22,ring:1,pulse:3,beam:1,arc:1,inh:0,scan:0};
+const ST={idle:{sc:1,spin:.22,ring:1,pulse:3,beam:1,arc:1,inh:0,scan:0},
+  listening:{sc:.93,spin:.32,ring:.8,pulse:2,beam:.85,arc:.7,inh:1,scan:0},
+  thinking:{sc:1,spin:.9,ring:3.4,pulse:8,beam:1.05,arc:2.2,inh:0,scan:1},
+  speaking:{sc:1.02,spin:.3,ring:1.3,pulse:4,beam:1.1,arc:1.8,inh:0,scan:0}};
+function frame(t){
+  if(!animating||!pageVisible){rafId=0;lastT=0;return}
+  rafId=requestAnimationFrame(frame);
+  const frameInterval=state==='idle'?100:(state==='speaking'?33.4:41.7);
+  if(t-lastPaint<frameInterval)return;
+  lastPaint=t;
+  t/=1000;
+  if(bootT===null)bootT=location.hash==='#noboot'?-999:t;
+  const T=t-bootT, dt=Math.min(.05,Math.max(0,t-lastT));lastT=t;
+  const ss=(a,b)=>{const x=Math.max(0,Math.min(1,(T-a)/(b-a)));return x*x*(3-2*x)}, bBase=ss(0,1.3), bB=ss(1,2.5), bS=ss(2,3.8);
+  const tg=ST[state];for(const k in tg)P[k]+=(tg[k]-P[k])*.05;
+  hs+=(hue[state]-hs)*.08;ang+=dt*P.spin;rph+=dt*P.ring;pph+=dt*P.pulse;aph+=dt*P.arc;
+  audio+=(audioT-audio)*.18;
+  const breath=Math.sin(t*1.6)*.025+(state==='speaking'&&!ext?Math.abs(Math.sin(t*7))*.12:0);
+  const lvl=Math.max(0,audio+breath), h=hs, L=(l,a)=>`hsla(${h},100%,${l}%,${a})`;
+  const cx=W/2, cy=H*.38, R=Math.min(W*.17,H*.24)*(1+lvl*.25)*P.sc*(.8+.2*bS);
+  const bx=cx, by=H*.74, rx=Math.min(W*.17,260), ry=rx*.2;
+  g.clearRect(0,0,W,H);
+  g.globalAlpha=.8;g.globalCompositeOperation='lighter';
+
+  // 漂浮星尘
+  dust.forEach(d=>{const a=d.a+t*d.v, x=cx+Math.cos(a)*d.d*R*1.15, y=cy+d.y*R*1.05+Math.sin(a*2)*R*.1, tw=.3+.7*Math.abs(Math.sin(t*1.2+d.p));
+    g.fillStyle=d.p>5?`rgba(255,220,140,${.7*tw})`:L(80,.7*tw);g.fillRect(x,y,d.s,d.s)});
+
+  // 体积光锥
+  g.globalAlpha=Math.min(1,.8*bB*P.beam*(1+lvl*.8));
+  const top0=cy+R*.9, top=by-(by-top0)*bB, wTop=R*.95*(.4+.6*bB), wBot=rx*.42;
+  let gr=g.createLinearGradient(0,by,0,top);
+  gr.addColorStop(0,L(65,.45));gr.addColorStop(.55,L(58,.15));gr.addColorStop(1,L(55,.05));
+  g.fillStyle=gr;g.beginPath();g.moveTo(bx-wBot,by);g.lineTo(cx-wTop,top);g.lineTo(cx+wTop,top);g.lineTo(bx+wBot,by);g.fill();
+  gr=g.createLinearGradient(0,by,0,top);gr.addColorStop(0,L(85,.32));gr.addColorStop(1,L(70,.03));
+  g.fillStyle=gr;g.beginPath();g.moveTo(bx-wBot*.4,by);g.lineTo(cx-wTop*.4,top);g.lineTo(cx+wTop*.4,top);g.lineTo(bx+wBot*.4,by);g.fill();
+  rays.forEach(r=>{const f=.5+.5*Math.sin(t*1.7+r.p);g.strokeStyle=L(80,(.05+.2*f)*r.w);g.lineWidth=r.w*2.2;g.beginPath();g.moveTo(bx+r.a*wBot,by);g.lineTo(cx+r.b*wTop,top);g.stroke()});
+  for(let i=0;i<3;i++){const u=((t*.22+i/3)%1), y=by-(by-top)*u, w=wBot+(wTop-wBot)*u, a=Math.sin(u*Math.PI);
+    g.strokeStyle=L(80,.55*a);g.lineWidth=1.4;g.beginPath();g.ellipse(cx,y,w,w*.14,0,0,Math.PI*2);g.stroke()}
+  sparks.forEach(s=>{s.u+=s.v*.006*(1+lvl*3);if(s.u>1){s.u=0;s.x=Math.random()*2-1}
+    const u=s.u,y=by-(by-top)*u,x=cx+s.x*(wBot+(wTop-wBot)*u)*.9;g.fillStyle=L(85,.85*Math.sin(u*Math.PI));g.fillRect(x,y,s.s,s.s)});
+
+  // 底座
+  g.globalAlpha=.8*bBase;
+  g.globalCompositeOperation='source-over';
+  g.fillStyle='rgba(4,12,18,.88)';g.beginPath();g.ellipse(bx,by+ry*.35,rx*1.22,ry*1.35,0,0,Math.PI*2);g.fill();
+  g.strokeStyle=L(60,.55);g.lineWidth=2;g.stroke();
+  g.globalCompositeOperation='lighter';
+  for(let i=0;i<6;i++){const k=1.12-i*.17;g.strokeStyle=L(60+i*3,.75-i*.08);g.lineWidth=i===2?3:1.2;
+    g.setLineDash(i%2?[4,7]:i===3?[rx*1.4,rx*.5]:[]);g.lineDashOffset=-t*(i%2?-18:24)*(i+1);
+    g.beginPath();g.ellipse(bx,by,rx*k,ry*k,0,0,Math.PI*2);g.stroke()}
+  g.setLineDash([]);
+  for(let i=0;i<3;i++){const a0=aph*(.6+i*.3)*(i%2?-1:1)+i*2.1,k=1-i*.2;
+    g.strokeStyle=L(85,.16);g.lineWidth=14;g.beginPath();g.ellipse(bx,by,rx*k,ry*k,0,a0,a0+1.1);g.stroke();
+    g.strokeStyle=L(85,.86);g.lineWidth=5;g.beginPath();g.ellipse(bx,by,rx*k,ry*k,0,a0,a0+1.1);g.stroke()}
+  g.shadowBlur=0;
+  g.strokeStyle='rgba(255,215,120,.9)';g.lineWidth=2.5;g.beginPath();g.ellipse(bx,by,rx*.26,ry*.26,0,0,Math.PI*2);g.stroke();
+  gr=g.createRadialGradient(bx,by,0,bx,by,rx*.5);gr.addColorStop(0,'rgba(255,255,255,.95)');gr.addColorStop(.25,L(65,.6));gr.addColorStop(1,'transparent');
+  g.fillStyle=gr;g.save();g.translate(bx,by);g.scale(1,.22);g.translate(-bx,-by);g.beginPath();g.arc(bx,by,rx*.5,0,7);g.fill();g.restore();
+
+  // 光晕 + 玻璃球体
+  g.globalAlpha=.8*bS;
+  gr=g.createRadialGradient(cx,cy,R*.4,cx,cy,R*2);gr.addColorStop(0,L(60,.1+lvl*.2));gr.addColorStop(1,'transparent');
+  g.fillStyle=gr;g.beginPath();g.arc(cx,cy,R*2,0,7);g.fill();
+  gr=g.createRadialGradient(cx,cy,R*.45,cx,cy,R*1.03);
+  gr.addColorStop(0,L(55,.05));gr.addColorStop(.85,L(62,.14));gr.addColorStop(1,L(75,.36));
+  g.fillStyle=gr;g.beginPath();g.arc(cx,cy,R*1.03,0,7);g.fill();
+
+  // 聆听：能量向球心收拢；思考：扫描光带
+  if(P.inh>.02)for(let i=0;i<3;i++){const u=((t*.5+i/3)%1);g.strokeStyle=L(75,.5*P.inh*Math.sin(u*Math.PI));g.lineWidth=1.2;g.beginPath();g.arc(cx,cy,R*(2.3-1.2*u),0,7);g.stroke()}
+  if(P.scan>.02){const sy=cy+Math.sin(t*2.2)*R*.9,sb=g.createLinearGradient(0,sy-12,0,sy+12);sb.addColorStop(0,'transparent');sb.addColorStop(.5,L(85,.5*P.scan));sb.addColorStop(1,'transparent');g.fillStyle=sb;g.fillRect(cx-R*1.05,sy-12,R*2.1,24)}
+  // 粒子地球
+  const ay=ang, ax=.35;
+  const cay=Math.cos(ay),say=Math.sin(ay),cax=Math.cos(ax),sax=Math.sin(ax);
+  // 说话时在球面朝向我们的一侧激起水波
+  if(lvl>.1&&t-lastRip>Math.max(.2,.6-lvl*.8)){lastRip=t;const vx=Math.random()*1.2-.6,vy=Math.random()*1.2-.6;ripples.push({t0:t,o:toObj(vx,vy,Math.sqrt(1-vx*vx-vy*vy),ay,ax)});if(ripples.length>7)ripples.shift()}
+  for(const p of pts){
+    let w=lvl*.05*(Math.sin(p.y*10-t*7)+.8*Math.sin(p.x*8+p.z*6-t*5.5)), glow=0;
+    for(const rp of ripples){const age=t-rp.t0;if(age>2.4)continue;const th=Math.acos(Math.max(-1,Math.min(1,p.x*rp.o[0]+p.y*rp.o[1]+p.z*rp.o[2]))),dz=(th-age*1.5)/.3,e=Math.exp(-dz*dz)*(1-age/2.4);w+=.13*e*Math.cos(dz*3);glow+=e}
+    const k2=(1+w)*(1+(1-bS)*(1-bS)*p.sc), px=p.x*k2, py=p.y*k2, pz=p.z*k2;
+    const x1=px*cay+pz*say, z1=-px*say+pz*cay;
+    const y1=py*cax-z1*sax, z2=py*sax+z1*cax;
+    const pk=1/(1-z2*.22), qx=cx+x1*R*pk, qy=cy+y1*R*pk, d=(z2+1)/2;
+    const s=p.s*pk*(1+lvl*.6+glow*.9)*(.6+.6*d);
+    if(p.land){g.fillStyle=p.edge?`hsla(46,100%,74%,${.3+.7*d})`:`hsla(${h-6},100%,${72+d*24}%,${.3+.7*d})`}
+    else g.fillStyle=L(62,.05+.28*d);
+    g.fillRect(qx-s/2,qy-s/2,s,s);
+    if(glow>.2){g.fillStyle=`rgba(220,255,255,${Math.min(.9,glow*.8)})`;g.fillRect(qx-s/2,qy-s/2,s,s)}
+  }
+
+  // 轨道环（细线 + 辉光 + 轨道光点）
+  ringsD.forEach((rg,i)=>{
+    g.save();g.translate(cx,cy);g.rotate(rg.rot+Math.sin(t*.25+i)*.1);
+    const col=rg.gold?'255,205,110':'150,245,255';
+    g.strokeStyle=`rgba(${col},.07)`;g.lineWidth=6;g.beginPath();g.ellipse(0,0,rg.a*R,rg.b*R,0,0,7);g.stroke();
+    g.strokeStyle=`rgba(${col},.85)`;g.lineWidth=1;g.beginPath();g.ellipse(0,0,rg.a*R,rg.b*R,0,0,7);g.stroke();
+    const an=rph*rg.sp+i*2.1;
+    g.lineWidth=9;g.strokeStyle=`rgba(${col},.14)`;
+    g.beginPath();g.ellipse(0,0,rg.a*R,rg.b*R,0,Math.min(an,an-.55),Math.max(an,an-.55));g.stroke();
+    g.lineWidth=2.4;g.strokeStyle=`rgba(${col},.95)`;
+    g.beginPath();g.ellipse(0,0,rg.a*R,rg.b*R,0,Math.min(an,an-.55),Math.max(an,an-.55));g.stroke();
+    const px=Math.cos(an)*rg.a*R,py=Math.sin(an)*rg.b*R,pg=g.createRadialGradient(px,py,0,px,py,9);
+    pg.addColorStop(0,'rgba(255,255,255,1)');pg.addColorStop(1,'transparent');g.fillStyle=pg;g.beginPath();g.arc(px,py,9,0,7);g.fill();
+    if(rg.gold)for(let k=0;k<26;k++){const a=k*.51+t*rg.sp*.3,j=Math.sin(k*7.3)*R*.07;g.fillStyle=`rgba(255,215,130,${.4+.5*Math.abs(Math.sin(t*2+k))})`;g.fillRect(Math.cos(a)*(rg.a*R+j),Math.sin(a)*(rg.b*R+j),1.8,1.8)}
+    g.restore();
+  });
+
+  // HUD 刻度环
+  {const rr=R*1.2;g.save();g.translate(cx,cy);g.rotate(ang*.5);g.strokeStyle=L(75,.3);g.lineWidth=1;g.beginPath();
+   for(let i=0;i<120;i++){const a=i/120*Math.PI*2,l=i%10===0?10:i%5===0?6:3;g.moveTo(Math.cos(a)*rr,Math.sin(a)*rr);g.lineTo(Math.cos(a)*(rr+l),Math.sin(a)*(rr+l))}
+   g.stroke();g.rotate(-ang*.9);g.setLineDash([2,6]);g.strokeStyle=L(75,.22);g.beginPath();g.arc(0,0,R*1.42,0,7);g.stroke();g.setLineDash([]);
+   g.lineWidth=2;g.strokeStyle=L(85,.45);for(let i=0;i<3;i++){const a=i*2.094+t*.3;g.beginPath();g.arc(0,0,R*1.3,a,a+.5);g.stroke()}
+   g.restore();
+   g.font='10px monospace';g.fillStyle=L(80,.4);
+   for(let i=0;i<12;i++){const a=i*Math.PI/6+ang*.5;g.fillText(String(i*30).padStart(3,'0'),cx+Math.cos(a)*(rr+26)-9,cy+Math.sin(a)*(rr+26)+3)}}
+  // 核心强光 + 星芒
+  const pu=1+.12*Math.sin(pph)+lvl*.6;
+  gr=g.createRadialGradient(cx,cy,0,cx,cy,R*.95*pu);
+  gr.addColorStop(0,'rgba(255,255,255,.8)');gr.addColorStop(.1,L(85,.5));gr.addColorStop(.4,L(60,.13));gr.addColorStop(1,'transparent');
+  g.fillStyle=gr;g.beginPath();g.arc(cx,cy,R*.95*pu,0,7);g.fill();
+  flare(cx,cy,R*2.2*pu,2,0,'rgba(255,255,255,.55)');
+  flare(cx,cy,R*1.5*pu,1.6,.62,'rgba(255,240,200,.45)');
+  flare(cx,cy,R*1.6*pu,1.6,-.9,L(80,.45));
+  flare(cx,cy,R*.75*pu,1.4,Math.PI/2,'rgba(255,255,255,.4)');
+  // 镜头光斑
+  const bkx=cx+R*1.55,bky=cy-R*1.1;
+  gr=g.createRadialGradient(bkx,bky,0,bkx,bky,R*.13);gr.addColorStop(0,'rgba(255,190,90,.35)');gr.addColorStop(.8,'rgba(120,255,230,.25)');gr.addColorStop(1,'transparent');
+  g.fillStyle=gr;g.beginPath();g.arc(bkx,bky,R*.13,0,7);g.fill();
+
+  // 声波线
+  g.strokeStyle=L(72,.85);g.lineWidth=1.6;g.beginPath();
+  const wy=by-ry*2.2, ww=Math.min(W*.3,420);
+  for(let x=-ww;x<=ww;x+=4){const e=1-Math.abs(x)/ww;const y=wy+Math.sin(x*.05+t*5)*(2+lvl*26)*e;x===-ww?g.moveTo(cx+x,y):g.lineTo(cx+x,y)}
+  g.stroke();
+}
+rafId=requestAnimationFrame(frame);
+
+/* ============ 鼠标微视差 ±3deg ============ */
+let tmx=0,tmy=0,cmx=0,cmy=0;
+addEventListener('mousemove',e=>{tmx=e.clientX/innerWidth*2-1;tmy=e.clientY/innerHeight*2-1;if(animating&&pageVisible&&!parId)parId=requestAnimationFrame(par)});
+function par(){
+  if(!animating||!pageVisible){parId=0;return}
+  cmx+=(tmx-cmx)*.05;cmy+=(tmy-cmy)*.05;
+  if(Math.abs(tmx-cmx)>.0005||Math.abs(tmy-cmy)>.0005){
+    $('rig').style.transform=`rotateY(${(cmx*3).toFixed(3)}deg) rotateX(${(-cmy*3).toFixed(3)}deg)`;
+    $('bg').style.transform=`translate3d(${(-cmx*10).toFixed(2)}px,${(-cmy*6).toFixed(2)}px,0) scale(1.04)`;
+    parId=requestAnimationFrame(par);
+  }else{
+    parId=0;
+  }
+}
+par();
+addEventListener('visibilitychange',()=>{
+  pageVisible=!document.hidden;
+  if(!pageVisible){
+    if(rafId){cancelAnimationFrame(rafId);rafId=0}
+    if(parId){cancelAnimationFrame(parId);parId=0}
+  }else if(animating){
+    lastT=0;lastPaint=0;
+    if(!rafId)rafId=requestAnimationFrame(frame);
+  }
+});
+
+/* ============ UI 逻辑 ============ */
+const clock=()=>$('clock').textContent=new Date().toLocaleTimeString('en-GB')+' CST';
+clock();setInterval(clock,1000);
+const emit=(n,d)=>dispatchEvent(new CustomEvent('jarvis:'+n,{detail:d}));
+const ring=(k,v)=>{v=Math.max(0,Math.min(100,+v||0));$('r-'+k).style.strokeDashoffset=113.1*(1-v/100);$('v-'+k).textContent=$('m-'+k).textContent=Math.round(v)+'%'};
+const logEl=$('log');
+function addLog(line){
+  const d=document.createElement('div');d.textContent='['+new Date().toLocaleTimeString('en-GB')+'] '+line;
+  logEl.appendChild(d);while(logEl.children.length>7)logEl.firstChild.remove();
+}
+function setModelStatus(ok,name){
+  const b=$('mstat');b.className='badge'+(ok?'':' off');
+  b.lastChild.textContent=ok?`大模型已连接${name?' · '+name:''}`:'大模型未连接';
+  const m=$('miniM');m.className='badge'+(ok?'':' off');m.lastChild.textContent=ok?(name||'已连接'):'未连接';
+}
+let typTimer=null,outTimer=null,outQueue=[],outToken=0;
+function splitOutput(text){
+  const raw=String(text||'').replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').trim();
+  if(!raw)return [];
+  const parts=raw.split(/(?<=[。！？!?；;])(?![”’」』])/)
+    .flatMap(s=>s.split(/(?<=[。！？!?；;][”’」』])/))
+    .map(s=>s.trim()).filter(Boolean);
+  const out=[];
+  for(const p of parts){
+    if(p.length<=56){out.push(p);continue}
+    let rest=p;
+    while(rest.length>56){
+      let cut=Math.max(rest.lastIndexOf('，',56),rest.lastIndexOf(',',56),rest.lastIndexOf('、',56),rest.lastIndexOf('：',56));
+      if(cut<28)cut=56;
+      out.push(rest.slice(0,cut+1).trim());
+      rest=rest.slice(cut+1).trim();
+    }
+    if(rest)out.push(rest);
+  }
+  if(out.length>1&&out[out.length-1].length<6)out[out.length-2]+=out.pop();
+  return out;
+}
+function typeText(text,token){
+  token=(token==null)?outToken:token;
+  clearTimeout(typTimer);const s=$('sub');s.style.opacity='1';s.textContent='';let i=0;
+  (function n(){
+    if(token!==outToken)return;
+    if(i<=text.length){s.textContent=text.slice(0,i++);typTimer=setTimeout(n,Math.max(18,52-text.length*.35))}
+  })();
+}
+function clearOutput(token){
+  token=(token==null)?outToken:token;
+  if(token!==outToken)return;
+  clearTimeout(outTimer);clearTimeout(typTimer);outQueue=[];
+  const s=$('sub');s.style.opacity='0';
+  outTimer=setTimeout(()=>{if(token===outToken){s.textContent='';s.style.opacity='1'}},300);
+}
+function showNextOutput(){
+  clearTimeout(outTimer);clearTimeout(typTimer);
+  if(!outQueue.length)return;
+  const token=outToken;
+  const sentence=outQueue.shift();
+  typeText(sentence,token);
+  if(outQueue.length){
+    outTimer=setTimeout(showNextOutput,Math.max(2800,Math.min(7000,sentence.length*80+900)));
+  }else{
+    // 最后一句由 Python 在 TTS 播完后清空；这里留足 7 秒兜底，避免字幕永远挂着。
+    outTimer=setTimeout(()=>clearOutput(token),Math.max(7000,Math.min(14000,sentence.length*120+3000)));
+  }
+}
+function setOutput(text){
+  wake();
+  const parts=splitOutput(text);
+  outToken++;clearTimeout(outTimer);clearTimeout(typTimer);
+  outQueue=parts;
+  if(!parts.length){clearOutput(outToken);return}
+  $('sub').style.opacity='1';
+  showNextOutput();
+}
+function setState(s){if(!hue[s])return;if(s!=='idle')wake();state=s;$('stateTxt').textContent=stateLabel[s]}
+function setAudioLevel(v){audioT=Math.max(0,Math.min(1,+v||0));if(audioT>.12)wake()}
+function setTelemetry(o={}){['cpu','ram','disk'].forEach(k=>{if(o[k]!=null)ring(k,o[k])})}
+
+$('save').onclick=()=>{
+  const d={provider:$('provider').value,apiKey:$('apikey').value};
+  addLog('模型配置已提交: '+d.provider);emit('saveModel',d);
+};
+document.querySelectorAll('.slot').forEach(b=>b.onclick=()=>{addLog('预留槽位 #'+b.dataset.slot+' 被点击');emit('slot',{index:+b.dataset.slot})});
+let mic=null;
+async function toggleMic(){
+  if(mic){clearInterval(mic.iv);mic.stream.getTracks().forEach(t=>t.stop());mic.ctx.close();mic=null;setAudioLevel(0);setState('idle');addLog('麦克风已关闭');return}
+  try{const stream=await navigator.mediaDevices.getUserMedia({audio:true}),ctx=new AudioContext(),an=ctx.createAnalyser();an.fftSize=512;
+    ctx.createMediaStreamSource(stream).connect(an);const buf=new Uint8Array(an.fftSize);
+    const iv=setInterval(()=>{an.getByteTimeDomainData(buf);let sum=0;for(const v of buf){const x=(v-128)/128;sum+=x*x}
+      const lv=Math.min(1,Math.sqrt(sum/buf.length)*5);ext=true;setAudioLevel(lv);setState(lv>.08?'speaking':'listening')},50);
+    mic={stream,ctx,iv};setState('listening');addLog('麦克风已开启')}
+  catch(e){addLog('无法访问麦克风')}
+}
+document.querySelectorAll('.mod').forEach(b=>b.onclick=()=>{addLog('模块触发: '+b.textContent);emit('module',{key:b.dataset.k});if(b.dataset.k==='voice')toggleMic()});
+const voices=['A','B','C'];let vi=0;
+document.querySelectorAll('.tog').forEach(b=>b.onclick=()=>{
+  const k=b.dataset.k,em=b.querySelector('em');let d={key:k};
+  if(k==='vision'||k==='auto'){const on=b.classList.toggle('on');em.textContent=on?'[ON]':'[OFF]';d.on=on}
+  else if(k==='voice-style'){vi=(vi+1)%3;em.textContent='['+voices[vi]+']';d.voice=voices[vi]}
+  addLog('开关: '+b.textContent.trim());emit('toggle',d);
+});
+$('cmd').addEventListener('submit',e=>e.preventDefault());
+function sendCmd(){const v=$('cmdin').value.trim();if(!v)return;addLog('指令: '+v);emit('command',{text:v});$('cmdin').value=''}
+$('send').onclick=sendCmd;
+$('cmdin').addEventListener('keydown',e=>{if(e.key==='Enter')sendCmd()});
+
+/* HUD 读数：经纬度取自球体当前正对我们的位置 */
+const pad=n=>String(Math.floor(n)).padStart(2,'0');
+setInterval(()=>{
+  const deg=-ang*180/Math.PI, lon=(((deg+180)%360)+360)%360-180, up=performance.now()/1000;
+  $('h-pos').textContent=`LON ${Math.abs(lon).toFixed(1).padStart(5,'0')}°${lon<0?'W':'E'}  LAT 20.1°S`;
+  $('h-az').textContent=`AZ ${String(Math.floor(((deg%360)+360)%360)).padStart(3,'0')}° · ${state.toUpperCase()}`;
+  $('h-up').textContent=`UPTIME ${pad(up/3600)}:${pad(up/60%60)}:${pad(up%60)}`;
+  const k=Math.min(5,Math.round(3+audio*3));
+  $('h-link').textContent=`LINK ${'▮'.repeat(k)}${'▯'.repeat(5-k)} LVL ${pad(audio*99)}`;
+},200);
+
+/* 沉浸模式：空闲 15 秒后面板自动收起并冻结 Canvas；有操作、声音或状态变化时恢复 */
+let calm=false,lastAct=performance.now(),autoCol=[];
+function wake(){lastAct=performance.now();if(!calm)return;calm=false;document.body.classList.remove('calm');autoCol.forEach(id=>$(id).classList.remove('collapsed'));autoCol=[];if(window.JarvisHUD)window.JarvisHUD.setAnimating(true)}
+function enterCalm(){if(calm)return;calm=true;document.body.classList.add('calm');['pL','pR'].forEach(id=>{const p=$(id);if(!p.classList.contains('collapsed')){p.classList.add('collapsed');autoCol.push(id)}});if(window.JarvisHUD)window.JarvisHUD.setAnimating(false)}
+['pointerdown','keydown','mousemove','touchstart'].forEach(ev=>addEventListener(ev,wake,{passive:true}));
+setInterval(()=>{if(!calm&&state==='idle'&&performance.now()-lastAct>15000)enterCalm()},1000);
+$('sub').textContent='';setTimeout(()=>setOutput('贾维斯已上线，喊贾维斯就能叫我'),location.hash==='#noboot'?0:3500);
+
+/* 面板收起 / 展开 */
+const setCol=(id,c)=>{$(id).classList.toggle('collapsed',c);try{localStorage.setItem('jv-'+id,c?1:0)}catch(e){}};
+try{['pL','pR'].forEach(id=>{if(localStorage.getItem('jv-'+id)==='1')$(id).classList.add('collapsed')})}catch(e){}
+document.querySelectorAll('.full .cbtn').forEach(b=>b.onclick=()=>setCol(b.closest('.side').id,true));
+document.querySelectorAll('.mini').forEach(m=>{const f=()=>setCol(m.closest('.side').id,false);m.onclick=f;m.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();f()}}});
+
+/* ============ 对外接口 ============ */
+window.JarvisUI={
+  setState:s=>{ext=true;setState(s)},
+  setAudioLevel:v=>{ext=true;setAudioLevel(v)},
+  setOutput,
+  clearOutput,
+  setTelemetry:o=>{ext=true;setTelemetry(o)},
+  setModelStatus,
+  addLog,
+  wake,calm:on=>on?enterCalm():wake(),
+  collapsePanel:(n,c)=>setCol(n==='right'?'pR':'pL',c!==false),
+  setAnimating:on=>{
+    const next=!!on;
+    if(next===animating)return;
+    animating=next;
+    if(next){
+      lastT=0;lastPaint=0;
+      if(pageVisible){
+        if(!rafId)rafId=requestAnimationFrame(frame);
+        if(!parId)parId=requestAnimationFrame(par);
+      }
+    }else{
+      if(rafId){cancelAnimationFrame(rafId);rafId=0}
+      if(parId){cancelAnimationFrame(parId);parId=0}
+    }
+  },
+  getAnimating:()=>animating,
+  setVoiceStyle:v=>{
+    const i=voices.indexOf(v);
+    if(i<0)return;
+    vi=i;
+    const b=document.querySelector('.tog[data-k=voice-style] em');
+    if(b)b.textContent='['+v+']';
+  }
+};
+
+/* 演示数据：一旦后端调用接口（ext=true）即自动停止 */
+setTelemetry({cpu:34,ram:58,disk:71});setModelStatus(true,'DeepSeek');
+['系统自检完成','音频输入设备就绪','等待唤醒词 “贾维斯”'].forEach(addLog);
+setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math.random()*6,disk:71})},2200);
+})();
+</script>
+
+<script>
+/* ===== J.A.R.V.I.S. 安全桥接适配层（不改任何视觉 CSS） ===== */
+(() => {
+  'use strict';
+  const UI = window.JarvisUI;
+  if (!UI) return;
+  const errors = window.__JARVIS_ERRORS__ = window.__JARVIS_ERRORS__ || [];
+  const stateMap = {IDLE:'idle', LISTENING:'listening', PERCEIVING:'thinking',
+                    THINKING:'thinking', ACTING:'speaking', GUARD:'thinking'};
+  const voiceMap = {
+    A:{tts_voice:'云希', robot_voice:false},
+    B:{tts_voice:'云扬', robot_voice:false},
+    C:{robot_voice:true},
+  };
+  const apiQueue = [];
+  let reported = false, lastOutput = '', lastGuard = '', lastConfigKey = '';
+  let guardButtons = null, guardKey = null, readyTimer = 0;
+
+  function callApi(name, ...args) {
+    const api = window.pywebview && window.pywebview.api;
+    if (api && typeof api[name] === 'function') {
+      try { return Promise.resolve(api[name](...args)); }
+      catch (e) { errors.push(String(e && e.message || e)); }
+    }
+    return new Promise(resolve => apiQueue.push({name, args, resolve}));
+  }
+
+  function flushQueue() {
+    const api = window.pywebview && window.pywebview.api;
+    if (!api) return;
+    while (apiQueue.length) {
+      const item = apiQueue.shift();
+      try { item.resolve(api[item.name](...item.args)); }
+      catch (e) { errors.push(String(e && e.message || e)); }
+    }
+  }
+
+  function reportReady() {
+    if (reported) return true;
+    const api = window.pywebview && window.pywebview.api;
+    if (!api || typeof api.report !== 'function') return false;
+    try {
+      api.report({bridge:'JarvisHUD', width:innerWidth, height:innerHeight,
+                  dpr:devicePixelRatio || 1, state:'loaded'});
+    } catch (e) {
+      errors.push(String(e && e.message || e));
+      return false;
+    }
+    reported = true;
+    if (readyTimer) { clearInterval(readyTimer); readyTimer = 0; }
+    UI.addLog('UI 桥接已就绪');
+    dispatchEvent(new CustomEvent('jarvis:loaded', {detail:{
+      width:innerWidth, height:innerHeight, dpr:devicePixelRatio || 1
+    }}));
+    flushQueue();
+    return true;
+  }
+
+  function scheduleReady() {
+    if (reportReady()) return;
+    if (readyTimer) return;
+    let n = 0;
+    readyTimer = setInterval(() => {
+      n++;
+      if (reportReady() || n >= 20) { clearInterval(readyTimer); readyTimer = 0; }
+    }, 250);
+  }
+
+  addEventListener('pywebviewready', scheduleReady);
+  addEventListener('load', () => setTimeout(scheduleReady, 0));
+  setTimeout(scheduleReady, 0);
+
+  function setToggle(key, on) {
+    const b = document.querySelector('.tog[data-k="' + key + '"]');
+    if (!b) return;
+    const em = b.querySelector('em');
+    if (em) em.textContent = on ? '[ON]' : '[OFF]';
+    b.classList.toggle('on', !!on);
+  }
+
+  function populateProviders(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    const sel = document.getElementById('provider');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = '';
+    list.forEach(p => {
+      const o = document.createElement('option');
+      o.textContent = String(p);
+      sel.appendChild(o);
+    });
+    if (list.map(String).includes(current)) sel.value = current;
+  }
+
+  function applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    const key = JSON.stringify([cfg.ai_provider, cfg.tts_voice, cfg.robot_voice,
+      cfg.vision_enabled, cfg.always_listen, !!cfg.api_key, cfg.providers]);
+    if (key === lastConfigKey) return;
+    lastConfigKey = key;
+    if (cfg.providers) populateProviders(cfg.providers);
+    if (cfg.ai_provider) {
+      const sel = document.getElementById('provider');
+      if (sel && [...sel.options].some(o => o.value === cfg.ai_provider)) sel.value = cfg.ai_provider;
+    }
+    if ('vision_enabled' in cfg) setToggle('vision', !!cfg.vision_enabled);
+    if ('always_listen' in cfg) setToggle('auto', !!cfg.always_listen);
+    if ('tts_voice' in cfg || 'robot_voice' in cfg) {
+      const style = cfg.robot_voice ? 'C' : (String(cfg.tts_voice) === '云扬' ? 'B' : 'A');
+      if (UI.setVoiceStyle) UI.setVoiceStyle(style);
+    }
+    UI.setModelStatus(!!cfg.api_key, cfg.ai_provider || '');
+    const ak = document.getElementById('apikey');
+    if (ak) ak.placeholder = cfg.api_key ? '已配置（留空保持不变）' : '输入 API Key';
+  }
+
+  function clearGuard(reset) {
+    if (guardButtons) {
+      guardButtons.forEach(b => b.remove());
+      guardButtons = null;
+    }
+    document.querySelectorAll('.tog[data-k]').forEach(b => { b.style.display = ''; });
+    if (guardKey) { removeEventListener('keydown', guardKey, true); guardKey = null; }
+    if (reset) lastGuard = '';
+  }
+
+  function resolveGuard(ok) {
+    callApi('resolve_guard', !!ok);
+    UI.addLog(ok ? 'GUARD 用户确认执行' : 'GUARD 用户取消执行');
+    clearGuard(false);
+  }
+
+  function handleGuard(guard) {
+    if (!guard || !guard.desc) { if (lastGuard) clearGuard(true); return; }
+    const desc = String(guard.desc);
+    if (desc === lastGuard) return;
+    lastGuard = desc;
+    UI.setOutput('⚠ 高危操作待确认：' + desc + '。请选择确认或取消。');
+    UI.addLog('GUARD  ' + desc);
+    if (guardButtons) return;
+    const togs = document.getElementById('togs');
+    if (!togs) return;
+    document.querySelectorAll('.tog[data-k]').forEach(b => { b.style.display = 'none'; });
+    const yes = document.createElement('button');
+    yes.type = 'button';
+    yes.className = 'tog on';
+    yes.textContent = '确认执行 [Y]';
+    yes.onclick = () => resolveGuard(true);
+    const no = document.createElement('button');
+    no.type = 'button';
+    no.className = 'tog';
+    no.textContent = '取消 [N]';
+    no.onclick = () => resolveGuard(false);
+    togs.appendChild(yes);
+    togs.appendChild(no);
+    guardButtons = [yes, no];
+    guardKey = e => {
+      const k = String(e.key || '').toLowerCase();
+      if (!lastGuard || (k !== 'y' && k !== 'n')) return;
+      e.preventDefault();
+      resolveGuard(k === 'y');
+    };
+    addEventListener('keydown', guardKey, true);
+  }
+
+  function update(payload) {
+    payload = payload || {};
+    const snap = payload.snap || {};
+    if (snap.state) {
+      UI.setState(stateMap[String(snap.state).toUpperCase()] || (snap.speaking ? 'speaking' : 'idle'));
+    }
+    if (snap.level != null) UI.setAudioLevel(snap.level);
+    const out = (typeof payload.output === 'string' && payload.output.trim())
+      ? payload.output : (snap.subtitle || '');
+    if (out && out !== lastOutput) { lastOutput = out; UI.setOutput(out); }
+    else if (!out && lastOutput) { lastOutput = ''; UI.clearOutput(); }
+    const m = payload.metrics || {};
+    if (m.cpu != null || m.memory != null || m.ram != null || m.disk != null) {
+      UI.setTelemetry({cpu:m.cpu, ram:(m.memory !== undefined ? m.memory : m.ram), disk:m.disk});
+    }
+    applyConfig(payload.config);
+    (payload.logs || []).forEach(line => { if (line) UI.addLog(String(line)); });
+    if (payload.notice && payload.notice.message) {
+      UI.addLog((payload.notice.ok === false ? '错误: ' : '') + payload.notice.message);
+    }
+    handleGuard(snap.guard);
+  }
+
+  window.JarvisHUD = {
+    update,
+    setAnimating:on => UI.setAnimating ? UI.setAnimating(on) : null,
+    ready:scheduleReady,
+    getDiagnostics:() => ({
+      errors:errors.slice(-20), reported, lastOutput, lastGuard,
+      apiReady:!!(window.pywebview && window.pywebview.api),
+      animating:UI.getAnimating ? UI.getAnimating() : null
+    })
+  };
+
+  addEventListener('jarvis:command', e => {
+    const text = String((e.detail && e.detail.text) || '').trim();
+    if (text) callApi('command', text);
+  });
+  addEventListener('jarvis:saveModel', e => {
+    const d = e.detail || {};
+    const patch = {ai_provider:String(d.provider || '')};
+    const key = String(d.apiKey || '').trim();
+    if (key) patch.api_key = key;
+    callApi('save_config', patch);
+  });
+  addEventListener('jarvis:toggle', e => {
+    const d = e.detail || {};
+    if (d.key === 'vision') callApi('save_config', {vision_enabled:!!d.on});
+    else if (d.key === 'auto') callApi('save_config', {always_listen:!!d.on});
+    else if (d.key === 'voice-style') callApi('save_config', voiceMap[d.voice] || {});
+    else if (d.key === 'shot') callApi('command', '截图');
+  });
+  addEventListener('keydown', e => {
+    if (String(e.key || '') !== 'Escape') return;
+    e.preventDefault();
+    if (lastGuard) { resolveGuard(false); return; }
+    UI.addLog('ESC 收起为灵动岛');
+    callApi('collapse');
+  }, true);
+})();
+</script>
+
+</body>
+</html>

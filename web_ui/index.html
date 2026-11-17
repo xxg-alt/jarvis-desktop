@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis Capsule</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-state="IDLE">
+
+  <!-- 外框: 切角 + 流光边框 -->
+  <div class="shell" id="shell">
+    <div class="edge-glow"></div>
+    <div class="sweep"></div>
+
+    <!-- 左侧: 粒子声纹核心 -->
+    <div class="core-wrap">
+      <canvas id="core" width="128" height="128"></canvas>
+    </div>
+
+    <!-- 中间: 状态与字幕 -->
+    <div class="meta">
+      <div class="row">
+        <span class="title" id="title">待命</span>
+        <span class="tag" id="tag">IDLE</span>
+      </div>
+      <div class="sub" id="sub">系统在线</div>
+    </div>
+
+    <!-- 右侧: 微型电平条 -->
+    <div class="bars" id="bars"></div>
+
+    <!-- 确认按钮组 -->
+    <div class="guard">
+      <button class="btn ok" id="btn-ok">确认</button>
+      <button class="btn no" id="btn-no">取消</button>
+    </div>
+  </div>
+
+<script src="hud.js"></script>
+</body>
+</html>
