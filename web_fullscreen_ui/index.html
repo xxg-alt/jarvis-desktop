@@ -497,12 +497,28 @@ body.calm #togs,body.calm #cmd{opacity:0;pointer-events:none}
     <div class="full">
     <div class="ttl"><span>AI 大模型配置</span><button class="cbtn" aria-label="收起">–</button></div>
     <select id="provider" class="fld" aria-label="服务商">
-      <option>DeepSeek</option><option>OpenAI</option><option>Claude</option><option>通义千问</option><option>Kimi</option>
+      <option>DeepSeek</option>
+      <option>通义千问 (Qwen)</option>
+      <option>智谱清言 (GLM)</option>
+      <option>Moonshot (Kimi)</option>
+      <option>Google Gemini</option>
+      <option>OpenAI (ChatGPT)</option>
+      <option>Anthropic Claude</option>
+      <option>自定义 API (OpenAI兼容)</option>
     </select>
+    <div style="display:grid;gap:8px;margin:9px 0">
+      <select id="aiModel" class="fld" aria-label="模型">
+        <option>deepseek-chat</option>
+        <option>deepseek-reasoner</option>
+      </select>
+      <input id="aiModelCustom" type="text" class="fld" placeholder="输入模型名（自定义服务商使用）" autocomplete="off" style="display:none">
+      <input id="aiUrl" type="url" class="fld" placeholder="接口地址（留空用默认；自定义 API 必填）" autocomplete="off">
+    </div>
     <div style="display:flex;gap:8px;margin:9px 0">
       <input id="apikey" type="password" class="fld" placeholder="输入 API Key" autocomplete="off">
       <button id="save" class="btn">保存</button>
     </div>
+    <button id="test" class="btn" style="width:100%;margin-top:2px">保存并测试</button>
     <span id="mstat" class="badge off"><i></i><span>大模型未连接</span></span>
     <div class="ttl" style="margin-top:22px">功能模块 <small>可扩展</small></div>
     <div class="grid3" id="mods">
@@ -517,7 +533,7 @@ body.calm #togs,body.calm #cmd{opacity:0;pointer-events:none}
   </section>
 
   <!-- 中央字幕与控制 -->
-  <div id="sub">贾维斯已上线，喊贾维斯就能叫我</div>
+  <div id="sub">贾维斯已上线，随时待命</div>
   <div id="togs">
     <button class="tog on" data-k="vision">视觉感知 <em>[ON]</em></button>
     <button class="tog" data-k="auto">自动接管 <em>[OFF]</em></button>
@@ -806,8 +822,8 @@ function addLog(line){
 }
 function setModelStatus(ok,name){
   const b=$('mstat');b.className='badge'+(ok?'':' off');
-  b.lastChild.textContent=ok?`大模型已连接${name?' · '+name:''}`:'大模型未连接';
-  const m=$('miniM');m.className='badge'+(ok?'':' off');m.lastChild.textContent=ok?(name||'已连接'):'未连接';
+  b.lastChild.textContent=ok?`AI 已配置${name?' · '+name:''}（未验证）`:'AI 未配置';
+  const m=$('miniM');m.className='badge'+(ok?'':' off');m.lastChild.textContent=ok?(name||'已配置'):'未配置';
 }
 let typTimer=null,outTimer=null,outQueue=[],outToken=0;
 function splitOutput(text){
@@ -828,16 +844,16 @@ function splitOutput(text){
     }
     if(rest)out.push(rest);
   }
-  if(out.length>1&&out[out.length-1].length<6)out[out.length-2]+=out.pop();
+  if(out.length>1&&out[out.length-1].length<3)out[out.length-2]+=out.pop();
   return out;
 }
 function typeText(text,token){
   token=(token==null)?outToken:token;
-  clearTimeout(typTimer);const s=$('sub');s.style.opacity='1';s.textContent='';let i=0;
-  (function n(){
-    if(token!==outToken)return;
-    if(i<=text.length){s.textContent=text.slice(0,i++);typTimer=setTimeout(n,Math.max(18,52-text.length*.35))}
-  })();
+  clearTimeout(typTimer);
+  const s=$('sub');
+  s.style.opacity='1';
+  // 字幕必须跟语音同步：整句立即出现，不再逐字打字拖慢半秒以上。
+  s.textContent=String(text||'');
 }
 function clearOutput(token){
   token=(token==null)?outToken:token;
@@ -873,9 +889,94 @@ function setAudioLevel(v){audioT=Math.max(0,Math.min(1,+v||0));if(audioT>.12)wak
 function setTelemetry(o={}){['cpu','ram','disk'].forEach(k=>{if(o[k]!=null)ring(k,o[k])})}
 
 $('save').onclick=()=>{
-  const d={provider:$('provider').value,apiKey:$('apikey').value};
+  const btn=$('save');
+  if(btn.disabled)return;
+  const d={
+    provider:$('provider').value,
+    model:getModelValue(),
+    url:$('aiUrl').value.trim(),
+    apiKey:$('apikey').value
+  };
+  btn.disabled=true;btn.textContent='保存中…';
   addLog('模型配置已提交: '+d.provider);emit('saveModel',d);
+  setTimeout(()=>{btn.disabled=false;btn.textContent='保存'},1500);
 };
+$('test').onclick=()=>{
+  const btn=$('test');
+  if(btn.disabled)return;
+  const d={
+    provider:$('provider').value,
+    model:getModelValue(),
+    url:$('aiUrl').value.trim(),
+    apiKey:$('apikey').value
+  };
+  btn.disabled=true;btn.textContent='测试连接中，请稍候…';
+  addLog('保存并测试 AI 连接…');emit('testModel',d);
+  // 测试请求有 25s 超时，30s 后恢复按钮作为兜底
+  setTimeout(()=>{btn.disabled=false;btn.textContent='保存并测试'},30000);
+};
+
+/* ============ 模型下拉：清单来自后端 LLM_PROVIDERS，按服务商自动切换 ============ */
+let providerModels = {
+  "DeepSeek": ["deepseek-chat", "deepseek-flash", "deepseek-v4-pro", "deepseek-reasoner"],
+  "通义千问 (Qwen)": ["qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max-0902", "qwen3.7-flash", "qwen4-max-preview", "qwen-plus"],
+  "智谱清言 (GLM)": ["glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-4.7", "glm-4.5-flash"],
+  "Moonshot (Kimi)": ["kimi-k3", "kimi-k2.6", "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "kimi-k2.7-code"],
+  "Google Gemini": ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  "OpenAI (ChatGPT)": ["gpt-5.2", "gpt-5.2-chat", "gpt-5.3-codex", "gpt-5.1", "gpt-4o-mini"],
+  "Anthropic Claude": ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-sonnet-4-6"],
+  "自定义 API (OpenAI兼容)": []
+};
+window.__jarvisSetProviderModels = m => {
+  if (m && typeof m === 'object') {
+    Object.assign(providerModels, m);
+  }
+};
+function syncModelSelect(selected){
+  const sel=$('aiModel'),custom=$('aiModelCustom');
+  if(!sel||!custom)return;
+  const provider=$('provider').value;
+  const list=Array.isArray(providerModels[provider])?providerModels[provider].slice():[];
+  const isCustomProvider=provider==='自定义 API (OpenAI兼容)';
+  sel.innerHTML='';
+  if(isCustomProvider){
+    sel.style.display='none';
+    custom.style.display='';
+    if(selected)custom.value=String(selected);
+    return;
+  }
+  sel.style.display='';
+  custom.style.display='none';
+  const values=list.map(String).filter(Boolean);
+  const current=String(selected||'').trim();
+  if(current&&current!=='__custom__'&&!values.includes(current))values.push(current);
+  values.forEach(m=>{const o=document.createElement('option');o.value=o.textContent=m;sel.appendChild(o)});
+  const other=document.createElement('option');
+  other.value='__custom__';other.textContent='其他模型（手动输入）';
+  sel.appendChild(other);
+  let want=current;
+  if(!want||![...sel.options].some(o=>o.value===want))want=values[0]||'__custom__';
+  sel.value=want;
+  if(want==='__custom__'){
+    custom.style.display='';
+    custom.value=current&&current!=='__custom__'?current:'';
+  }
+}
+function getModelValue(){
+  const provider=$('provider').value;
+  const sel=$('aiModel'),custom=$('aiModelCustom');
+  if(provider==='自定义 API (OpenAI兼容)')return custom?custom.value.trim():'';
+  if(sel&&sel.value==='__custom__')return custom?custom.value.trim():'';
+  return sel?sel.value.trim():'';
+}
+window.__jarvisSyncModelSelect=syncModelSelect;
+$('provider').addEventListener('change',()=>syncModelSelect(''));
+$('aiModel').addEventListener('change',()=>{
+  const custom=$('aiModelCustom'),sel=$('aiModel');
+  if(!custom||!sel)return;
+  custom.style.display=sel.value==='__custom__'?'':'none';
+  if(sel.value==='__custom__')custom.focus();
+});
 document.querySelectorAll('.slot').forEach(b=>b.onclick=()=>{addLog('预留槽位 #'+b.dataset.slot+' 被点击');emit('slot',{index:+b.dataset.slot})});
 let mic=null;
 async function toggleMic(){
@@ -917,7 +1018,7 @@ function wake(){lastAct=performance.now();if(!calm)return;calm=false;document.bo
 function enterCalm(){if(calm)return;calm=true;document.body.classList.add('calm');['pL','pR'].forEach(id=>{const p=$(id);if(!p.classList.contains('collapsed')){p.classList.add('collapsed');autoCol.push(id)}});if(window.JarvisHUD)window.JarvisHUD.setAnimating(false)}
 ['pointerdown','keydown','mousemove','touchstart'].forEach(ev=>addEventListener(ev,wake,{passive:true}));
 setInterval(()=>{if(!calm&&state==='idle'&&performance.now()-lastAct>15000)enterCalm()},1000);
-$('sub').textContent='';setTimeout(()=>setOutput('贾维斯已上线，喊贾维斯就能叫我'),location.hash==='#noboot'?0:3500);
+$('sub').textContent='';setTimeout(()=>setOutput('贾维斯已上线，随时待命'),location.hash==='#noboot'?0:3500);
 
 /* 面板收起 / 展开 */
 const setCol=(id,c)=>{$(id).classList.toggle('collapsed',c);try{localStorage.setItem('jv-'+id,c?1:0)}catch(e){}};
@@ -963,6 +1064,7 @@ window.JarvisUI={
 
 /* 演示数据：一旦后端调用接口（ext=true）即自动停止 */
 setTelemetry({cpu:34,ram:58,disk:71});setModelStatus(true,'DeepSeek');
+syncModelSelect('deepseek-chat');
 ['系统自检完成','音频输入设备就绪','等待唤醒词 “贾维斯”'].forEach(addLog);
 setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math.random()*6,disk:71})},2200);
 })();
@@ -989,8 +1091,14 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
   function callApi(name, ...args) {
     const api = window.pywebview && window.pywebview.api;
     if (api && typeof api[name] === 'function') {
-      try { return Promise.resolve(api[name](...args)); }
-      catch (e) { errors.push(String(e && e.message || e)); }
+      // pywebview JS→Python 调用是同步阻塞 WebView2 UI 线程的；
+      // 用 setTimeout(0) 解耦，让调用不卡住页面交互和 evaluate_js 推送。
+      return new Promise(resolve => {
+        setTimeout(() => {
+          try { resolve(api[name](...args)); }
+          catch (e) { errors.push(String(e && e.message || e)); resolve(false); }
+        }, 0);
+      });
     }
     return new Promise(resolve => apiQueue.push({name, args, resolve}));
   }
@@ -1048,7 +1156,8 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
     b.classList.toggle('on', !!on);
   }
 
-  function populateProviders(list) {
+  function populateProviders(list, models) {
+    if (models && window.__jarvisSetProviderModels) window.__jarvisSetProviderModels(models);
     if (!Array.isArray(list) || !list.length) return;
     const sel = document.getElementById('provider');
     if (!sel) return;
@@ -1060,28 +1169,39 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
       sel.appendChild(o);
     });
     if (list.map(String).includes(current)) sel.value = current;
+    if (window.__jarvisSyncModelSelect) window.__jarvisSyncModelSelect(current);
   }
 
   function applyConfig(cfg) {
     if (!cfg || typeof cfg !== 'object') return;
-    const key = JSON.stringify([cfg.ai_provider, cfg.tts_voice, cfg.robot_voice,
-      cfg.vision_enabled, cfg.always_listen, !!cfg.api_key, cfg.providers]);
+    const keySet = !!(cfg.api_key || cfg.api_key_set);
+    const key = JSON.stringify([cfg.ai_provider, cfg.ai_model, cfg.ai_url, cfg.tts_voice, cfg.robot_voice,
+      cfg.vision_enabled, cfg.always_listen, keySet, cfg.api_key_hint, cfg.providers]);
     if (key === lastConfigKey) return;
     lastConfigKey = key;
-    if (cfg.providers) populateProviders(cfg.providers);
+    if (cfg.providers) populateProviders(cfg.providers, cfg.provider_models);
     if (cfg.ai_provider) {
       const sel = document.getElementById('provider');
       if (sel && [...sel.options].some(o => o.value === cfg.ai_provider)) sel.value = cfg.ai_provider;
     }
+    if (window.__jarvisSyncModelSelect) window.__jarvisSyncModelSelect(cfg.ai_model);
+    const url = document.getElementById('aiUrl');
+    if (url) url.value = String(cfg.ai_url || '');
     if ('vision_enabled' in cfg) setToggle('vision', !!cfg.vision_enabled);
     if ('always_listen' in cfg) setToggle('auto', !!cfg.always_listen);
     if ('tts_voice' in cfg || 'robot_voice' in cfg) {
       const style = cfg.robot_voice ? 'C' : (String(cfg.tts_voice) === '云扬' ? 'B' : 'A');
       if (UI.setVoiceStyle) UI.setVoiceStyle(style);
     }
-    UI.setModelStatus(!!cfg.api_key, cfg.ai_provider || '');
+    UI.setModelStatus(keySet, cfg.ai_provider || '');
     const ak = document.getElementById('apikey');
-    if (ak) ak.placeholder = cfg.api_key ? '已配置（留空保持不变）' : '输入 API Key';
+    if (ak) {
+      // 密钥明文不进页面, 但要把"已保存的是哪一把"写出来, 否则用户看到空框会以为没存住
+      const hint = String(cfg.api_key_hint || '');
+      ak.placeholder = keySet
+        ? (hint && hint !== '未配置' ? `已保存 ${hint} · 留空保持不变` : '已配置 · 留空保持不变')
+        : '输入 API Key';
+    }
   }
 
   function clearGuard(reset) {
@@ -1140,8 +1260,9 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
       UI.setState(stateMap[String(snap.state).toUpperCase()] || (snap.speaking ? 'speaking' : 'idle'));
     }
     if (snap.level != null) UI.setAudioLevel(snap.level);
-    const out = (typeof payload.output === 'string' && payload.output.trim())
-      ? payload.output : (snap.subtitle || '');
+    const snapSub = String(snap.subtitle || '').trim();
+    const out = snapSub || ((typeof payload.output === 'string' && payload.output.trim())
+      ? payload.output : '');
     if (out && out !== lastOutput) { lastOutput = out; UI.setOutput(out); }
     else if (!out && lastOutput) { lastOutput = ''; UI.clearOutput(); }
     const m = payload.metrics || {};
@@ -1152,6 +1273,11 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
     (payload.logs || []).forEach(line => { if (line) UI.addLog(String(line)); });
     if (payload.notice && payload.notice.message) {
       UI.addLog((payload.notice.ok === false ? '错误: ' : '') + payload.notice.message);
+      // 收到测试结果后恢复测试按钮
+      const testBtn = document.getElementById('test');
+      if (testBtn && testBtn.disabled) { testBtn.disabled = false; testBtn.textContent = '保存并测试'; }
+      const saveBtn = document.getElementById('save');
+      if (saveBtn && saveBtn.disabled) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
     }
     handleGuard(snap.guard);
   }
@@ -1173,10 +1299,25 @@ setInterval(()=>{if(ext)return;setTelemetry({cpu:30+Math.random()*20,ram:56+Math
   });
   addEventListener('jarvis:saveModel', e => {
     const d = e.detail || {};
-    const patch = {ai_provider:String(d.provider || '')};
+    const patch = {
+      ai_provider:String(d.provider || ''),
+      ai_model:String(d.model || ''),
+      ai_url:String(d.url || '')
+    };
     const key = String(d.apiKey || '').trim();
     if (key) patch.api_key = key;
     callApi('save_config', patch);
+  });
+  addEventListener('jarvis:testModel', e => {
+    const d = e.detail || {};
+    const patch = {
+      ai_provider:String(d.provider || ''),
+      ai_model:String(d.model || ''),
+      ai_url:String(d.url || '')
+    };
+    const key = String(d.apiKey || '').trim();
+    if (key) patch.api_key = key;
+    callApi('test_llm', patch);
   });
   addEventListener('jarvis:toggle', e => {
     const d = e.detail || {};

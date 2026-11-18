@@ -62,8 +62,8 @@ def _build(hotwords=None):
             print(f"[系统语音] 热词表加载失败(不影响使用): {e}")
     # 调参: 更愿意等用户说完, 减少半句话就被截断
     try:
-        rec.timeouts.initial_silence_timeout = 6_000_000      # 100ns 单位 -> 0.6s
-        rec.timeouts.end_silence_timeout = 900_000            # 0.09s 静音就结束
+        rec.timeouts.initial_silence_timeout = 10_000_000     # 100ns 单位 -> 1.0s
+        rec.timeouts.end_silence_timeout = 5_000_000          # 0.5s 静音才结束 (0.09s 太短)
         rec.timeouts.babble_timeout = 60_000_000              # 6s 无效语音
     except Exception:
         pass

@@ -19,6 +19,8 @@ import time
 import webbrowser
 from pathlib import Path
 
+import audio_device
+
 BASE = Path(__file__).resolve().parent
 DRY_RUN = False
 # GUI 外壳回调（终端版保持 None）：文字、语音播放结束和麦克风音量。
@@ -63,6 +65,10 @@ def load_config():
         "robot_voice": 0.7,
         "always_listen": True,
         "vision_enabled": True,
+        "ai_provider": "DeepSeek",
+        "api_key": "",
+        "ai_model": "",
+        "ai_url": "",
         # auto = 优先本地 whisper(中英文都准) -> 系统引擎 -> Vosk
         "stt_engine": "auto",
         "whisper_model": "small",
@@ -161,7 +167,7 @@ def _split_sentences(text, max_len=56):
             part = part[cut + 1 :].strip()
         if part:
             out.append(part)
-    if len(out) > 1 and len(out[-1]) < 6:
+    if len(out) > 1 and len(out[-1]) < 3:
         tail = out.pop()
         out[-1] = (out[-1] + tail).strip()
     return out
@@ -261,12 +267,20 @@ def _speak_one(text, on_start=None):
 
 
 def _speak(text):
-    """逐句显示 + 逐句播放：字幕永远只出现当前这一句。
+    """整段连续 TTS + 句边界字幕；Edge 不可用时退回逐句播放。
 
-    每句流程：
-      显示当前句 -> TTS 播放 -> 清空字幕 -> 留白约 0.9 秒 -> 出现下一句
-    最后一句播完再停留约 2.2 秒，然后清空字幕（避免整段长期挂在屏幕中央）。
+    连续模式：
+      Edge 流式合成 -> 首块音频到达即播放 -> 字幕按云端句边界时间戳切换
+      -> 整段音频结束后字幕停留约 2.2 秒再清空
+    这样句间不再有“合成一句、播一句、停 0.9 秒”的机械断裂。
+
+    兼容模式（Edge 失败时）：
+      仍然逐句显示 + 逐句播放，保证没有 Edge 时也能出声。
+
+    重要：只有真正有音频在播时才把 is_speaking() 置为真；句间和最后字幕
+    停留期放开麦克风，用户在贾维斯说完后立刻开口不会被整句丢掉。
     """
+    global _SPEAKING_UNTIL, _CURRENT_STOP_EVENT
     text = str(text or "").strip()
     if not text:
         return
@@ -289,6 +303,116 @@ def _speak(text):
             ui_bridge.emit_subtitle("", True)
         return
 
+    # 解析机械音强度, 供连续流式和逐句兜底共用
+    robot_cfg = CONFIG.get("robot_voice", 0)
+    if robot_cfg is True:
+        robot_cfg = 0.7
+    try:
+        robot_cfg = float(robot_cfg)
+    except (TypeError, ValueError):
+        robot_cfg = 0.0
+
+    voice_choice = CONFIG.get("tts_voice", "云扬")
+    tts_engine_type = str(CONFIG.get("tts_engine", "edge") or "edge").lower()
+    streamed = False
+    stream_started = False
+    stream_interrupted = False
+
+    # ── 首选：Edge 整段流式连续播放 ──
+    if tts_engine_type == "edge":
+        try:
+            from edge_speech import speak_edge_streaming
+        except Exception:
+            speak_edge_streaming = None
+
+        if speak_edge_streaming is not None:
+            print(f"[TTS] 连续流式 · {'机械音' if robot_cfg > 0 else '自然音'} · {voice_choice}")
+            stop_event = threading.Event()
+            _CURRENT_STOP_EVENT = stop_event
+            esc_handler = None
+            try:
+                import keyboard
+                # 只在本次播报期间注册 Esc；按一下立即停下并回到监听
+                esc_handler = keyboard.add_hotkey("esc", stop_event.set)
+            except Exception:
+                esc_handler = None
+
+            last_stream_sentence = [None]
+
+            def stream_start():
+                global _SPEAKING_UNTIL
+                nonlocal stream_started
+                stream_started = True
+                # 整段播放窗口; 结束后会收紧到 0.25 秒
+                _SPEAKING_UNTIL = time.time() + max(8.0, min(600.0, len(text) * 0.5 + 15.0))
+                first = sentences[0]
+                last_stream_sentence[0] = first
+                if ui_bridge is not None:
+                    ui_bridge.emit_subtitle(first, True)
+                if ON_SPEAK is not None:
+                    try:
+                        ON_SPEAK(first)
+                    except Exception:
+                        pass
+
+            def stream_sentence(sentence):
+                sentence = str(sentence or "").strip()
+                if not sentence or sentence == last_stream_sentence[0]:
+                    return
+                last_stream_sentence[0] = sentence
+                if ui_bridge is not None:
+                    ui_bridge.emit_subtitle(sentence, True)
+                if ON_SPEAK is not None:
+                    try:
+                        ON_SPEAK(sentence)
+                    except Exception:
+                        pass
+
+            try:
+                speak_edge_streaming(
+                    text,
+                    voice_choice,
+                    on_start=stream_start,
+                    on_sentence=stream_sentence,
+                    robot_intensity=robot_cfg,
+                    stop_event=stop_event,
+                    on_level=_emit_audio_level,
+                )
+                streamed = True
+                stream_interrupted = stop_event.is_set()
+            except Exception as e:
+                print(f"[连续 TTS 失败] {type(e).__name__}: {str(e)[:180]}")
+                if stop_event.is_set():
+                    # 用户在首块音频前按了 Esc：不要回退去重播整段
+                    streamed = True
+                    stream_started = True
+                    stream_interrupted = True
+                elif stream_started:
+                    # 已经出过声：不再整段重播，避免重复；保持已显示字幕并尽快恢复监听
+                    streamed = True
+                    stream_interrupted = True
+            finally:
+                _CURRENT_STOP_EVENT = None
+                if esc_handler is not None:
+                    try:
+                        import keyboard
+                        keyboard.remove_hotkey(esc_handler)
+                    except Exception:
+                        pass
+
+            if streamed:
+                _SPEAKING_UNTIL = time.time() + (0.1 if stream_interrupted else 0.25)
+                if not stream_interrupted:
+                    # 最后一句字幕停留是视觉效果，不阻塞麦克风
+                    time.sleep(2.2)
+                if ui_bridge is not None:
+                    try:
+                        ui_bridge.emit_subtitle("", True)
+                    except Exception:
+                        pass
+                return
+
+    # ── 兜底：逐句播放（Edge 不可用或首块音频都没出来）──
     try:
         for i, sentence in enumerate(sentences):
             started = False
@@ -307,7 +431,11 @@ def _speak(text):
                     except Exception:
                         pass
 
+            # 只在这一句的“合成 + 播放”窗口内屏蔽麦克风，留足余量防止尾音回声。
+            _SPEAKING_UNTIL = time.time() + max(8.0, min(60.0, len(sentence) * 0.5 + 3.0))
             _speak_one(sentence, start)
+            # 这一句音频已经结束，句间留白不再屏蔽，用户这时开口不会被整句丢掉。
+            _SPEAKING_UNTIL = time.time() + 0.25
             # 极端情况下没有任何 TTS 能播放，也至少把这一句显示出来。
             if not started:
                 start()
@@ -316,10 +444,12 @@ def _speak(text):
                 if ui_bridge is not None:
                     ui_bridge.emit_subtitle("", True)
                 time.sleep(0.9)
-        # 最后一句播完后多停留一会儿，再清空。
+        # 最后一句音频结束后，字幕停留 2.2 秒只是视觉效果，不应继续屏蔽麦克风。
+        _SPEAKING_UNTIL = time.time() + 0.25
         time.sleep(2.2)
     finally:
         # 即使 TTS 中途失败，也不能把最后一句留在屏幕中央。
+        _SPEAKING_UNTIL = time.time() + 0.25
         if ui_bridge is not None:
             try:
                 ui_bridge.emit_subtitle("", True)
@@ -333,12 +463,13 @@ def speak(text):
     if not str(text).strip():
         return
     # 播放期间标记"我在说话": 识别端据此丢弃自己声音的回声, 避免自问自答。
-    # 逐句播放会让长回答的总时长变长，按字数动态放宽，避免说到一半就被当成“已说完”。
-    _SPEAKING_UNTIL = time.time() + max(60.0, min(600.0, len(str(text)) * 0.45 + 15.0))
+    # 这里只给一个初始窗口; _speak() 会按每一句的真实播放起止重新收紧/放开。
+    _SPEAKING_UNTIL = time.time() + max(8.0, min(600.0, len(str(text)) * 0.5 + 15.0))
     try:
         _speak(text)
     finally:
-        _SPEAKING_UNTIL = time.time() + 0.8
+        # 最后一段字幕停留不应继续屏蔽麦克风, 只留 0.25 秒尾音保护。
+        _SPEAKING_UNTIL = time.time() + 0.25
         if ON_SPEAK_END is not None:
             try:
                 ON_SPEAK_END()
@@ -353,6 +484,19 @@ def speak(text):
 
 
 _SPEAKING_UNTIL = 0.0
+_CURRENT_STOP_EVENT = None
+
+
+def stop_speaking():
+    """强制掐断当前正在播放的语音并释放说话锁。"""
+    global _SPEAKING_UNTIL, _CURRENT_STOP_EVENT
+    _SPEAKING_UNTIL = 0.0
+    if _CURRENT_STOP_EVENT is not None:
+        try:
+            _CURRENT_STOP_EVENT.set()
+        except Exception:
+            pass
+        _CURRENT_STOP_EVENT = None
 
 
 def is_speaking():
@@ -580,18 +724,19 @@ def execute_plan(plan):
         if DRY_RUN:
             print(f"[dry-run] 危险动作 {action} 需要确认, 已跳过执行")
             return
-        question = f"你说的是{action}, 确定要执行吗"
+        desc = plan.get("guard_desc") or f"执行操作：{action}"
+        question = f"即将{desc}，确定要执行吗，Sir？"
         verdict = None
-        # 优先在胶囊上点确认; 没界面 (终端模式) 就退回原来的语音/键盘确认
+        # 优先在胶囊/全屏 HUD 上唤起高危操作确认卡片（带描述文本）
         if ui_bridge is not None:
             try:
-                verdict = ui_bridge.request_guard_confirm(question)
+                verdict = ui_bridge.request_guard_confirm(desc)
             except Exception:
                 verdict = None
         if verdict is None:
             verdict = confirm(question)
         if not verdict:
-            speak("已取消")
+            speak("好的，已取消操作，Sir。")
             return
 
     if DRY_RUN:
@@ -932,9 +1077,9 @@ def _wake_loop_vosk(hotkey_event):
     if _vosk_model is None:
         _vosk_model = vosk.Model(str(MODEL_DIR))
     rec = vosk.KaldiRecognizer(_vosk_model, 16000)
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                     input=True, frames_per_buffer=4000)
+    # 借用进程级 PortAudio 单例；不要 terminate，那会拆掉 TTS 输出/其它输入流
+    stream = audio_device.open_input(format=pyaudio.paInt16, channels=1, rate=16000,
+                                     input=True, frames_per_buffer=4000)
     print("正在听唤醒词(离线):", CONFIG["wake_words"])
     _ui_listening()
     if CONFIG.get("always_listen", True):
@@ -1026,12 +1171,7 @@ def _wake_loop_vosk(hotkey_event):
                     rec.Reset()
                 continue
     finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-        except Exception:
-            pass
+        audio_device.release_stream(stream)
 
 
 def _wake_loop_winrt(hotkey_event):
@@ -1093,6 +1233,10 @@ def _wake_loop_winrt(hotkey_event):
             continue
         if not text:
             continue
+        # 用户打断（Barge-in）：如果贾维斯此时正在说话，用户开口说了有效指令，立刻掐断旧播报
+        if is_speaking():
+            stop_speaking()
+            time.sleep(0.08)
         if _wake_hit(text):
             rest = _strip_wake(text)
             print(f"[唤醒] 听到: {text}")
@@ -1124,6 +1268,16 @@ def _wake_loop_whisper(hotkey_event):
     stop = threading.Event()
     ready = threading.Event()
     failure = {}
+    worker_dead = threading.Event()
+
+    def _on_mic_error(msg):
+        """麦克风穷尽自愈手段后的最后一道通知：界面不能再假装在听。"""
+        print(f"[语音] 麦克风故障: {msg}")
+        if ui_bridge is not None:
+            try:
+                ui_bridge.emit_subtitle("麦克风异常，正在尝试恢复…", True)
+            except Exception:
+                pass
 
     def _worker():
         try:
@@ -1131,11 +1285,17 @@ def _wake_loop_whisper(hotkey_event):
                 pending.put, stop,
                 ignore_while=is_speaking, on_ready=ready.set,
                 size=size, on_level=_emit_audio_level,
+                # 本机主要是中文指令; 强制 zh 可避免 Whisper 把短句误判成英文
+                # ("Hello"/"Uh-uh" 这类碎片), 英文单词仍会被中文模型尽量音译识别。
+                language=str(CONFIG.get("whisper_language", "zh")),
+                on_error=_on_mic_error,
             )
         except Exception as e:
             failure["error"] = e
+        finally:
+            worker_dead.set()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, name="whisper-listen", daemon=True).start()
     if not ready.wait(30):
         stop.set()
         raise failure.get("error") or RuntimeError("whisper 启动超时")
@@ -1157,6 +1317,19 @@ def _wake_loop_whisper(hotkey_event):
         follow_until = time.time() + 12
 
     while True:
+        if worker_dead.is_set():
+            # 监听线程真的退出了。绝不能继续在这个循环里空转（那就是"卡死"的样子），
+            # 直接起一个新的监听线程，让语音能力自愈。
+            worker_dead.clear()
+            err = failure.pop("error", None)
+            print(f"[语音] 监听线程已退出({err!r})，自动重启…")
+            ready.clear()
+            threading.Thread(target=_worker, name="whisper-listen", daemon=True).start()
+            if not ready.wait(10):
+                print("[语音] 监听线程重启失败，请检查麦克风设备")
+            else:
+                print("[语音] 监听线程已恢复")
+            continue
         if hotkey_event.is_set():
             hotkey_event.clear()
             speak("我在")
@@ -1168,6 +1341,10 @@ def _wake_loop_whisper(hotkey_event):
             continue
         if not text:
             continue
+        # 用户打断（Barge-in）：如果贾维斯此时正在说话，用户开口说了有效指令，立刻掐断旧播报
+        if is_speaking():
+            stop_speaking()
+            time.sleep(0.08)
         if _wake_hit(text):
             rest = _strip_wake(text)
             print(f"[唤醒] 听到: {text}")
@@ -1188,7 +1365,7 @@ def _wake_loop_whisper(hotkey_event):
 
 def wake_loop():
     import speech_recognition as sr
-    speak("贾维斯已上线, 喊贾维斯就能叫我, 也可以按 Ctrl Alt J")
+    speak("贾维斯已上线，随时待命")
     # 热键线程
     hotkey_event = threading.Event()
     try:

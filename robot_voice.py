@@ -15,6 +15,8 @@ import wave
 
 import numpy as np
 
+import audio_device
+
 
 # ═══════════════ 核心: 音频效果 ═══════════════
 
@@ -155,18 +157,18 @@ def speak_robot(engine, text: str, intensity: float = 0.7):
             processed = apply_robot_effect(samples, framerate, intensity)
             output_bytes = processed.tobytes()
 
-        # 播放
-        pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pa.get_format_from_width(sample_width),
+        # 播放: 借用进程级 PortAudio 单例，只关自己的输出流，绝不 terminate ——
+        # 否则会把 whisper 的常驻输入流一起拆掉（说完一句就听不见的根因）
+        stream = audio_device.open_output(
+            format=audio_device.get_pyaudio().get_format_from_width(sample_width),
             channels=n_channels,
             rate=framerate,
             output=True,
         )
-        stream.write(output_bytes)
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+        try:
+            stream.write(output_bytes)
+        finally:
+            audio_device.release_stream(stream)
 
     finally:
         try:

@@ -19,18 +19,47 @@ import threading
 import time
 from pathlib import Path
 
+import audio_device
+
 BASE = Path(__file__).resolve().parent
 SAMPLE_RATE = 16000
 CHUNK = 480                 # 30ms
-_PRE_ROLL = 10              # 保留 300ms 前置音频, 避免吃掉字头
-_SIL_END = 18               # 连续 540ms 静音视为说完
-_MIN_SPEECH = 15            # 至少 450ms 有效语音才算一句
+_PRE_ROLL = 12              # 保留 360ms 前置音频, 避免吃掉字头
+_SIL_END = 24               # 连续 720ms 静音才视为说完 (0.54s 对正常换气太短)
+_MIN_SPEECH = 12            # 至少 360ms 有效语音才算一句
 _MAX_UTTER = 400            # 单句最长 12s, 到点强制切
+_MAX_READ_FAILS = 8         # 连续读失败超过这次数就重建输入流
 
 SUPPORTED_SIZES = ("base", "small", "medium")
 _MODEL = None
 _MODEL_SIZE = None
 _LOAD_LOCK = threading.Lock()
+
+# faster-whisper / ctranslate2 的模型不是线程安全的：listen_continuous 的后台线程
+# 和 confirm() 里的 recognize_once 会同时打同一个 _MODEL，并发进 native 层会段错误
+# （进程静默消失、没有 traceback）。所有推理串行化，排队等待远比崩溃划算。
+_TRANSCRIBE_LOCK = threading.Lock()
+
+# 心跳：让外部能区分"真的在监听"和"线程还活着但再也读不到音频"
+_HEARTBEAT_LOCK = threading.Lock()
+_HEARTBEAT = {
+    "state": "idle",      # idle / listening / read_error / stopped / fatal
+    "last_read": 0.0,     # 最后一次成功读到音频块的时间
+    "read_fails": 0,      # 当前连续失败次数
+    "restarts": 0,        # 输入流重建次数
+    "last_error": "",
+}
+
+
+def last_heartbeat() -> dict:
+    """当前麦克风监听的实时状态快照 (供 UI / 看门狗判断是否真的在听)。"""
+    with _HEARTBEAT_LOCK:
+        return dict(_HEARTBEAT)
+
+
+def _beat(**kwargs):
+    with _HEARTBEAT_LOCK:
+        _HEARTBEAT.update(kwargs)
 
 # whisper 在纯噪音/呼吸声上容易编出来的句子, 直接丢掉
 _HALLUCINATION = (
@@ -99,6 +128,10 @@ def _load(size: str = "small"):
         return _MODEL
 
 
+# 常见简短有效口语/打招呼词白名单，即便字母少于4个也不过滤
+_ALLOWED_SHORT_EN = {"hi", "hey", "ok", "yes", "no", "bye", "jarvis"}
+
+
 def _clean(text: str) -> str:
     t = (text or "").strip()
     low = t.lower()
@@ -106,9 +139,13 @@ def _clean(text: str) -> str:
         if bad in low:
             return ""
     if not any("\u4e00" <= ch <= "\u9fff" for ch in t):
-        # 没有汉字时要求是像样的英文, 过滤 "you" "oh" 这类噪音碎片
+        # 没有汉字时检查是否在短词白名单中
+        pure_en = low.strip(" .?!,")
+        if pure_en in _ALLOWED_SHORT_EN:
+            return t.strip(" 。，,.！!？?、\n\t")
+        # 否则要求是像样的英文, 过滤 "you" "oh" 这类噪音碎片
         letters = sum(ch.isalpha() for ch in t)
-        if letters < 4 or len(t.split()) < 1 or low.strip(".") in _NOISE_EN:
+        if letters < 3 or len(t.split()) < 1 or pure_en in _NOISE_EN:
             return ""
     return t.strip(" 。，,.！!？?、\n\t")
 
@@ -123,7 +160,7 @@ def _normalize(arr):
     return arr
 
 
-def transcribe(audio, size: str = "small", language=None) -> str:
+def transcribe(audio, size: str = "small", language="zh") -> str:
     """audio: float32 numpy (16k 单声道) 或 int16 字节; 返回识别文本"""
     import numpy as np
     model = _load(size)
@@ -134,24 +171,27 @@ def transcribe(audio, size: str = "small", language=None) -> str:
     if arr.size < SAMPLE_RATE // 4:      # 短于 0.25s 不识别
         return ""
     arr = _normalize(arr)
-    segs, _info = model.transcribe(
-        arr,
-        language=language,               # None = 自动判断中/英
-        beam_size=1,
-        vad_filter=False,                # 上层已经切好句子, 不用再跑一遍 VAD
-        condition_on_previous_text=False,
-        without_timestamps=True,
-        # 给点中文语境: 否则模型偶尔会输出繁体字, 英文也不会因此受影响
-        initial_prompt="以下是普通话的句子。",
-    )
-    # whisper 在噪音上会一本正经地编句子, 用模型自带的置信度把这类结果挡掉
     keep = []
-    for s in segs:
-        if getattr(s, "no_speech_prob", 0.0) > 0.55:
-            continue
-        if getattr(s, "avg_logprob", 0.0) < -1.0:
-            continue
-        keep.append(s.text)
+    # 串行化推理：ctranslate2 的 segment 是惰性生成器，真正的计算发生在迭代时，
+    # 因此锁必须包住整个 transcribe + 迭代过程，而不是只包住调用。
+    with _TRANSCRIBE_LOCK:
+        segs, _info = model.transcribe(
+            arr,
+            language=language,               # 默认 zh; 只有显式传 None 才自动判断中/英
+            beam_size=1,
+            vad_filter=False,                # 上层已经切好句子, 不用再跑一遍 VAD
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            # 提供中英双语环境上下文: 避免英文短词被强制当成中文杂音丢掉，同时保持普通话优先级
+            initial_prompt="以下是普通话和常用英文指令（如 Hello, Hi, Jarvis, OK）的对话。",
+        )
+        # whisper 在噪音上会一本正经地编句子, 用模型自带的置信度把这类结果挡掉
+        for s in segs:
+            if getattr(s, "no_speech_prob", 0.0) > 0.65:
+                continue
+            if getattr(s, "avg_logprob", 0.0) < -1.2:
+                continue
+            keep.append(s.text)
     return _clean("".join(keep))
 
 
@@ -159,7 +199,9 @@ class _Segmenter:
     """能量 VAD: 把连续音频流切成一句一句"""
 
     def __init__(self):
-        self.floor = None
+        # 不能从 None 起步: 第一帧如果是小声说话, 会把 floor 直接设成说话电平,
+        # 门限反而永远压在自己的声音之上。给一个很低的初始基底, 让启动自检去校准。
+        self.floor = 5.0
         self.buf = []
         self.rolling = []
         self.speaking = False
@@ -167,9 +209,10 @@ class _Segmenter:
         self.voiced = 0
 
     def _threshold(self):
-        # 下限压到 150: 有些机器的麦克风阵列本身很"安静", 阈值太高会完全听不到
-        f = self.floor if self.floor and self.floor > 1 else 80.0
-        return max(150.0, min(4000.0, f * 2.0))
+        # 下限压到 65: 本机麦克风安静时峰值只有 39~99, 旧下限 150 会把小声说话整句漏掉。
+        # 用 floor*1.5+15 跟随环境噪声, 而不是死翻倍, 避免环境稍吵时门限被抬得过高。
+        f = self.floor if self.floor and self.floor > 1 else 10.0
+        return max(65.0, min(2500.0, f * 1.5 + 15.0))
 
     def push(self, chunk: bytes):
         """喂 30ms 音频; 返回一句话的 int16 字节 (没有就是 None)"""
@@ -224,11 +267,13 @@ class _Segmenter:
 
 
 def listen_continuous(on_text, stop_event=None, hotwords=None, ignore_while=None,
-                      on_ready=None, size="small", on_level=None):
+                      on_ready=None, size="small", on_level=None, language="zh",
+                      on_error=None):
     """后台线程持续听; 每识别出一句调用 on_text(text)
 
     ignore_while: 返回 True 时丢弃这句 (跳过贾维斯自己说话的回声)
     on_ready:     真正开始监听后回调一次
+    on_error:     输入流无法恢复时回调一次 (上层应把界面从 LISTENING 切走)
     """
     import pyaudio
 
@@ -237,50 +282,119 @@ def listen_continuous(on_text, stop_event=None, hotwords=None, ignore_while=None
 
     _load(size)   # 预热, 避免第一句话等 3 秒
 
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                     input=True, frames_per_buffer=CHUNK)
+    def _open_stream():
+        # 借用进程级 PortAudio 单例。绝不 terminate：
+        # 那会把同一进程里 TTS 输出流和其它输入流一起拆掉。
+        return audio_device.open_input(
+            format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+            input=True, frames_per_buffer=CHUNK,
+        )
+
+    stream = _open_stream()
     seg = _Segmenter()
     # 开机自检: 报一下麦克风实际电平, 方便判断"听不见"是设备问题还是嘴离太远
     try:
         import audioop
         probe = [audioop.rms(stream.read(CHUNK, exception_on_overflow=False), 2) for _ in range(10)]
-        print(f"[语音] 麦克风电平: 平均 {sum(probe)//10} 峰值 {max(probe)} (安静环境正常值 <200)")
-    except Exception:
-        pass
+        avg = sum(probe) / max(1, len(probe))
+        # 即使启动时几乎无声, 也要给一个低基底, 否则第一句小声说话会把 floor
+        # 直接抬成语音电平, 反而让门限永远高于自己的说话声。
+        seg.floor = max(5.0, avg)
+        print(f"[语音] 麦克风电平: 平均 {int(avg)} 峰值 {max(probe)} "
+              f"(安静环境正常值 <200), 当前门限 {seg._threshold():.0f}")
+    except Exception as e:
+        print(f"[语音] 电平自检失败, 继续监听: {type(e).__name__}: {e}")
     print("[语音] whisper 持续识别已启动")
+    _beat(state="listening", last_read=time.time(), read_fails=0, last_error="")
     if on_ready is not None:
         on_ready()
+
+    ignore_current = False
+    read_fails = 0
+    restarts = 0
+    beat_tick = 0
     try:
         while stop_event is None or not stop_event.is_set():
             try:
                 chunk = stream.read(CHUNK, exception_on_overflow=False)
-            except Exception:
+                if not chunk:
+                    # 空块说明设备已经不给数据了，必须当故障处理，不能继续空转
+                    raise IOError("麦克风返回空音频块")
+            except Exception as e:
+                read_fails += 1
+                _beat(state="read_error", read_fails=read_fails,
+                      last_error=f"{type(e).__name__}: {e}")
+                if read_fails < _MAX_READ_FAILS:
+                    # 短时抖动（缓冲溢出等）先退让一下，避免把 CPU 空转成 100%
+                    time.sleep(0.05)
+                    continue
+                # 连续读失败 = 输入流已经坏了。
+                # 旧代码在这里只是 continue 空转：界面显示"聆听中"、实际永远听不到，
+                # 这正是"卡死"的真身。现在改成重建流自愈。
+                print(f"[语音] 麦克风连续读取失败 {read_fails} 次 "
+                      f"({type(e).__name__}: {e})，正在重建输入流…")
+                audio_device.release_stream(stream)
+                stream = None
+                time.sleep(0.3)
+                try:
+                    stream = _open_stream()
+                except Exception as re_err:
+                    msg = f"麦克风无法恢复: {type(re_err).__name__}: {re_err}"
+                    print(f"[语音] {msg}")
+                    _beat(state="fatal", last_error=msg)
+                    if on_error is not None:
+                        try:
+                            on_error(msg)
+                        except Exception:
+                            pass
+                    raise RuntimeError(msg)
+                seg = _Segmenter()
+                read_fails = 0
+                restarts += 1
+                _beat(state="listening", read_fails=0, restarts=restarts,
+                      last_read=time.time(), last_error="")
+                print(f"[语音] 输入流已重建（第 {restarts} 次），继续监听")
                 continue
+
+            if read_fails:
+                # 从故障里恢复：立刻刷新心跳，让看门狗知道音频又开始流动了
+                read_fails = 0
+                _beat(state="listening", read_fails=0, last_error="")
+            beat_tick += 1
+            if beat_tick >= 10:          # 约 300ms 一次，不必每块都抢锁
+                beat_tick = 0
+                _beat(last_read=time.time())
             if on_level is not None:
                 try:
                     on_level(chunk)
                 except Exception:
                     pass
+            # 在“这句话刚开始”时判断是否处于贾维斯说话中。
+            # 不能等到整句结束再判断：用户如果在句间 0.9 秒留白里开口，
+            # 下一句 TTS 可能在他说完前又开始，末端判断会把这句整句误丢。
+            was_speaking = seg.speaking
             data = seg.push(chunk)
+            if not was_speaking and seg.speaking:
+                ignore_current = bool(ignore_while is not None and ignore_while())
             if not data:
                 continue
-            if ignore_while is not None and ignore_while():
+            if ignore_current:
+                ignore_current = False
                 continue
+            ignore_current = False
             try:
-                text = transcribe(data, size=size)
+                text = transcribe(data, size=size, language=language)
             except Exception as e:
                 print(f"[语音] 识别失败: {type(e).__name__}: {e}")
                 continue
             if text:
                 on_text(text)
+            elif len(data) / 2 / SAMPLE_RATE >= 0.5:
+                # 只记录“确实听到一段声音但没识别出字”的情况, 方便区分麦克风/VAD/模型三类问题
+                print(f"[语音] 切出一段 {len(data) / 2 / SAMPLE_RATE:.1f}s 音频, 但没识别出文字")
     finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-        except Exception:
-            pass
+        _beat(state="stopped")
+        audio_device.release_stream(stream)
 
 
 def recognize_once(timeout: float = 8.0, hotwords=None, size="small") -> str:
@@ -290,17 +404,31 @@ def recognize_once(timeout: float = 8.0, hotwords=None, size="small") -> str:
     if not available(size):
         return ""
     _load(size)
-    pa = pyaudio.PyAudio()
-    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                     input=True, frames_per_buffer=CHUNK)
+    try:
+        stream = audio_device.open_input(
+            format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+            input=True, frames_per_buffer=CHUNK,
+        )
+    except Exception as e:
+        print(f"[语音] 打开麦克风失败: {type(e).__name__}: {e}")
+        return ""
     seg = _Segmenter()
     end = time.time() + timeout
+    fails = 0
     try:
         while time.time() < end:
             try:
                 chunk = stream.read(CHUNK, exception_on_overflow=False)
-            except Exception:
+                if not chunk:
+                    raise IOError("麦克风返回空音频块")
+            except Exception as e:
+                fails += 1
+                if fails >= _MAX_READ_FAILS:
+                    print(f"[语音] 单次识别读取失败过多, 放弃: {type(e).__name__}: {e}")
+                    return ""
+                time.sleep(0.05)
                 continue
+            fails = 0
             data = seg.push(chunk)
             if not data:
                 continue
@@ -312,9 +440,4 @@ def recognize_once(timeout: float = 8.0, hotwords=None, size="small") -> str:
                 return text
         return ""
     finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-        except Exception:
-            pass
+        audio_device.release_stream(stream)

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as JsPushTimeout
 from pathlib import Path
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -82,6 +83,11 @@ class _Child:
         self._deferred_size = None             # 拖动期间收到的尺寸变化, 松手后再应用
         self._active = True                     # 窗口是否可见 (用于暂停前端 rAF)
         self._js_active = None
+        # evaluate_js 是无限期阻塞调用: 统一走单线程执行器 + 超时看门狗,
+        # 与全屏 HUD 的处理保持一致。之前这里是裸调用, 页面一断就把推送线程永久卡死。
+        self._js_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cap-js")
+        self._js_lock = threading.Lock()
+        self._pending_lock = threading.Lock()   # 主线程写 _pending / 推送线程读
 
     # ── Win32 小工具 ──
     def _wait_native(self, timeout=15.0):
@@ -311,39 +317,51 @@ class _Child:
         }
         js = f"window.JarvisUI && window.JarvisUI.update({json.dumps(payload, ensure_ascii=False)})"
         # evaluate_js 只能在页面加载完后调用, 否则会卡死接收线程 —— 交给专门的推送线程
-        self._pending = {"js": js, "state": st, "size": SIZES.get(st, SIZES["LISTENING"])}
-        self._pending_evt.set()
-        self._last_state = st
+        with self._pending_lock:
+            self._pending = {"js": js, "state": st, "size": SIZES.get(st, SIZES["LISTENING"])}
+            self._pending_evt.set()
+            self._last_state = st
+
+    def _push_js(self, js, what="状态"):
+        """带看门狗的 evaluate_js：超时即放弃该调用线程并更换执行器，推送管线继续存活。"""
+        executor = self._js_exec
+        fut = executor.submit(self.win.evaluate_js, js)
+        try:
+            fut.result(timeout=8)
+            return True
+        except JsPushTimeout:
+            print(f"[胶囊] 页面{what}注入超过8秒未完成，跳过本次以保活推送线程", flush=True)
+            with self._js_lock:
+                if self._js_exec is executor:
+                    self._js_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cap-js")
+            return False
+        except Exception as e:
+            print(f"[胶囊] 推送到页面失败: {e}", flush=True)
+            return False
 
     def _sync_page_animation(self):
         """页面隐藏时显式停掉 Canvas 循环，避免 WebView2 后台空转。"""
         if self._active == self._js_active:
             return
-        try:
-            self.win.evaluate_js(
-                "window.JarvisUI && window.JarvisUI.setAnimating("
-                + ("true" if self._active else "false") + ")"
-            )
+        js = ("window.JarvisUI && window.JarvisUI.setAnimating("
+              + ("true" if self._active else "false") + ")")
+        if self._push_js(js, "动画"):
             self._js_active = self._active
-        except Exception as e:
-            print(f"[胶囊] 暂停/恢复绘制失败: {e}", flush=True)
 
     def _js_worker(self):
         """单线程串行推送到页面, 避免多线程 evaluate_js 互相阻塞"""
         self._page_ready.wait(20)
         while True:
             self._pending_evt.wait(0.5)
-            job = self._pending
-            if not job:
+            with self._pending_lock:
+                job, self._pending = self._pending, None
                 self._pending_evt.clear()
+            if not job:
                 self._sync_page_animation()
                 continue
-            self._pending = None
-            self._pending_evt.clear()
-            try:
-                self.win.evaluate_js(job["js"])
-            except Exception as e:
-                print(f"[胶囊] 推送到页面失败: {e}", flush=True)
+            if not self._push_js(job["js"], "状态"):
+                # 注入失败（页面断开/渲染进程卡住）不能让推送线程陪葬：
+                # 继续下一轮，等页面恢复或由主进程重启子进程。
                 continue
             self._sync_page_animation()
             st = job["state"]

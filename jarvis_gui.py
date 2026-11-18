@@ -84,6 +84,11 @@ class OutputTee:
 sys.stdout = OutputTee()
 sys.stderr = OutputTee()
 
+# 接上日志文件之后立刻装好崩溃/线程看门狗：
+# pythonw 没有控制台，静默死亡和线程卡住否则不会留下任何证据
+import diagnostics
+diagnostics.enable(LOG_FILE)
+
 import jarvis
 from edge_speech import PRESET_VOICES
 
@@ -607,20 +612,29 @@ class TkFullscreenHUDWindow:
 
     def _save_api_key(self):
         new_key = self.key_var.get().strip()
-        if new_key:
-            from llm_brain import clean_api_key
-            if not clean_api_key(new_key):
-                # 常见情况: 粘进来一大段文字/带换行, 直接拒绝而不是写进配置
-                self.jarvis_text_var.set(
-                    "密钥格式不对：应该是一串不含空格和换行的字符（以 sk- 开头那种）。请重新复制一次再保存。")
-                print(f"[AI 密钥] 拒绝保存: 格式不合法 ({len(new_key)} 字符, 含空格或非 ASCII)")
-                return
+        from llm_brain import clean_api_key, key_hint
+        if not new_key:
+            # 留空 = "沿用已保存的那把", 不能用空串把它覆盖掉:
+            # 以前这里的写回语句在 if 之外, 于是框里没填内容点一次保存就把 Key 清空了。
+            hint = key_hint(jarvis.CONFIG.get("api_key"))
+            self.jarvis_text_var.set(
+                f"未输入新密钥，已保留原有配置：{hint}（服务商：{self.provider_var.get()}）。"
+                "如需更换，请先粘贴新密钥再点保存。")
+            print(f"[AI 密钥] 输入为空, 保留现有配置 ({hint})")
+            return
+        if not clean_api_key(new_key):
+            # 常见情况: 粘进来一大段文字/带换行, 直接拒绝而不是写进配置
+            self.jarvis_text_var.set(
+                "密钥格式不对：应该是一串不含空格和换行的字符（以 sk- 开头那种）。请重新复制一次再保存。")
+            print(f"[AI 密钥] 拒绝保存: 格式不合法 ({len(new_key)} 字符, 含空格或非 ASCII)")
+            return
         jarvis.CONFIG["api_key"] = new_key
         self._save_config("api_key", new_key)
         # 同步写入环境
         os.environ["AI_API_KEY"] = new_key
-        self.jarvis_text_var.set(f"AI 密钥已成功配置！当前接入服务商：{self.provider_var.get()}。随时向我提问吧，Sir。")
-        print("[AI 密钥] API Key 已写入用户配置 (%APPDATA%\\Jarvis\\config.json)")
+        self.jarvis_text_var.set(
+            f"AI 密钥已保存：{key_hint(new_key)}。当前接入服务商：{self.provider_var.get()}。随时向我提问吧，Sir。")
+        print(f"[AI 密钥] 已写入用户配置 ({jarvis.USER_CFG_FILE})：{key_hint(new_key)}")
 
     def _on_dial_click(self, event):
         cx = self.dial_w // 2
@@ -875,6 +889,38 @@ class JarvisAppManager:
 
         self._render_tick()
         self._poll_ui()
+        self._start_watchdog()
+
+    def _watchdog_problems(self):
+        """采集"应该干活却没动静"的信号；由 diagnostics 看门狗定期调用。"""
+        problems = []
+        # 1) Tk 主循环心跳（after 链断了/主线程被阻塞都会停跳）
+        gap = diagnostics.since("tk")
+        if gap > 5.0:
+            problems.append(f"Tk 主循环已 {gap:.0f}s 没有心跳")
+
+        # 2) whisper 常驻监听心跳（"界面在聆听、其实听不到"就是这种）
+        try:
+            import whisper_engine
+            hb = whisper_engine.last_heartbeat()
+            if hb.get("state") == "fatal":
+                problems.append(f"whisper 已停止: {hb.get('last_error')}")
+            elif hb.get("state") == "listening":
+                idle = time.time() - float(hb.get("last_read") or 0)
+                if idle > 8.0:
+                    problems.append(f"whisper 已 {idle:.0f}s 没有读到音频块")
+        except Exception:
+            pass
+
+        # 3) Web 胶囊子进程
+        if self.mode == "web" and self.web_capsule is not None:
+            if not getattr(self.web_capsule, "alive", True):
+                problems.append("Web 胶囊子进程已断开")
+        return problems
+
+    def _start_watchdog(self):
+        diagnostics.start_watchdog(self._watchdog_problems, LOG_FILE)
+        diagnostics.mark("tk")
 
     @staticmethod
     def _demo_states():
@@ -1096,24 +1142,32 @@ class JarvisAppManager:
             traceback.print_exc()
 
     def _render_tick(self):
-        t = time.time() - self.time_start
-        self.audio_level += (self.target_audio_level - self.audio_level) * 0.35
+        diagnostics.mark("tk")
+        try:
+            t = time.time() - self.time_start
+            self.audio_level += (self.target_audio_level - self.audio_level) * 0.35
 
-        if self.mode == "web":
-            if self.overlay is not None:
-                self.overlay.render()
-        elif self.mode == "capsule" and self.capsule is not None:
-            self.capsule.render(t, self.audio_level)
-            if self.overlay is not None:
-                self.overlay.render()
-        elif self.mode == "orb":
-            self.orb_win.render(t, self.audio_level)
-        elif self.mode == "fullscreen":
-            self.hud_win.render(t, self.audio_level)
-
-        # WebView 自带 30/60FPS 合成，Tk 侧只需低频做兜底同步，避免空转。
-        interval = 50 if self.mode in ("web", "fullscreen") else 30
-        self.root.after(interval, self._render_tick)
+            if self.mode == "web":
+                if self.overlay is not None:
+                    self.overlay.render()
+            elif self.mode == "capsule" and self.capsule is not None:
+                self.capsule.render(t, self.audio_level)
+                if self.overlay is not None:
+                    self.overlay.render()
+            elif self.mode == "orb":
+                self.orb_win.render(t, self.audio_level)
+            elif self.mode == "fullscreen":
+                self.hud_win.render(t, self.audio_level)
+        except Exception:
+            # 渲染出错只记录, 不让它冒泡
+            traceback.print_exc()
+        finally:
+            # after 链必须无条件续上：一次渲染异常绝不能把整个界面永久冻住
+            interval = 50 if self.mode in ("web", "fullscreen") else 30
+            try:
+                self.root.after(interval, self._render_tick)
+            except Exception:
+                pass
 
     def _poll_ui(self):
         # ── 状态总线 → 穿透层 / 歌词字幕 / Tk 胶囊 (Web 胶囊有自己的推送线程) ──
@@ -1131,7 +1185,7 @@ class JarvisAppManager:
                 self.lyric_subtitle.apply_snapshot(
                     snap, speaking=bool(jarvis.is_speaking()))
         except Exception:
-            pass
+            traceback.print_exc()
 
         try:
             while True:
@@ -1140,15 +1194,52 @@ class JarvisAppManager:
                     self.hud_win.set_output(val)
                 elif kind == "level":
                     self.target_audio_level = max(0.0, min(1.0, float(val)))
-        except queue.Empty: pass
+        except queue.Empty:
+            pass
+        except Exception:
+            traceback.print_exc()
 
+        # Web 胶囊子进程掉线 → 自动重启。
+        # 不重启的话界面会直接消失，用户眼前就是"卡死"；起不来就退回经典界面保底。
         try:
-            while True:
-                s = log_queue.get_nowait()
-                self.hud_win.append_log(s)
-        except queue.Empty: pass
+            wc = self.web_capsule
+            if self.mode == "web" and wc is not None and not getattr(wc, "alive", True):
+                now = time.time()
+                if now - getattr(self, "_wc_restart_at", 0.0) > 8.0:
+                    self._wc_restart_at = now
+                    print("[界面] Web 胶囊已断开，正在重启…")
+                    try:
+                        wc.stop()
+                    except Exception:
+                        pass
+                    self.web_capsule = None
+                    if self._ensure_web_capsule():
+                        print("[界面] Web 胶囊已恢复")
+                    else:
+                        print("[界面] 胶囊重启失败，回退到经典界面")
+                        self.use_classic_ui()
+        except Exception:
+            traceback.print_exc()
 
-        self.root.after(100, self._poll_ui)
+        # 日志队列只取有限条：界面一旦卡顿，把积压一次性倒进 Tk 会让它卡得更久
+        try:
+            for _ in range(200):
+                try:
+                    s = log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.hud_win.append_log(s)
+                except Exception:
+                    pass
+        except Exception:
+            traceback.print_exc()
+        finally:
+            # 同上：任何异常都不能断掉轮询链，否则 ui_queue 再没人消费，界面就假死
+            try:
+                self.root.after(100, self._poll_ui)
+            except Exception:
+                pass
 
     def run(self):
         self.root.mainloop()

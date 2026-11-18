@@ -64,15 +64,17 @@ html, body {
 /* 扫光 */
 .sweep {
   position: absolute; top: 0; bottom: 0; width: 38%;
+  left: -45%;
   background: linear-gradient(90deg, transparent,
               color-mix(in srgb, var(--accent) 14%, transparent), transparent);
-  transform: skewX(-18deg);
+  transform: skewX(-18deg) translate3d(0, 0, 0);
   animation: sweep 3.6s linear infinite;
+  will-change: transform;
   pointer-events: none;
 }
 @keyframes sweep {
-  0%   { left: -45%; }
-  100% { left: 115%; }
+  0%   { transform: skewX(-18deg) translate3d(0, 0, 0); }
+  100% { transform: skewX(-18deg) translate3d(420%, 0, 0); }
 }
 
 .edge-glow {
@@ -138,7 +140,7 @@ html, body {
   background: var(--accent);
   opacity: .5;
   box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 60%, transparent);
-  transition: height .09s linear, opacity .2s ease, background .35s ease;
+  transition: opacity .2s ease, background .35s ease;
 }
 
 /* ── 确认按钮 ── */

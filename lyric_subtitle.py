@@ -279,7 +279,7 @@ def _demo():
     root = tk.Tk()
     root.withdraw()
     lyric = LyricSubtitleWindow(root)
-    ui_bridge.emit_subtitle("贾维斯已上线，随时听候您的差遣。", True)
+    ui_bridge.emit_subtitle("贾维斯已上线，随时待命", True)
     started = time.monotonic()
 
     def tick():

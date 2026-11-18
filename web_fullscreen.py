@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as JsPushTimeout
 from collections import deque
 from pathlib import Path
 
@@ -29,6 +31,18 @@ if not WEB_DIR.is_dir():
     WEB_DIR = APP_DIR / "web_fullscreen_ui"
 BG_COLOR = "#040914"
 VOICE_LIST = ["云希", "云扬", "晓晓", "晓伊", "云健"]
+
+
+def _provider_models_map():
+    """把服务商可选模型清单交给页面，避免前端再维护一份会过期的列表。"""
+    from llm_brain import LLM_PROVIDERS
+    result = {}
+    for name, info in LLM_PROVIDERS.items():
+        models = info.get("models") or []
+        if not models and info.get("default_model"):
+            models = [info["default_model"]]
+        result[name] = [str(m).strip() for m in models if str(m).strip()]
+    return result
 
 
 def _line(obj) -> bytes:
@@ -47,14 +61,25 @@ class _Child:
         self._pending_evt = threading.Event()
         self._pending = None
         self._pending_lock = threading.Lock()
+        # evaluate_js 是无限期阻塞调用：所有注入走单线程执行器 + 超时看门狗，
+        # 防止一次卡死的注入把整个页面推送管线（和 WebView UI 线程）拖死。
+        self._js_lock = threading.Lock()
+        self._js_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="js")
         self._stop = False
         self._active = True
         self._js_active = None
         self._demo_config = {
-            "providers": ["DeepSeek", "通义千问 (Qwen)", "智谱清言 (GLM)"],
+            "providers": [
+                "DeepSeek", "通义千问 (Qwen)", "智谱清言 (GLM)",
+                "Moonshot (Kimi)", "Google Gemini", "OpenAI (ChatGPT)",
+                "Anthropic Claude", "自定义 API (OpenAI兼容)",
+            ],
+            "provider_models": _provider_models_map(),
             "voices": VOICE_LIST,
             "ai_provider": "DeepSeek",
             "api_key": "",
+            "ai_model": "",
+            "ai_url": "",
             "tts_voice": "云希",
             "robot_voice": 0.7,
             "vision_enabled": True,
@@ -112,7 +137,23 @@ class _Child:
         try:
             if kind == "visible":
                 self._active = bool(msg.get("v"))
-                self.win.show() if self._active else self.win.hide()
+                if self._active:
+                    self.win.show()
+                    try:
+                        self.win.restore()
+                    except Exception:
+                        pass
+                else:
+                    # pywebview 的 hide() 在 fullscreen+frameless 模式下可能导致
+                    # WebView2 窗口被销毁、子进程退出；改用 minimize() 只最小化窗口，
+                    # 保持进程和 socket 连接存活，下次 show 时秒开不用重启。
+                    try:
+                        self.win.minimize()
+                    except Exception:
+                        try:
+                            self.win.hide()
+                        except Exception:
+                            pass
                 self._pending_evt.set()   # 让推送线程显式暂停/恢复前端 rAF
                 return
             if kind == "focus":
@@ -149,17 +190,34 @@ class _Child:
             if self._active:
                 # 重新显示时先走页面自己的 wake()，把 calm/折叠状态一并恢复；
                 # 页面还没就绪时退回只恢复动画。
-                self.win.evaluate_js(
+                self._push_js(
                     "window.JarvisUI && window.JarvisUI.wake ? window.JarvisUI.wake() : "
-                    "(window.JarvisHUD && window.JarvisHUD.setAnimating(true))"
-                )
+                    "(window.JarvisHUD && window.JarvisHUD.setAnimating(true))",
+                    "动画恢复")
             else:
-                self.win.evaluate_js(
-                    "window.JarvisHUD && window.JarvisHUD.setAnimating(false)"
-                )
+                self._push_js(
+                    "window.JarvisHUD && window.JarvisHUD.setAnimating(false)",
+                    "动画暂停")
             self._js_active = self._active
         except Exception as exc:
             print(f"[全屏HUD] 暂停/恢复绘制失败: {exc}", flush=True)
+
+    def _push_js(self, js, what="状态"):
+        """带看门狗的 evaluate_js：超时即放弃该调用线程并更换执行器，管线继续存活。"""
+        executor = self._js_exec
+        fut = executor.submit(self.win.evaluate_js, js)
+        try:
+            fut.result(timeout=8)
+            return True
+        except JsPushTimeout:
+            print(f"[全屏HUD] 页面{what}注入超过8秒未完成，跳过本次以保活管线", flush=True)
+            with self._js_lock:
+                if self._js_exec is executor:
+                    self._js_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="js")
+            return False
+        except Exception as exc:
+            print(f"[全屏HUD] 推送页面失败: {exc}", flush=True)
+            return False
 
     def _js_worker(self):
         self._page_ready.wait(25)
@@ -185,10 +243,7 @@ class _Child:
                 + json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
                 + ")"
             )
-            try:
-                self.win.evaluate_js(js)
-            except Exception as exc:
-                print(f"[全屏HUD] 推送页面失败: {exc}", flush=True)
+            self._push_js(js)
             self._sync_page_animation()
 
     def _send(self, obj):
@@ -210,7 +265,7 @@ class _Child:
                 "ok": True, "message": f"视觉预览不会执行指令：{text}"}})
         elif kind == "config":
             patch = obj.get("patch") or {}
-            for key in ("ai_provider", "tts_voice", "robot_voice", "vision_enabled", "always_listen"):
+            for key in ("ai_provider", "ai_model", "ai_url", "tts_voice", "robot_voice", "vision_enabled", "always_listen"):
                 if key in patch:
                     if key in ("robot_voice", "vision_enabled", "always_listen"):
                         self._demo_config[key] = bool(patch[key])
@@ -218,6 +273,9 @@ class _Child:
                         self._demo_config[key] = patch[key]
             self._handle({"type": "sync", "config": self._demo_config,
                           "notice": {"ok": True, "message": "预览配置已在页面内更新，未写入磁盘"}})
+        elif kind == "test_llm":
+            self._handle({"type": "sync", "notice": {
+                "ok": True, "message": "预览模式不会发起真实 AI 请求，请在正式运行中测试连接"}})
         elif kind == "guard":
             self._handle({"type": "sync", "notice": {
                 "ok": True, "message": "预览安全确认已响应，未执行任何系统动作"}})
@@ -234,6 +292,12 @@ class _Child:
     def api_report(self, info):
         print(f"[全屏HUD] 页面就绪 {info}", flush=True)
         self._page_ready.set()
+        # 页面就绪时立即注入最新的服务商与模型映射字典，确保即点即有
+        try:
+            models_json = json.dumps(_provider_models_map(), ensure_ascii=False)
+            self._push_js(f"window.__jarvisSetProviderModels && window.__jarvisSetProviderModels({models_json})", "模型映射注入")
+        except Exception:
+            pass
         return True
 
     def api_command(self, text):
@@ -245,11 +309,17 @@ class _Child:
     def api_save_config(self, patch):
         if not isinstance(patch, dict):
             return False
-        allowed = {"ai_provider", "api_key", "tts_voice", "robot_voice",
+        allowed = {"ai_provider", "api_key", "ai_model", "ai_url", "tts_voice", "robot_voice",
                    "vision_enabled", "always_listen"}
         clean = {k: v for k, v in patch.items() if k in allowed}
         if clean:
             self._send({"type": "config", "patch": clean})
+        return True
+
+    def api_test_llm(self, patch=None):
+        if isinstance(patch, dict):
+            self.api_save_config(patch)
+        self._send({"type": "test_llm"})
         return True
 
     def api_collapse(self):
@@ -328,6 +398,9 @@ class _Api:
     def save_config(self, patch):
         return self._c.api_save_config(patch)
 
+    def test_llm(self, patch=None):
+        return self._c.api_test_llm(patch)
+
     def collapse(self):
         return self._c.api_collapse()
 
@@ -384,6 +457,8 @@ class FullscreenHUDWindow:
         self._data_lock = threading.Lock()
         self._last_seq = -1
         self._last_metrics = 0.0
+        self._last_state = ""
+        self._last_level = -1.0
         self._metrics = {"cpu": 0.0, "memory": 0.0, "disk": 0.0}
         self._output = "全屏战术指挥大厅已就绪。Sir，随时听候您的差遣。"
         self._output_dirty = True
@@ -433,6 +508,9 @@ class FullscreenHUDWindow:
         return True
 
     def show(self):
+        # 确保子进程存在且连接健康；如果旧进程已退出或不可用，先彻底清理再重新启动
+        if self.proc and self.proc.poll() is not None:
+            self.stop()
         self.start()
         self.visible = True
         self._send({"type": "visible", "v": True})
@@ -495,13 +573,21 @@ class FullscreenHUDWindow:
 
     def _read_config(self):
         import jarvis
-        from llm_brain import LLM_PROVIDERS
+        from llm_brain import LLM_PROVIDERS, key_hint, resolve_provider_name
         cfg = jarvis.CONFIG
+        raw_provider = cfg.get("ai_provider", "DeepSeek")
+        provider = resolve_provider_name(raw_provider) or raw_provider
         return {
             "providers": list(LLM_PROVIDERS.keys()),
+            "provider_models": _provider_models_map(),
             "voices": VOICE_LIST,
-            "ai_provider": cfg.get("ai_provider", "DeepSeek"),
-            "api_key": cfg.get("api_key", ""),
+            "ai_provider": provider,
+            # 密钥不进页面 DOM：只回传"是否已配置"和指纹, 避免明文随每次推送注入 WebView
+            "api_key": "",
+            "api_key_set": bool(str(cfg.get("api_key", "")).strip()),
+            "api_key_hint": key_hint(cfg.get("api_key", "")),
+            "ai_model": cfg.get("ai_model", ""),
+            "ai_url": cfg.get("ai_url", ""),
             "tts_voice": cfg.get("tts_voice", "云希"),
             "robot_voice": cfg.get("robot_voice", 0),
             "vision_enabled": bool(cfg.get("vision_enabled", True)),
@@ -548,9 +634,18 @@ class FullscreenHUDWindow:
                     config_dirty = self._config_dirty
                     self._config_dirty = False
                     output = self._output
-                changed = snap["seq"] != self._last_seq
+                # 事件驱动推送：音量档位按 0.04 步进量化，只有状态/档位真正变化
+                # 或有新数据时才注入页面。常驻的每帧注入会与 pywebview 的
+                # JS-Promise 回注撞在 WebView2 的 UI 线程上，是页面卡死的根源。
+                level = round(float(snap.get("level") or 0) / 0.04) * 0.04
+                state = str(snap.get("state") or "")
+                changed = (snap["seq"] != self._last_seq
+                           or state != self._last_state
+                           or level != self._last_level)
                 if changed or logs or notice or output_dirty or config_dirty or metrics_dirty:
                     self._last_seq = snap["seq"]
+                    self._last_state = state
+                    self._last_level = level
                     config = None
                     if config_dirty or self._config is None:
                         self._config = self._read_config()
@@ -558,7 +653,7 @@ class FullscreenHUDWindow:
                     fresh = now - float(snap.get("subtitle_ts") or 0) < 30.0
                     payload = {
                         "state": snap["state"],
-                        "level": round(float(snap["level"]), 4),
+                        "level": round(level, 3),
                         "subtitle": snap["subtitle"] if fresh else "",
                         "subtitle_final": snap["subtitle_final"],
                         "guard": snap["guard"],
@@ -576,46 +671,83 @@ class FullscreenHUDWindow:
             except Exception as exc:
                 print(f"[全屏HUD] 状态推送异常: {exc}", flush=True)
                 time.sleep(0.2)
-            time.sleep(0.06 if self.visible else 0.5)
+            time.sleep(0.12 if self.visible else 0.5)
 
     # ── 页面事件：仍由主进程执行原后端 ──
     def _rx_loop(self):
         import ui_bridge
         buf = b""
         while not self._stop and self.conn:
+            # 接收层：只有管道真正断开才退出循环
             try:
                 chunk = self.conn.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
-                while b"\n" in buf:
-                    raw, buf = buf.split(b"\n", 1)
-                    if not raw.strip():
-                        continue
-                    msg = json.loads(raw.decode("utf-8"))
-                    kind = msg.get("type")
-                    if kind == "command":
-                        text = str(msg.get("text") or "").strip()[:4000]
-                        if text:
-                            threading.Thread(target=self._run_command, args=(text,), daemon=True).start()
-                    elif kind == "config":
-                        self._apply_config(msg.get("patch") or {})
-                    elif kind == "guard":
-                        ui_bridge.resolve_guard(bool(msg.get("ok")))
-                    elif kind == "collapse":
-                        self.mgr.root.after(0, self.mgr.switch_to_orb)
-                    elif kind == "hide":
-                        self.mgr.root.after(0, self.mgr.hide_all)
-            except Exception as exc:
+            except (OSError, EOFError):
                 if not self._stop:
-                    print(f"[全屏HUD] 事件接收异常: {exc}", flush=True)
+                    print("[全屏HUD] 事件通道已断开", flush=True)
                 break
+            # 解析与分发层：单条消息出错只丢弃该消息，绝不能杀死整个循环，
+            # 否则 ESC 收起、保存配置、状态推送会全部静默失效。
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                if not raw.strip():
+                    continue
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    print("[全屏HUD] 丢弃无法解析的事件帧", flush=True)
+                    continue
+                kind = str(msg.get("type") or "")
+                try:
+                    self._dispatch_event(kind, msg)
+                except Exception as exc:
+                    if not self._stop:
+                        print(f"[全屏HUD] 事件处理异常({kind}): {exc}", flush=True)
         self.alive = False
 
-    @staticmethod
-    def _run_command(text):
+    def _dispatch_event(self, kind, msg):
+        import ui_bridge
+        if kind == "command":
+            text = str(msg.get("text") or "").strip()[:4000]
+            if text:
+                threading.Thread(target=self._run_command, args=(text,), daemon=True).start()
+        elif kind == "config":
+            self._apply_config(msg.get("patch") or {})
+        elif kind == "test_llm":
+            threading.Thread(target=self._run_llm_test, daemon=True).start()
+        elif kind == "guard":
+            ui_bridge.resolve_guard(bool(msg.get("ok")))
+        elif kind == "collapse":
+            self.mgr.root.after(0, self.mgr.switch_to_orb)
+        elif kind == "hide":
+            self.mgr.root.after(0, self.mgr.hide_all)
+
+    def _run_llm_test(self):
+        """从主进程发起一次最小真实请求，验证 Key、模型名和接口地址是否真的可用。"""
         import jarvis
-        jarvis.handle_command(text)
+        from llm_brain import query_llm_plan
+        self.set_output("正在测试 AI 连接，请稍候……")
+        try:
+            plan = query_llm_plan("请只回复：连接成功", dict(jarvis.CONFIG))
+        except Exception as exc:
+            plan = {"action": "chat", "say": f"测试请求异常：{exc}", "error": True}
+        say = str((plan or {}).get("say") or "AI 没有返回结果").strip()
+        ok = bool(plan) and not plan.get("error")
+        self.set_output(say)
+        self._notify("AI 连接测试通过" if ok else "AI 连接测试失败", ok)
+
+    def _run_command(self, text):
+        import jarvis
+        try:
+            jarvis.handle_command(text)
+        except Exception as exc:
+            print(f"[全屏HUD] 指令处理异常: {exc}", flush=True)
+            try:
+                self.set_output(f"处理指令时出现异常：{exc}")
+            except Exception:
+                pass
 
     def _notify(self, message, ok=True):
         with self._data_lock:
@@ -623,16 +755,29 @@ class FullscreenHUDWindow:
 
     def _apply_config(self, patch):
         import jarvis
-        from llm_brain import LLM_PROVIDERS, clean_api_key
+        from llm_brain import clean_api_key, key_hint, resolve_provider_name
         if not isinstance(patch, dict):
             return
         clean = {}
         try:
             if "ai_provider" in patch:
-                provider = str(patch["ai_provider"])
-                if provider not in LLM_PROVIDERS:
-                    raise ValueError("未知的大模型服务商")
+                raw_provider = str(patch["ai_provider"] or "").strip()
+                provider = resolve_provider_name(raw_provider)
+                if not provider:
+                    raise ValueError("未知的大模型服务商，请从下拉列表重新选择")
                 clean["ai_provider"] = provider
+            if "ai_model" in patch:
+                model = str(patch["ai_model"] or "").strip()
+                if len(model) > 160 or re.search(r"[\x00-\x1f\x7f]", model):
+                    raise ValueError("模型名格式不对：不能包含换行或控制字符")
+                clean["ai_model"] = model
+            if "ai_url" in patch:
+                url = str(patch["ai_url"] or "").strip()
+                if len(url) > 2048:
+                    raise ValueError("接口地址过长")
+                if url and not re.match(r"^https?://", url, re.I):
+                    raise ValueError("接口地址必须以 http:// 或 https:// 开头")
+                clean["ai_url"] = url
             if "tts_voice" in patch:
                 voice = str(patch["tts_voice"])
                 if voice not in VOICE_LIST:
@@ -648,7 +793,11 @@ class FullscreenHUDWindow:
                 key = str(patch["api_key"] or "").strip()
                 if key and not clean_api_key(key):
                     raise ValueError("密钥格式不对：应为一串不含空格和换行的可见字符")
-                clean["api_key"] = key
+                # 空值代表"沿用已保存的那把", 绝不能拿它覆盖磁盘上的 key。
+                # 曾经的坑: 打开面板时输入框本来就是空的 -> 顺手改个音色 -> 点保存
+                # -> 空串把已存好的 Key 一起写掉 -> 下次进来又得重新粘贴。
+                if key:
+                    clean["api_key"] = key
             if not clean:
                 return
 
@@ -656,6 +805,17 @@ class FullscreenHUDWindow:
             cfg_file.parent.mkdir(parents=True, exist_ok=True)
             data = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
             data.update(clean)
+
+            # 自定义服务商必须同时具备地址与模型名，否则保存了也发不出请求
+            provider_final = resolve_provider_name(data.get("ai_provider", "DeepSeek"))
+            if not provider_final:
+                raise ValueError("当前配置中的 AI 服务商无法识别，请重新选择服务商")
+            if provider_final == "自定义 API (OpenAI兼容)":
+                if not str(data.get("ai_url") or "").strip():
+                    raise ValueError("自定义 API 需要填写接口地址")
+                if not str(data.get("ai_model") or "").strip():
+                    raise ValueError("自定义 API 需要填写模型名")
+
             cfg_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             jarvis.CONFIG.update(clean)
             try:
@@ -669,9 +829,12 @@ class FullscreenHUDWindow:
             if "api_key" in clean:
                 os.environ["AI_API_KEY"] = clean["api_key"]
                 self.set_output(
-                    f"AI 密钥已成功配置！当前接入服务商：{jarvis.CONFIG.get('ai_provider', 'DeepSeek')}。"
-                    "随时向我提问吧，Sir。"
+                    f"AI 密钥已保存：{key_hint(clean['api_key'])}（服务商："
+                    f"{jarvis.CONFIG.get('ai_provider', 'DeepSeek')}）。正在后台校验这把 Key 是否属于该服务商…"
                 )
+                # 校验要发网络请求, 放后台线程: 保存动作本身不该被它卡住
+                threading.Thread(target=self._verify_key_async,
+                                 args=(dict(data),), daemon=True).start()
             with self._data_lock:
                 self._config = None
                 self._config_dirty = True
@@ -680,7 +843,9 @@ class FullscreenHUDWindow:
                 mechanical = bool(jarvis.CONFIG.get("robot_voice", 0))
                 self._notify(f"声线已切换为 {'机械音 · ' if mechanical else ''}{voice}")
             elif "api_key" in clean:
-                self._notify("AI 核心配置已保存")
+                self._notify(f"AI 密钥已保存：{key_hint(clean['api_key'])}")
+            elif "ai_model" in clean or "ai_url" in clean:
+                self._notify("AI 模型与接口配置已保存")
             elif "vision_enabled" in clean:
                 self._notify("视觉感知已开启" if clean["vision_enabled"] else "视觉感知已关闭")
             elif "always_listen" in clean:
@@ -690,6 +855,22 @@ class FullscreenHUDWindow:
         except Exception as exc:
             self._notify(str(exc), False)
             self.set_output(str(exc))
+
+    def _verify_key_async(self, cfg):
+        """后台用刚保存的 Key 打一次最小请求, 结果通过 HUD 提示回报。
+
+        重点是把"网络不通"和"这把 Key 不属于该服务商"分开 —— 后者才是 401 的常见原因,
+        但用户看到的表现往往只是"AI 不回答", 很容易误判成"保存没成功"。
+        """
+        try:
+            from llm_brain import key_hint, probe_api_key
+            key = str(cfg.get("api_key") or "")
+            ok, msg = probe_api_key(cfg, key)
+            print(f"[AI 密钥] 校验 {key_hint(key)} -> {'通过' if ok else '失败'}: {msg}", flush=True)
+            self.set_output(("密钥校验通过：" if ok else "密钥校验失败：") + msg)
+            self._notify(msg, ok)
+        except Exception as exc:
+            print(f"[AI 密钥] 校验异常: {exc}", flush=True)
 
 
 if __name__ == "__main__":

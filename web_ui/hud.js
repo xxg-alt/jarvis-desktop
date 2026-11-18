@@ -179,7 +179,7 @@ function draw(now) {
   capsuleRaf = 0;
   if (!capsuleActive || document.visibilityState === "hidden") return;
   const busyState = ACTIVE_STATES.has(S.state) || S.lv > .18;
-  const targetFps = busyState ? 45 : 20;
+  const targetFps = busyState ? 45 : 30;
   if (now - capsuleLastPaint < 1000 / targetFps - 1.5) {
     scheduleCapsule();
     return;
@@ -236,15 +236,18 @@ function draw(now) {
 
   ctx.globalAlpha = 1;
 
-  // 5) 电平条
+  // 5) 电平条（待命/确认态不可见时跳过，避免每帧写 12 个 DOM 样式）
   const active = st === "LISTENING" || st === "ACTING" || st === "PERCEIVING";
-  for (let i = 0; i < BAR_N; i++) {
-    const ph = Math.sin(t * 6 + i * 0.55);
-    const h = active
-      ? 4 + lv * 26 * (0.55 + 0.45 * Math.abs(ph))
-      : 4 + 3 * Math.abs(ph);
-    barEls[i].style.height = h.toFixed(1) + "px";
-    barEls[i].style.opacity = (active ? 0.55 + 0.45 * lv : 0.28).toFixed(2);
+  const barsVisible = st !== "IDLE" && st !== "GUARD";
+  if (barsVisible) {
+    for (let i = 0; i < BAR_N; i++) {
+      const ph = Math.sin(t * 6 + i * 0.55);
+      const h = active
+        ? 4 + lv * 26 * (0.55 + 0.45 * Math.abs(ph))
+        : 4 + 3 * Math.abs(ph);
+      barEls[i].style.height = h.toFixed(1) + "px";
+      barEls[i].style.opacity = (active ? 0.55 + 0.45 * lv : 0.28).toFixed(2);
+    }
   }
 
   scheduleCapsule();
