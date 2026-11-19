@@ -20,7 +20,6 @@ import tkinter as tk
 from tkinter import scrolledtext
 from pathlib import Path
 import psutil
-import ui_state
 
 # 开启 Windows 硬件级高 DPI 适配，确保 2560x1600 (2.5K) 等屏幕真·100% 满屏覆盖
 try:
@@ -898,20 +897,6 @@ class JarvisAppManager:
         except Exception as _e:
             print(f"[歌词字幕启动失败] {_e}")
 
-        # ── 界面状态机：唯一权威 + 定期对账 ──
-        # 四个载体各注册"探测/自愈"，每 2 秒用 Win32 实际数窗口和账本对一次；
-        # 对不上就修，修不好就降级悬浮球 —— 保证屏幕上永远有能点的东西。
-        self.ui_state = ui_state.UiStateMachine(
-            log=lambda s: print(s, flush=True),
-            on_degrade=self._degrade_to_orb,
-            quiet=3.0,
-        )
-        self.ui_state.register("fullscreen", self._probe_fullscreen, self._heal_fullscreen)
-        self.ui_state.register("web", self._probe_web_capsule, self._heal_web_capsule)
-        self.ui_state.register("capsule", self._probe_tk_capsule, self._heal_tk_capsule)
-        self.ui_state.register("orb", self._probe_orb, self._heal_orb)
-        self.ui_state.set_target(self.mode, "启动")
-
         self.tray_icon = None
         self._start_tray()
 
@@ -924,110 +909,6 @@ class JarvisAppManager:
         self._render_tick()
         self._poll_ui()
         self._start_watchdog()
-
-    # ── 界面状态机的探测与自愈 ──
-    FULLSCREEN_TITLE = "J.A.R.V.I.S"
-    CAPSULE_TITLE = "Jarvis Capsule"
-
-    def _probe_fullscreen(self):
-        """全屏是不是真的在屏幕上。不信 flag，去数窗口。"""
-        if not getattr(self.hud_win, "alive", False):
-            return False
-        proc = getattr(self.hud_win, "proc", None)
-        if proc is not None and proc.poll() is not None:
-            return False
-        return ui_state.on_screen(self.FULLSCREEN_TITLE)
-
-    def _heal_fullscreen(self):
-        try:
-            self.hud_win.show()
-            for w in ui_state.find_windows(self.FULLSCREEN_TITLE):
-                if w.iconic or not w.visible:
-                    ui_state.restore_window(w.hwnd)
-            return ui_state.on_screen(self.FULLSCREEN_TITLE)
-        except Exception as exc:
-            print(f"[对账] 全屏自愈失败: {exc}", flush=True)
-            return False
-
-    def _probe_web_capsule(self):
-        wc = self.web_capsule
-        if wc is None or not getattr(wc, "alive", False):
-            return False
-        return ui_state.on_screen(self.CAPSULE_TITLE)
-
-    def _heal_web_capsule(self):
-        try:
-            if not self._ensure_web_capsule():
-                return False
-            self.web_capsule.set_visible(True)
-            # 兜底：子进程活着但窗口被最小化/藏起来时，直接用 Win32 拉回屏幕。
-            # pywebview 的 show() 用的是 SW_SHOW，还原不了最小化窗口。
-            for w in ui_state.find_windows(self.CAPSULE_TITLE):
-                if w.iconic or not w.visible:
-                    ui_state.restore_window(w.hwnd)
-            return ui_state.on_screen(self.CAPSULE_TITLE)
-        except Exception as exc:
-            print(f"[对账] Web 胶囊自愈失败: {exc}", flush=True)
-            return False
-
-    def _probe_tk_capsule(self):
-        cap = self.capsule
-        if cap is None:
-            return False
-        try:
-            return bool(cap.win.winfo_ismapped()) and cap.win.state() != "iconified"
-        except Exception:
-            return False
-
-    def _heal_tk_capsule(self):
-        try:
-            if self.overlay is not None and not self.overlay._visible:
-                self.overlay.show()
-            self.capsule.show()
-            self.capsule.win.lift()
-            return True
-        except Exception as exc:
-            print(f"[对账] Tk 胶囊自愈失败: {exc}", flush=True)
-            return False
-
-    def _probe_orb(self):
-        try:
-            w = self.orb_win.win
-            return bool(w.winfo_ismapped()) and w.state() != "iconified"
-        except Exception:
-            return False
-
-    def _heal_orb(self):
-        try:
-            self.orb_win.win.deiconify()
-            self.orb_win.win.lift()
-            return True
-        except Exception as exc:
-            print(f"[对账] 悬浮球自愈失败: {exc}", flush=True)
-            return False
-
-    def _degrade_to_orb(self):
-        """降级：目标形态救不回来时，至少留一个能点的悬浮球。"""
-        self.mode = "orb"
-        try:
-            self.hud_win.hide()
-        except Exception:
-            pass
-        try:
-            if self.web_capsule is not None:
-                self.web_capsule.set_visible(False)
-        except Exception:
-            pass
-        self._heal_orb()
-        print("[对账] 已降级到悬浮球（屏幕上至少保留可交互界面）", flush=True)
-
-    def _reconcile_ui(self):
-        if getattr(self, "ui_state", None) is None:
-            return
-        try:
-            self.ui_state.reconcile()
-        except Exception:
-            traceback.print_exc()
 
     def _watchdog_problems(self):
         """采集"应该干活却没动静"的信号；由 diagnostics 看门狗定期调用。"""
@@ -1087,7 +968,6 @@ class JarvisAppManager:
         try:
             self.hud_win.show()
             self.mode = "fullscreen"
-            self.ui_state.set_target("fullscreen", "展开全屏")
         except Exception as exc:
             print(f"[全屏 HUD 启动失败] {exc}")
             self.use_web_ui()
@@ -1118,7 +998,6 @@ class JarvisAppManager:
                 self.overlay.show()
             if self.web_capsule.set_visible(True):
                 self.mode = "web"
-                self.ui_state.set_target("web", "ESC 收起")
                 return
             print("[界面] 胶囊显示指令没送达，回退悬浮球", flush=True)
 
@@ -1127,7 +1006,6 @@ class JarvisAppManager:
     def _fallback_to_orb(self):
         """最后一道兜底：无论上面哪一步失败，都必须留一个可交互的界面。"""
         self.mode = "orb"
-        self.ui_state.set_target("orb", "收起兜底")
         try:
             self.orb_win.win.deiconify()
             self.orb_win.win.lift()
@@ -1219,7 +1097,6 @@ class JarvisAppManager:
             self.overlay.show()
         self.web_capsule.set_visible(True)
         self.mode = "web"
-        self.ui_state.set_target("web", "切到 Web 胶囊")
 
     def use_capsule_ui(self):
         """Tk 胶囊 + 穿透层 (备用新界面)"""
@@ -1235,7 +1112,6 @@ class JarvisAppManager:
         self.capsule.show()
         self.capsule.win.lift()
         self.mode = "capsule"
-        self.ui_state.set_target("capsule", "切到 Tk 胶囊")
 
     def use_classic_ui(self):
         """展开 PyWebView 全屏战术大中枢。"""
@@ -1257,7 +1133,6 @@ class JarvisAppManager:
         self.hud_win.hide()
         self._hide_new_ui()
         self.mode = "orb"
-        self.ui_state.set_target("orb", "切到悬浮球")
         self.orb_win.win.deiconify()
         self.orb_win.win.lift()
 
@@ -1266,12 +1141,6 @@ class JarvisAppManager:
         try:
             print("[退出] quit_app 被调用，调用栈：", flush=True)
             traceback.print_stack()
-        except Exception:
-            pass
-        # 退出前停掉对账，否则它会把正在拆的界面当成"坏了"又去救一遍
-        try:
-            if getattr(self, "ui_state", None) is not None:
-                self.ui_state.enabled = False
         except Exception:
             pass
         try:
@@ -1359,11 +1228,6 @@ class JarvisAppManager:
                 pass
 
     def _poll_ui(self):
-        # ── 对账：每 20 个 tick（约 2 秒）用真实窗口状态校正一次目标形态 ──
-        self._ui_tick = getattr(self, "_ui_tick", 0) + 1
-        if self._ui_tick % 20 == 0:
-            self._reconcile_ui()
-
         # ── 状态总线 → 穿透层 / 歌词字幕 / Tk 胶囊 (Web 胶囊有自己的推送线程) ──
         try:
             snap = ui_bridge.snapshot()
