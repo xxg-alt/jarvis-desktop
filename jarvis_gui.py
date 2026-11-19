@@ -1137,6 +1137,12 @@ class JarvisAppManager:
         self.orb_win.win.lift()
 
     def quit_app(self):
+        # 取证：进程"自己没了"时 stderr 是空的，必须留下是谁要求退出的证据
+        try:
+            print("[退出] quit_app 被调用，调用栈：", flush=True)
+            traceback.print_stack()
+        except Exception:
+            pass
         try:
             if self.tray_icon:
                 self.tray_icon.stop()
@@ -1293,8 +1299,53 @@ class JarvisAppManager:
             except Exception:
                 pass
 
+    def _foreground_title(self):
+        """当前前台窗口的标题。用来判断 ESC 是不是冲着贾维斯按的。"""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetForegroundWindow()
+            if not hwnd:
+                return ""
+            buf = ctypes.create_unicode_buffer(512)
+            u.GetWindowTextW(hwnd, buf, 512)
+            return buf.value or ""
+        except Exception:
+            return ""
+
+    def _on_global_esc(self):
+        """全局 ESC：只在贾维斯界面处于前台时才接管。
+
+        为什么必须放在 Python 侧：全屏 HUD 是 pywebview 子进程，
+        Tk 的 win.bind("<Escape>") 根本管不到它；原先只能靠页面里的
+        JS keydown 收键，而 WebView2 的键盘焦点在渲染进程，
+        顶层窗口拿到前台也不代表 JS 能收到 —— 表现就是"按 ESC 毫无反应"。
+        这里用全局钩子兜住，并且只认自己的窗口，不干扰别的程序按 ESC。
+        """
+        try:
+            title = self._foreground_title()
+            print(f"[ESC] 全局热键触发，前台={title!r} mode={self.mode}", flush=True)
+            if ("J.A.R.V.I.S" not in title) and ("Jarvis" not in title):
+                return
+            self.root.after(0, lambda: escape_to_orb(self))
+        except Exception as exc:
+            print(f"[ESC] 处理失败: {exc}", flush=True)
+
+    def _start_esc_hotkey(self):
+        try:
+            import keyboard
+            # suppress 默认 False：不吞按键，其它程序照常收到 ESC
+            keyboard.add_hotkey("esc", self._on_global_esc)
+            print("[界面] 全局 ESC 热键已注册（仅贾维斯前台时生效）", flush=True)
+        except Exception as exc:
+            print(f"[界面] 全局 ESC 热键注册失败: {exc}", flush=True)
+
     def run(self):
+        import atexit
+        atexit.register(lambda: print("[退出] atexit：解释器正常收尾", flush=True))
+        self._start_esc_hotkey()
+        print("[退出] mainloop 开始", flush=True)
         self.root.mainloop()
+        print("[退出] mainloop 已返回 —— Tk 认为没有窗口可服务了", flush=True)
 
 if __name__ == "__main__":
     app = JarvisAppManager()

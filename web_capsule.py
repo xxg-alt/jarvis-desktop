@@ -628,19 +628,19 @@ class WebCapsuleHost:
             except Exception:
                 pass
         self.conn = self.server = None
-        if self.proc and self.proc.poll() is None:
-            # /T：WebView2 挂在子进程下，单独 terminate 会留下点不动的残留窗口
+        if self.proc is not None:
+            # 不加 poll() 判断：子进程"已经死了"恰恰是最需要清理残留 WebView2 的时候。
+            # kill_tree 对失效 PID 会安静返回 0，不会误伤。
+            # 必须用 proc_tree：taskkill /T 按 PPID 构树，遇到失效/复用的 PID
+            # 会把主进程误判成子树成员一起强杀（实测"按 ESC 后程序自己没了"）。
             try:
-                if os.name == "nt":
-                    subprocess.run(
-                        [_taskkill_path(), "/F", "/T", "/PID", str(self.proc.pid)],
-                        capture_output=True, timeout=5,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                else:
-                    self.proc.terminate()
+                from proc_tree import kill_tree
+                kill_tree(self.proc.pid)
             except Exception:
-                pass
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
         self.proc = None
 
     # ── 收发 ──

@@ -1,135 +1,128 @@
 # 按 ESC 会退出、会卡死 —— 根因与修复
 
-修复日期：2026-11-19　　分支：main　　回滚目录：`_backup\esc-exit-fix-before-20261119`
+修复日期：2026-11-19　分支：main　回滚：`_backup\esc-exit-fix-before-20261119`
+
+> 本文分两轮。**第一轮的部分结论和验证方法是错的，已在第二轮推翻并修正**，保留在此以免后人重踩。
 
 ---
 
-## 一、先把"退出"这个词拆开
+## 一、把"退出"拆开
 
-"按 ESC 会退出会卡死"其实是两种完全不同的故障，体感却一样：
-
-| 形态 | 进程 | 屏幕 | 用户感知 |
+| 形态 | 进程 | 屏幕 | 体感 |
 |---|---|---|---|
-| A 真退出 | 消失（pythonw=0） | 无 | 程序没了 |
-| B 假退出 | **还活着** | **什么都不剩** | "退出了" |
+| A 真退出 | 消失 | 无 | 程序没了 |
+| B 假退出 | 还活着 | 什么都不剩 | "退出了" |
 | C 冻住 | 还活着 | 窗口在，点哪都没反应 | "卡死了" |
 
-代码层面三种都能发生，而且它们**共用同一条路径**：ESC → 收起全屏 → 显示胶囊。
+三种共用同一条路径：ESC → 收起全屏 → 显示胶囊。
 
-这条路径上原来没有任何机制保证"新的载体一定看得见"。只要中间任一步静默失败，屏幕就空了；主进程还在 `root.mainloop()` 里继续识别声音、继续播报，于是"退出"和"卡死"同时成立。
-
-**这就是第一性原理的入口：ESC 的语义是"换载体"，不是"消灭载体"。任何时刻屏幕上必须有一个看得见、点得动的界面。**
+**不变量：ESC 只允许"换载体"，不允许"消灭载体"。任何时刻屏幕上必须有一个看得见、点得动的界面。**
 
 ---
 
-## 二、取证（不是猜）
+## 二、第一轮修的（仍然有效）
 
-| 手段 | 结果 |
-|---|---|
-| 枚举全部可见顶层窗口 | 全屏期标题为 `J.A.R.V.I.S. 战术全息指挥中枢`；ESC 后只剩胶囊/其它窗口 |
-| 数进程 | 结束主进程后 `msedgewebview2` **残留 6~12 个**，点不动的灰窗口就在这 |
-| 读 `jarvis-gui.log` | 发现 `_tkinter.TclError: bad window path name ".!toplevel3"`，每 100ms 刷一次 |
-| 对比两个解释器 | 系统 Python312 **没有 pywebview**；venv 有 |
-| 实按 ESC（PostMessage 送 WM_KEYDOWN/UP，VK_ESCAPE） | 日志出现 `[界面] ESC：已打断当前播报`，`pythonw=6`，胶囊窗口在 |
-
----
-
-## 三、四个确定性缺陷
-
-### 缺陷 1：`_ensure_web_capsule` 只判断"对象存在"，不判断"进程活着"
-
-```python
-if self.web_capsule is not None:
-    return True          # 子进程早死了，这里照样通过
-```
-
-于是 ESC 时走的顺序是：
-隐藏全屏 → 隐藏悬浮球 → 往一个死进程发"显示胶囊" → **静默失败** → 屏幕上什么都不剩。
-
-### 缺陷 2：`set_visible` / `_send` 静默失败，不返回结果
-
-```python
-if not self.conn:
-    return               # 没连上就当作"发过了"
-```
-
-调用方无从知道"到底切过去了没有"，只能盲目往下走。
-
-### 缺陷 3：子进程解释器不可信 → 秒退 → 界面 12 秒空白
-
-子进程用 `sys.executable` 启动。双击 .py、IDE 里跑的时候它指向**没装 pywebview** 的解释器，子进程一启动就 `ModuleNotFoundError` 秒退。而 `srv.accept()` 是裸阻塞的，子进程一秒都没活过，却仍要**干等满 12 秒超时**——这段时间界面已经藏了、新的还没出来，Tk 主线程被占着，就是"卡死"。
-
-### 缺陷 4：隐藏失败时窗口留在屏幕上，且 `terminate` 不回收 WebView2
-
-`hide()` 发不出消息只是把 `alive=False`，窗口还在那儿，点什么都没反应。`stop()` 只 `proc.terminate()` 父进程，WebView2 是它下面独立的进程组，于是每退出一次就攒一批残留进程。
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| `_ensure_web_capsule` 只判断对象存在，不看进程存活 | 子进程死了也返回 True，于是藏全屏+藏悬浮球+向死进程发显示 → 屏幕全空 | 校验 `alive`，失效则 stop 后重建 |
+| `set_visible` / `_send` 静默失败无返回值 | 调用方不知道有没有切过去 | 改返回 bool |
+| `hide()` 发不出消息只置 alive=False | 窗口留在屏幕上但不响应 | 发送失败直接结束子进程，由调用方兜底 |
+| `switch_to_orb` 无兜底 | 中途失败就停在半路 | 拆包装+检查返回值+`_fallback_to_orb` |
+| 子进程用 `sys.executable` | 系统 Python312 **没装 pywebview**，子进程秒退 | `_child_python()` 优先项目 venv |
+| `srv.accept()` 裸阻塞 | 子进程秒退仍干等满 12 秒 | `_accept_alive` 轮询，**0.2s** 发现 |
+| ESC 不打断播报 | 屏幕变了声音照旧，以为按键没生效 | 先 `stop_speaking()` 再收起 |
 
 ---
 
-## 四、改了什么
+## 三、第一轮的错误（已推翻）
 
-| 文件 | 位置 | 改动 | 为什么 |
-|---|---|---|---|
-| `web_capsule.py` | 模块级 | 新增 `_taskkill_path()`、`_child_python()`、`_accept_alive()` | 定位 taskkill；子进程强制用带 pywebview 的解释器；子进程一死立刻失败 |
-| `web_capsule.py` | `start()` | 改用 `_child_python()` 与 `_accept_alive()` | 不再盲信 `sys.executable`，不再干等 12 秒 |
-| `web_capsule.py` | `set_visible()` | 返回 bool，异常置 `alive=False` 并返回 False | 让"送没送到"变成可判断的事实 |
-| `web_capsule.py` | `stop()` | Windows 下 `taskkill /F /T /PID` | `/T` 连 WebView2 一起收，杜绝灰窗口残留 |
-| `web_fullscreen.py` | 模块级 | 同上三个辅助函数 | 同上 |
-| `web_fullscreen.py` | `_send()` | 返回 bool | 同上 |
-| `web_fullscreen.py` | `hide()` | 发送失败 → 打印日志 → `stop()` 杀进程 → 返回 False | 绝不留"窗口还在但不响应"的假界面 |
-| `web_fullscreen.py` | `stop()` | `taskkill /F /T /PID` | 回收 WebView2 |
-| `web_fullscreen.py` | `_dispatch_event("collapse")` | 先 `jarvis.stop_speaking()`，再 `switch_to_orb` | ESC 第一语义是"别吵了" |
-| `jarvis_gui.py` | 模块级 | 新增 `escape_to_orb(mgr)` | ESC 统一入口：先闭嘴，再收起，异常不吞 |
-| `jarvis_gui.py` | `<Escape>` 绑定 | 改走 `escape_to_orb` | 同上 |
-| `jarvis_gui.py` | `_ensure_web_capsule()` | 校验 `alive`，失效则 `stop()` 后重建 | 堵住缺陷 1 |
-| `jarvis_gui.py` | `switch_to_orb` / `_switch_to_orb` / `_fallback_to_orb` | 包装异常 + 检查返回值 + 兜底悬浮球 | 不变量落地：失败一定退到可见载体 |
+### 错误 1：把 `terminate()` 换成 `taskkill /F /T`，引入误杀风险
 
-### 核心不变量
+为了清 WebView2 残留，我把只杀目标进程的 `terminate()` 换成了盲目杀树。
+`/T` 按 **PPID** 递归构树，而 Windows 的 PID 会回收复用：要清理的子进程已退出（PID 失效），
+主进程的父进程（启动它的 shell）也早退出、PID 同样可能被复用。
+两者一撞，主进程就可能被当成子树成员一起 `/F` 强杀。
 
-> **ESC 只允许"换载体"，不允许"消灭载体"。任何一次收起，结束状态都必须是"屏幕上有一个看得见、点得动的界面"。**
+**修正**：新建 `proc_tree.py`，用 psutil（校验 `create_time`，能识别 PID 复用），
+并加硬护栏：**自己和自己全部祖先，永远不杀**。
 
-判断后续改动是否偏离，就看这一条。
+### 错误 2：监控的是 venv redirector stub，不是真主进程
+
+`.venv\Scripts\python.exe` 是个 **redirector**：它再启一个真正的解释器并等待。
+`Start-Process -PassThru` 拿到的是 stub PID。我盯着 stub 看到"存活 70 秒 PASS"，
+而真主进程早死了。证据：`[proc_tree] 自己=16080`，而我监控的是 29208。
+
+**修正**：用 `Win32_Process.CommandLine` 匹配 `jarvis_gui.py` 且排除 `--child`，才是真主进程。
+
+### 错误 3：把"按键注入失败"当成产品缺陷
+
+`SendInput` 在本环境**返回 0**（被拒），`SetForegroundWindow` 也返回 False。
+按键根本没送进去，却据此得出"ESC 没反应"的结论 —— 不成立。
+另外 `IsWindowVisible` 对**最小化**窗口仍返回 True，必须用 `IsIconic` 判断收起。
+
+**修正**：改用方法层驱动（假对象 + 真实方法）做确定性验证；真实按键由使用者完成。
+
+---
+
+## 四、第二轮新修的
+
+| 文件 | 改动 | 依据 |
+|---|---|---|
+| `proc_tree.py`（新建） | psutil 精确杀树 + 自身/祖先护栏 + 诊断输出 | 替代危险的 `taskkill /T` |
+| `web_capsule.py` / `web_fullscreen.py` `stop()` | 改用 `kill_tree`；**去掉 `poll() is None` 条件** | 子进程"已死"恰恰是最需要清残留的时候 |
+| `lyric_subtitle.py` | 新增 `_win_ok()`，四个入口检查，`destroy` 置死 | 窗口失效后每 100ms 抛 `TclError`，日志被刷满、真线索被埋 |
+| `jarvis_gui.py` | 新增全局 ESC 热键 `_start_esc_hotkey` / `_on_global_esc` / `_foreground_title` | 全屏 HUD 是 pywebview 子进程，Tk 的 `<Escape>` 绑定管不到它；原先只能靠页面 JS 收键，而 WebView2 焦点在渲染进程，不可靠 |
+| `jarvis_gui.py` | `quit_app` 打调用栈；`run()` 打 mainloop 进出 + atexit | 进程"自己没了"时 stderr 是空的，必须留下退出路径证据 |
+| `Jarvis.spec` | hiddenimports 补 `proc_tree` | 函数内 import，静态分析会漏 |
+
+### 全局 ESC 的设计要点
+
+- 用 `keyboard.add_hotkey("esc", ...)`，**不吞按键**（suppress 默认 False）
+- 只在前台窗口标题含 `J.A.R.V.I.S` 或 `Jarvis` 时才接管，不干扰其它程序按 ESC
+- 命中后 `root.after(0, escape_to_orb)`，回到 Tk 线程执行
 
 ---
 
 ## 五、验证
 
-### 方法层（`probe_esc_fix.py`，7 项全 PASS）
+### 方法层 13 项全 PASS
 
-| 场景 | 期望 | 结果 |
-|---|---|---|
-| A 一切正常 | 切到胶囊，悬浮球收起 | PASS `mode='web'` |
-| B 胶囊显示送不出去 | 回退悬浮球 | PASS `mode='orb'` |
-| C 全屏窗口僵死 | 杀掉子进程并回退 | PASS |
-| D 收起过程抛异常 | 兜底悬浮球 | PASS |
-| E 无连接时 `set_visible` | 返回 False（旧版静默 None） | PASS |
-| F 无连接时 `_send` | 返回 False | PASS |
-| G 子进程秒退 | 立刻发现（旧行为 12s） | PASS **0.20s** |
+`probe_esc_fix.py`（7）：正常切胶囊 / 胶囊送不出去 / 全屏僵死 / 抛异常 / 两个静默失败返回值 / 子进程秒退 0.20s 发现
 
-### 真实按键（PostMessage VK_ESCAPE 到全屏窗口）
+`probe_esc_hotkey.py`（6）：全屏在前台→接管；胶囊在前台→接管；浏览器 / VS Code / 空标题 / 小写 jarvis 路径→不干预
+
+### proc_tree 护栏实测
 
 ```
-[界面] ESC：已打断当前播报
-pythonw=6（主进程存活）
-Jarvis Capsule 窗口存在
+目标 pid=18308，其后代=[3672, 15036, 14924]
+kill_tree 处理了 4 个进程；目标与全部后代均已结束
+对自己调用 kill_tree 后仍然活着: True
+对不存在的 PID 调用: 0
 ```
+
+### 真实进程实测
+
+- 真主进程（按命令行定位）存活 **120 秒**，`[退出] mainloop 开始` 有记录，无 quit_app、无 mainloop 返回
+- **手动杀掉胶囊子进程**后，主进程存活 36 秒，日志出现 `[界面] Web 胶囊已恢复` —— 自愈链路打通
+- `[界面] 全局 ESC 热键已注册` 确认写入日志
+
+### 尚未验证（需使用者完成）
+
+**真实按一次 ESC**。本环境 `SendInput` 被拒（返回 0），无法代按。
+按下后 `jarvis-gui.log` 应出现：
+
+```
+[ESC] 全局热键触发，前台='...'
+[界面] ESC：已打断当前播报        （若正在说话）
+```
+
+- 有这行但窗口没收起 → 问题在收起链路
+- 连这行都没有 → `keyboard` 全局钩子在该环境没生效，需改用其它接管方式
 
 ---
 
-## 六、还没解决的，而且更值得看
+## 六、另一条独立缺陷（未动）
 
-日志里反复出现这类记录：
-
-```
-[直接执行] 听到: 因为我现在就卡了。因为我因为很相信你。谢谢
-[语音] 麦克风电平: 平均 1966 峰值 12581 (安静环境正常值 <200), 当前门限 2500
-```
-
-麦克风电平是正常值的 10~60 倍。在**免唤醒模式**下，程序把房间里所有说话都当成指令，逐句识别、逐句回复、逐句播报，形成正反馈。你说的"这太吵了"也在同一份日志里被它当成指令回复了一次。
-
-这不是 ESC 的问题，是**另一条独立缺陷**：门限 2500 挡不住当前环境的底噪。可选方向：
-
-1. 提高 RMS 门限到 3500~4000，并加"最短语音段 + 能量持续"双条件
-2. 免唤醒模式下要求文本长度 ≥ 4 字且不含高置信噪声词
-3. 增加一个"只说唤醒词才响应"的保守档位，默认开启
-
-在 ESC 这一轮我没有动它——它改的是识别策略，风险面比"让界面别消失"大，需要你确认口径再动。
+免唤醒模式把环境杂音全当指令，逐句识别、逐句播报，形成正反馈。
+日志实录：`[语音] 麦克风电平: 平均 1966 峰值 12581 (安静环境正常值 <200)`。
+这与 ESC 无关，属于识别策略，需确认口径后再改。

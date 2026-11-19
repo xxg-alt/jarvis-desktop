@@ -582,20 +582,17 @@ class FullscreenHUDWindow:
             except Exception:
                 pass
         self.conn = self.server = None
-        if self.proc and self.proc.poll() is None:
-            # /T 必须带上：WebView2 是挂在子进程下面的独立进程组，
-            # 只 terminate 父进程会留下一堆"点不动的灰色窗口"（实测残留 12 个）。
+        if self.proc is not None:
+            # 同上：子进程已死时更要清残留；kill_tree 对失效 PID 安全返回 0。
+            # 见 proc_tree 的说明：绝不能用 taskkill /T，会误杀主进程。
             try:
-                if os.name == "nt":
-                    subprocess.run(
-                        [_taskkill_path(), "/F", "/T", "/PID", str(self.proc.pid)],
-                        capture_output=True, timeout=5,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                else:
-                    self.proc.terminate()
+                from proc_tree import kill_tree
+                kill_tree(self.proc.pid)
             except Exception:
-                pass
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
         self.proc = None
         try:
             if self._log:

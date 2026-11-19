@@ -66,6 +66,24 @@ class LyricSubtitleWindow:
         self.win.update_idletasks()
 
     # ── 显示策略 ──
+    def _win_ok(self):
+        """窗口还在不在。
+
+        字幕窗口被销毁后，_poll_ui 仍会每 100ms 调进来一次，
+        于是 winfo_viewable 每次都抛 TclError: bad window path name，
+        日志被刷满、真正的故障线索被埋掉。这里一次性判死，之后安静退出。
+        """
+        if getattr(self, "_dead", False):
+            return False
+        try:
+            if not self.win.winfo_exists():
+                self._dead = True
+                return False
+            return True
+        except Exception:
+            self._dead = True
+            return False
+
     def set_enabled(self, enabled):
         """全屏或隐藏界面时关闭桌面字幕，避免双份字幕。"""
         self.enabled = bool(enabled)
@@ -82,6 +100,8 @@ class LyricSubtitleWindow:
     def _hide_now(self):
         self._alpha = 0.0
         self._last_tick = time.monotonic()
+        if not self._win_ok():
+            return
         try:
             self.win.withdraw()
         except Exception:
@@ -93,6 +113,7 @@ class LyricSubtitleWindow:
         self._hide_now()
 
     def destroy(self):
+        self._dead = True
         try:
             self.win.destroy()
         except Exception:
@@ -101,6 +122,8 @@ class LyricSubtitleWindow:
     # ── 总线快照 ──
     def apply_snapshot(self, snap, speaking=False):
         if not snap:
+            return
+        if not self._win_ok():
             return
         now = float(snap.get("ts") or time.time())
         text = str(snap.get("subtitle") or "").strip()
@@ -126,6 +149,8 @@ class LyricSubtitleWindow:
         self._animate(bool(should_show))
 
     def _animate(self, target_visible):
+        if not self._win_ok():
+            return
         now = time.monotonic()
         dt = min(0.25, max(0.0, now - self._last_tick))
         self._last_tick = now
@@ -148,6 +173,8 @@ class LyricSubtitleWindow:
 
     # ── 字幕绘制 ──
     def _redraw(self):
+        if not self._win_ok():
+            return
         self.cv.delete("all")
         if not self._text:
             return
