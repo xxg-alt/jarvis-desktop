@@ -27,6 +27,51 @@ from pathlib import Path
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 BASE = APP_DIR  # 日志、子进程入口等可写路径仍放在程序目录
+
+
+def _taskkill_path() -> str:
+    """定位 taskkill.exe；受限环境的 PATH 里可能没有 System32。"""
+    import shutil
+    hit = shutil.which("taskkill")
+    if hit:
+        return hit
+    return str(Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe")
+
+
+def _child_python() -> str:
+    """子进程解释器必须自带 pywebview。
+
+    sys.executable 并不可信：双击 .py 文件、或在 IDE 里跑的时候，它会指向
+    一个没装 pywebview 的解释器（实测系统 Python312 就是这种），子进程一启动
+    就 ModuleNotFoundError 秒退，胶囊永远起不来，而主进程还以为"已经切过去了"，
+    屏幕上于是什么都不剩。源码模式优先用项目自带的 venv。
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    for exe in ("pythonw.exe", "python.exe"):
+        cand = BASE / ".venv" / "Scripts" / exe
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+
+def _accept_alive(srv, proc, timeout, label="Web 胶囊"):
+    """等子进程连上来，但子进程一死就立刻失败，不要干等到超时。
+
+    旧写法是裸 srv.accept()：子进程一秒都没活过，这里仍会阻塞满 12 秒，
+    用户看到的就是"按完 ESC 界面没了，然后卡住半天"。
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            srv.settimeout(0.2)
+            conn, _ = srv.accept()
+            return conn
+        except socket.timeout:
+            if proc.poll() is not None:
+                raise RuntimeError(f"{label}子进程已退出 (code={proc.returncode})")
+            if time.time() >= deadline:
+                raise RuntimeError(f"{label}子进程启动超时")
 WEB_DIR = RESOURCE_DIR / "web_ui"
 if not WEB_DIR.is_dir():
     WEB_DIR = APP_DIR / "web_ui"
@@ -545,7 +590,7 @@ class WebCapsuleHost:
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--web-child", str(port)]
         else:
-            cmd = [sys.executable, str(BASE / "web_capsule.py"), "--child", str(port)]
+            cmd = [_child_python(), str(BASE / "web_capsule.py"), "--child", str(port)]
 
         creation = 0
         if os.name == "nt":
@@ -558,11 +603,14 @@ class WebCapsuleHost:
                                      stdout=self._log, stderr=subprocess.STDOUT)
 
         try:
-            self.conn, _ = srv.accept()
+            self.conn = _accept_alive(srv, self.proc, timeout)
             self.conn.settimeout(None)
         except socket.timeout:
             self.stop()
             raise RuntimeError("Web 胶囊子进程启动超时")
+        except Exception:
+            self.stop()
+            raise
 
         self.alive = True
         self.conn.recv(4096)   # hello
@@ -581,23 +629,37 @@ class WebCapsuleHost:
                 pass
         self.conn = self.server = None
         if self.proc and self.proc.poll() is None:
+            # /T：WebView2 挂在子进程下，单独 terminate 会留下点不动的残留窗口
             try:
-                self.proc.terminate()
+                if os.name == "nt":
+                    subprocess.run(
+                        [_taskkill_path(), "/F", "/T", "/PID", str(self.proc.pid)],
+                        capture_output=True, timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                else:
+                    self.proc.terminate()
             except Exception:
                 pass
         self.proc = None
 
     # ── 收发 ──
     def set_visible(self, visible):
-        """显示/隐藏 (切到经典界面时用)"""
+        """显示/隐藏胶囊。返回是否真的送达。
+
+        以前这里是静默 return：连接断了也当作发送成功，调用方于是以为
+        "已经切到胶囊了"，而屏幕上其实什么都没有 —— 用户看到的就是"退出"。
+        """
         if not self.conn:
-            return
+            return False
         self.visible = bool(visible)
         try:
             self.conn.sendall((json.dumps({"type": "visible", "v": bool(visible)}) + "\n")
                               .encode("utf-8"))
+            return True
         except Exception:
-            pass
+            self.alive = False
+            return False
 
     def _tx_loop(self):
         import ui_bridge

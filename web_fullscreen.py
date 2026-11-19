@@ -23,6 +23,41 @@ from collections import deque
 from pathlib import Path
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
+def _taskkill_path() -> str:
+    """定位 taskkill.exe。沙箱/精简环境的 PATH 里常常没有 System32。"""
+    import shutil
+    hit = shutil.which("taskkill")
+    if hit:
+        return hit
+    return str(Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "taskkill.exe")
+
+
+def _child_python() -> str:
+    """子进程解释器必须自带 pywebview；源码模式优先项目 venv。"""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    for exe in ("pythonw.exe", "python.exe"):
+        cand = APP_DIR / ".venv" / "Scripts" / exe
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+
+def _accept_alive(srv, proc, timeout, label="全屏 HUD"):
+    """子进程一死就立刻失败，别让 accept 干等满超时。"""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            srv.settimeout(0.2)
+            conn, _ = srv.accept()
+            return conn
+        except socket.timeout:
+            if proc.poll() is not None:
+                raise RuntimeError(f"{label}子进程已退出 (code={proc.returncode})")
+            if time.time() >= deadline:
+                raise RuntimeError(f"{label}子进程启动超时")
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 BASE = APP_DIR  # 日志、子进程入口等可写路径仍放在程序目录
 WEB_DIR = RESOURCE_DIR / "web_fullscreen_ui"
@@ -483,7 +518,7 @@ class FullscreenHUDWindow:
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--fullscreen-child", str(port)]
         else:
-            cmd = [sys.executable, str(BASE / "web_fullscreen.py"), "--child", str(port)]
+            cmd = [_child_python(), str(BASE / "web_fullscreen.py"), "--child", str(port)]
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         self._log = open(BASE / "web-fullscreen.log", "a", encoding="utf-8",
                          errors="ignore", buffering=1)
@@ -491,7 +526,7 @@ class FullscreenHUDWindow:
         self.proc = subprocess.Popen(cmd, cwd=str(BASE), creationflags=creation,
                                      stdout=self._log, stderr=subprocess.STDOUT)
         try:
-            self.conn, _ = srv.accept()
+            self.conn = _accept_alive(srv, self.proc, timeout)
             self.conn.settimeout(None)
             hello = self.conn.recv(4096)
             if b"hello" not in hello:
@@ -517,8 +552,17 @@ class FullscreenHUDWindow:
         self.focus_force()
 
     def hide(self):
+        """隐藏全屏窗口。发送失败说明子进程已经不听使唤，直接杀掉。
+
+        留着它只会变成一个"窗口还在、点哪儿都没反应"的假界面 ——
+        用户看到的正是"按 ESC 之后卡死"。杀干净，由调用方兜底到别的载体。
+        """
         self.visible = False
-        self._send({"type": "visible", "v": False})
+        if self._send({"type": "visible", "v": False}):
+            return True
+        print("[全屏HUD] 隐藏指令发送失败，结束子进程", flush=True)
+        self.stop()
+        return False
 
     def lift(self):
         if self.visible:
@@ -539,8 +583,17 @@ class FullscreenHUDWindow:
                 pass
         self.conn = self.server = None
         if self.proc and self.proc.poll() is None:
+            # /T 必须带上：WebView2 是挂在子进程下面的独立进程组，
+            # 只 terminate 父进程会留下一堆"点不动的灰色窗口"（实测残留 12 个）。
             try:
-                self.proc.terminate()
+                if os.name == "nt":
+                    subprocess.run(
+                        [_taskkill_path(), "/F", "/T", "/PID", str(self.proc.pid)],
+                        capture_output=True, timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                else:
+                    self.proc.terminate()
             except Exception:
                 pass
         self.proc = None
@@ -606,12 +659,14 @@ class FullscreenHUDWindow:
     def _send(self, obj):
         conn = self.conn
         if not conn:
-            return
+            return False
         try:
             with self._io_lock:
                 conn.sendall(_line(obj))
+            return True
         except Exception:
             self.alive = False
+            return False
 
     def _tx_loop(self):
         import jarvis
@@ -720,6 +775,16 @@ class FullscreenHUDWindow:
         elif kind == "guard":
             ui_bridge.resolve_guard(bool(msg.get("ok")))
         elif kind == "collapse":
+            # ESC 的第一语义是"别吵了"：先打断播报，再收起界面。
+            # 只收起不打断的话，用户按了 ESC 声音照旧继续，会以为按键没生效，
+            # 接着反复按、反复点，就变成"卡死"的体感。
+            try:
+                import jarvis
+                if jarvis.is_speaking():
+                    jarvis.stop_speaking()
+                    print("[界面] ESC：已打断当前播报", flush=True)
+            except Exception:
+                pass
             self.mgr.root.after(0, self.mgr.switch_to_orb)
         elif kind == "hide":
             self.mgr.root.after(0, self.mgr.hide_all)

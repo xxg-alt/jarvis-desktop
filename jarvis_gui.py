@@ -34,6 +34,25 @@ BASE = Path(__file__).resolve().parent
 LOG_FILE = BASE / "jarvis-gui.log"
 PREVIEW = "--preview" in sys.argv
 
+
+def escape_to_orb(mgr):
+    """ESC 的统一语义：先打断播报，再收起界面。
+
+    只收起不闭嘴的话，屏幕变了但声音还在，用户会以为按键没生效，
+    接着反复按、反复点 —— 这就是"按 ESC 卡死"的体感来源。
+    """
+    try:
+        import jarvis
+        if jarvis.is_speaking():
+            jarvis.stop_speaking()
+            print("[界面] ESC：已打断当前播报", flush=True)
+    except Exception:
+        pass
+    try:
+        mgr.switch_to_orb()
+    except Exception as exc:
+        print(f"[界面] ESC 收起失败: {exc}", flush=True)
+
 # ── PyWebView 子进程入口 (不启动 Tk, 避免两个 GUI 主循环冲突) ──
 if "--fullscreen-child" in sys.argv:
     try:
@@ -356,8 +375,8 @@ class TkFullscreenHUDWindow:
 
         self.win.geometry(f"{self.sw}x{self.sh}+0+0")
 
-        # 核心交互快捷键：按 Esc 随时收起回桌面悬浮球
-        self.win.bind("<Escape>", lambda e: self.mgr.switch_to_orb())
+        # 核心交互快捷键：按 Esc 先闭嘴、再收起回桌面悬浮球
+        self.win.bind("<Escape>", lambda e: escape_to_orb(self.mgr))
 
         # 面板折叠状态
         self.left_visible = True
@@ -954,20 +973,44 @@ class JarvisAppManager:
             self.use_web_ui()
 
     def switch_to_orb(self):
-        """收起全屏：默认回到共用 ui_bridge 的 Web 灵动岛。"""
+        """收起全屏的对外入口：任何异常都必须落到兜底，不能停在半路。"""
+        try:
+            self._switch_to_orb()
+        except Exception as exc:
+            print(f"[界面] 收起界面失败: {exc}", flush=True)
+            self._fallback_to_orb()
+
+    def _switch_to_orb(self):
+        """收起全屏：默认回到共用 ui_bridge 的 Web 灵动岛。
+
+        不变量：调用结束时屏幕上必须有一个看得见、点得动的界面。
+        以前这里的判断只覆盖"对象是否存在"，一旦胶囊子进程已经死了，
+        就会走隐藏全屏 → 隐藏悬浮球 → 往死进程发显示指令的路径，
+        结果全屏没了、兜底也没了，屏幕上什么都不剩 —— 用户看到的就是"退出"。
+        """
         self.hud_win.hide()
         if self.lyric_subtitle is not None:
             self.lyric_subtitle.set_enabled(True)
+
         if self.ui_style == "web" and self._ensure_web_capsule():
             self.orb_win.win.withdraw()
             if self.overlay is not None and not self.overlay._visible:
                 self.overlay.show()
-            self.web_capsule.set_visible(True)
-            self.mode = "web"
-        else:
-            self.mode = "orb"
+            if self.web_capsule.set_visible(True):
+                self.mode = "web"
+                return
+            print("[界面] 胶囊显示指令没送达，回退悬浮球", flush=True)
+
+        self._fallback_to_orb()
+
+    def _fallback_to_orb(self):
+        """最后一道兜底：无论上面哪一步失败，都必须留一个可交互的界面。"""
+        self.mode = "orb"
+        try:
             self.orb_win.win.deiconify()
             self.orb_win.win.lift()
+        except Exception as exc:
+            print(f"[界面] 悬浮球显示失败: {exc}", flush=True)
 
     def hide_all(self):
         if self.lyric_subtitle is not None:
@@ -995,8 +1038,17 @@ class JarvisAppManager:
 
     # ── 界面风格切换 ──
     def _ensure_web_capsule(self):
-        if self.web_capsule is not None:
+        # 只判断"对象是否存在"远不够：子进程死了、连接断了的时候它仍然非空，
+        # set_visible 会静默失败，于是调用方以为已经切到胶囊，屏幕上却什么都没有。
+        if self.web_capsule is not None and getattr(self.web_capsule, "alive", False):
             return True
+        if self.web_capsule is not None:
+            print("[Web 胶囊] 旧实例已失效，重建", flush=True)
+            try:
+                self.web_capsule.stop()
+            except Exception:
+                pass
+            self.web_capsule = None
         try:
             from web_capsule import WebCapsuleHost
             self.web_capsule = WebCapsuleHost(
