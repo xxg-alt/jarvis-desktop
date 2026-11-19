@@ -134,7 +134,7 @@ SYSTEM_PROMPT = """你是一个全能的 Windows 桌面智能语音助手贾维�
 
 只能输出纯 JSON，格式如下：
 {
-  "action": "动作名(必须是下述之一: chat, open_app, open_url, web_search, screenshot, lock, volume)",
+  "action": "动作名(必须是下述之一: chat, open_app, open_url, web_search, screenshot, lock, volume, file_manage, inspect_system, run_powershell)",
   "args": {动作参数，chat 动作留空即可},
   "say": "对用户的中文回答"
 }
@@ -146,6 +146,23 @@ SYSTEM_PROMPT = """你是一个全能的 Windows 桌面智能语音助手贾维�
 - 如果是静音/调音量：action 填 "volume"，args 填 {"mode": "up/down/mute"}
 - 如果是截图：action 填 "screenshot"
 - 如果是锁屏：action 填 "lock"
+
+【文件管理】action 填 "file_manage"，args 从下面三种里选一种：
+  {"action": "list", "folder": "下载"}                      列目录（folder 可写 桌面/下载/文档）
+  {"action": "search", "pattern": "*.pdf"}                   按通配符找文件
+  {"action": "move", "src": "下载\\报表.xlsx", "dst": "文档"}  归类移动到某个目录
+  只能操作桌面、下载、文档这三个目录。用户要删除文件时，如实说做不到，不要假装完成。
+
+【系统状态】action 填 "inspect_system"，args 从下面三种里选一种：
+  {"mode": "top_memory"}              最吃内存的前 5 个进程
+  {"mode": "top_cpu"}                 最吃 CPU 的前 5 个进程
+  {"mode": "port", "target": 8080}    谁占用了某个端口
+
+【执行命令】action 填 "run_powershell"，args 填 {"command": "Get-Process"}：
+  一次只给一条最简单的命令。不要用管道 |、重定向 >、分号 ;、反引号和换行，这些会被安全层拒绝。
+  只读的查询命令（Get-*、tasklist、ipconfig 等）会直接执行；带副作用的命令会先让用户确认。
+  关机、重启、删除文件、改注册表、改系统服务这类命令一律不要生成。
+
 注意：不要输出任何 markdown 格式代码块，只返回纯 JSON 字符串！
 如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；历史只作参考，
 当前用户输入才是本次唯一任务，不要重复执行历史动作。
@@ -321,6 +338,78 @@ def sanitize_plan(plan: dict) -> dict:
                 steps = 5
             out_args["steps"] = max(1, min(50, steps))
         return {"action": "volume", "args": out_args, "say": say or "已调整音量", "danger": False}
+
+    # ---- 第二步新增：三个真实系统工具 ----
+    if action == "file_manage":
+        sub = _safe_text(args.get("action"), 20).lower()
+        if sub not in ("list", "search", "move"):
+            return {"action": "chat", "say": "文件这块我只会列目录、按名字找、归类移动。", "danger": False}
+
+        out_args = {"action": sub}
+        if sub == "list":
+            folder = str(args.get("folder") or "").strip()
+            if folder:
+                out_args["folder"] = folder[:260]
+        elif sub == "search":
+            pattern = _safe_text(args.get("pattern"), 120)
+            if not pattern:
+                return {"action": "chat", "say": "要按什么找？比如 *.pdf 或者 *简历*。", "danger": False}
+            out_args["pattern"] = pattern
+            folder = str(args.get("folder") or "").strip()
+            if folder:
+                out_args["folder"] = folder[:260]
+        else:  # move
+            src = str(args.get("src") or "").strip()
+            if not src:
+                return {"action": "chat", "say": "要移动哪个文件？", "danger": False}
+            out_args["src"] = src[:260]
+            dst = str(args.get("dst") or "").strip()
+            if dst:
+                out_args["dst"] = dst[:260]
+
+        # 路径只当数据交给 system_tools 做授权目录校验, 不拼任何命令行
+        if sub == "move":
+            return {
+                "action": "file_manage",
+                "args": out_args,
+                "say": say or "这就帮你归档",
+                "danger": True,
+                "guard_desc": f"移动文件：{out_args['src']} → {out_args.get('dst') or '下载'}",
+            }
+        return {"action": "file_manage", "args": out_args, "say": say, "danger": False}
+
+    if action == "inspect_system":
+        kind = _safe_text(args.get("mode"), 20).lower()
+        if kind not in ("top_memory", "top_cpu", "port"):
+            return {"action": "chat", "say": "系统状态我只会查内存榜、CPU 榜和端口占用。", "danger": False}
+        out_args = {"mode": kind}
+        if kind == "port":
+            try:
+                port = int(args.get("target"))
+            except (TypeError, ValueError):
+                return {"action": "chat", "say": "端口号得是数字，比如 8080。", "danger": False}
+            if not 0 < port < 65536:
+                return {"action": "chat", "say": "端口号超出范围了。", "danger": False}
+            out_args["target"] = port
+        return {"action": "inspect_system", "args": out_args, "say": say, "danger": False}
+
+    if action == "run_powershell":
+        # _safe_text 会过滤 & | ; < > 反引号与换行, 正是文档要求的命令元字符黑名单
+        command = _safe_text(args.get("command"), 1000)
+        if not command:
+            return {"action": "chat", "say": "要执行什么命令？", "danger": False}
+        try:
+            from system_tools import is_readonly_command
+            readonly = is_readonly_command(command)
+        except Exception:
+            readonly = False
+        return {
+            "action": "run_powershell",
+            "args": {"command": command},
+            "say": say,
+            "danger": not readonly,
+            "guard_desc": "" if readonly else f"执行命令：{command[:80]}",
+        }
 
     if action in ("screenshot", "lock"):
         return {"action": action, "args": {}, "say": say, "danger": False}

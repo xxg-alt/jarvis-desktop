@@ -712,6 +712,35 @@ def gemini_plan(command, memory_context=""):
         return None
 
 # ---------- 执行动作 ----------
+def _format_tool_say(action, res):
+    """把系统工具的返回结果转成一句能直接念出来的话。
+
+    工具自己的 summary 已经是中文口吻；这里只负责补上"具体是哪几个文件"，
+    否则用户只听得到"共 12 项"，等于没告诉他。
+    """
+    summary = str(res.get("summary") or "").strip()
+    data = res.get("data") or {}
+
+    if action == "file_manage":
+        items = data.get("items") or []
+        base = summary.rstrip("。")
+        if "folder" in data and items:
+            names = []
+            for item in items[:8]:
+                if item.get("is_dir"):
+                    names.append(f"{item.get('name')}\\")
+                else:
+                    names.append(f"{item.get('name')}({item.get('size_text')})")
+            tail = f"等 {len(items)} 项" if len(items) > 8 else ""
+            return f"{base}：{'、'.join(names)}{tail}。"
+        if "pattern" in data and items:
+            names = [Path(item.get("path", "")).name for item in items[:6]]
+            return f"{base}：{'、'.join(names)}。"
+        return summary
+
+    return summary
+
+
 def execute_plan(plan):
     if not plan:
         speak("这条指令我还没学会, 可以换个说法, 比如打开记事本、搜索天气、音量调大")
@@ -763,6 +792,31 @@ def execute_plan(plan):
         elif action == "web_search":
             from urllib.parse import quote
             webbrowser.open("https://www.baidu.com/s?wd=" + quote(str(args.get("query", ""))))
+        elif action in ("file_manage", "inspect_system", "run_powershell"):
+            # 第二步接入的三个真实系统工具：统一走 system_tools，结果再转成口吻
+            try:
+                from system_tools import file_manage, inspect_system, run_powershell
+            except Exception as exc:
+                print(f"[系统工具不可用] {exc}")
+                say = "系统工具箱没加载上，这个动作暂时做不了。"
+            else:
+                if action == "file_manage":
+                    res = file_manage(
+                        action=args.get("action"),
+                        src=args.get("src"),
+                        dst=args.get("dst"),
+                        pattern=args.get("pattern"),
+                        folder=args.get("folder"),
+                    )
+                elif action == "inspect_system":
+                    res = inspect_system(args.get("mode"), args.get("target"))
+                else:
+                    res = run_powershell(args.get("command"))
+
+                if res.get("ok"):
+                    say = _format_tool_say(action, res)
+                else:
+                    say = str(res.get("summary") or "这个操作没有成功。")
         elif action == "open_folder":
             os.startfile(args["path"])  # Windows only
         elif action == "search_file":
