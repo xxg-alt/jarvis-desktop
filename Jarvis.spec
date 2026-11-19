@@ -67,7 +67,7 @@ a = Analysis(
                    "whisper_engine", "faster_whisper", "tokenizers",
                    "huggingface_hub", "ui_bridge", "capsule", "hud_overlay",
                    "web_capsule", "web_fullscreen", "lyric_subtitle",
-                   "audio_device", "diagnostics", "system_tools", "proc_tree"] + winrt_hidden + fw_hidden + wv_hidden,
+                   "audio_device", "diagnostics", "system_tools", "proc_tree", "ui_state"] + winrt_hidden + fw_hidden + wv_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
