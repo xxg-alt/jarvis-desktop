@@ -136,11 +136,13 @@ SYSTEM_PROMPT = """你是一个全能的 Windows 桌面智能语音助手贾维�
 {
   "action": "动作名(必须是下述之一: chat, open_app, open_url, web_search, screenshot, lock, volume, file_manage, inspect_system, run_powershell)",
   "args": {动作参数，chat 动作留空即可},
-  "say": "对用户的中文回答"
+  "say": "对用户的中文回答",
+  "status_say": "仅调用系统工具时填写：5~12 字的前置垫话"
 }
 
 说明：
-- 如果是普通聊天、提问或解答：action 填 "chat"，say 填你的详细专业回答。
+- 如果是普通聊天、提问或解答：action 填 "chat"，say 填你的详细专业回答，不需要 status_say。
+- 调用 file_manage、inspect_system 或 run_powershell 时，额外填写 5~12 字的 status_say，例如“正在检查高占用进程”；它只表示正在处理，不能声称已经完成。
 - 如果是打开软件：action 填 "open_app"，args 填 {"exe": "软件exe名", "name": "软件名"}
 - 如果是搜索：action 填 "web_search"，args 填 {"query": "搜索关键词"}
 - 如果是静音/调音量：action 填 "volume"，args 填 {"mode": "up/down/mute"}
@@ -263,6 +265,17 @@ def _safe_text(value, limit=200):
     return v
 
 
+def _with_status_say(out: dict, plan: dict) -> dict:
+    """只给真实系统工具保留一句短垫话；换行压成空格，避免模型塞入长文。"""
+    raw = plan.get("status_say")
+    if not isinstance(raw, str):
+        return out
+    status = re.sub(r"\s+", " ", raw).strip()
+    if status:
+        out["status_say"] = status[:40]
+    return out
+
+
 def sanitize_plan(plan: dict) -> dict:
     """统一收敛大模型输出: 只保留白名单动作, 并逐个校验参数取值。
 
@@ -369,14 +382,16 @@ def sanitize_plan(plan: dict) -> dict:
 
         # 路径只当数据交给 system_tools 做授权目录校验, 不拼任何命令行
         if sub == "move":
-            return {
+            return _with_status_say({
                 "action": "file_manage",
                 "args": out_args,
                 "say": say or "这就帮你归档",
                 "danger": True,
                 "guard_desc": f"移动文件：{out_args['src']} → {out_args.get('dst') or '下载'}",
-            }
-        return {"action": "file_manage", "args": out_args, "say": say, "danger": False}
+            }, plan)
+        return _with_status_say(
+            {"action": "file_manage", "args": out_args, "say": say, "danger": False}, plan
+        )
 
     if action == "inspect_system":
         kind = _safe_text(args.get("mode"), 20).lower()
@@ -391,7 +406,9 @@ def sanitize_plan(plan: dict) -> dict:
             if not 0 < port < 65536:
                 return {"action": "chat", "say": "端口号超出范围了。", "danger": False}
             out_args["target"] = port
-        return {"action": "inspect_system", "args": out_args, "say": say, "danger": False}
+        return _with_status_say(
+            {"action": "inspect_system", "args": out_args, "say": say, "danger": False}, plan
+        )
 
     if action == "run_powershell":
         # _safe_text 会过滤 & | ; < > 反引号与换行, 正是文档要求的命令元字符黑名单
@@ -403,13 +420,13 @@ def sanitize_plan(plan: dict) -> dict:
             readonly = is_readonly_command(command)
         except Exception:
             readonly = False
-        return {
+        return _with_status_say({
             "action": "run_powershell",
             "args": {"command": command},
             "say": say,
             "danger": not readonly,
             "guard_desc": "" if readonly else f"执行命令：{command[:80]}",
-        }
+        }, plan)
 
     if action in ("screenshot", "lock"):
         return {"action": action, "args": {}, "say": say, "danger": False}

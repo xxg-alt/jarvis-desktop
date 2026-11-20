@@ -11,6 +11,7 @@ import ctypes
 import datetime
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -486,10 +487,32 @@ def speak(text):
 _SPEAKING_UNTIL = 0.0
 _CURRENT_STOP_EVENT = None
 
+# 异步工具只把结果放进队列，由语音主循环取出并播报。
+# 每条指令/每次主动打断都会递增编号，旧任务因此失去回播资格。
+_ASYNC_RESULTS = queue.Queue()
+_ASYNC_ACTIONS = {"file_manage", "inspect_system", "run_powershell"}
+_DRAIN_LOCK = threading.Lock()
+_ASYNC_DISPATCHER = None
+_COMMAND_ID = 0
+_COMMAND_ID_LOCK = threading.Lock()
+
+
+def _new_command_id():
+    global _COMMAND_ID
+    with _COMMAND_ID_LOCK:
+        _COMMAND_ID += 1
+        return _COMMAND_ID
+
+
+def _command_is_current(command_id):
+    with _COMMAND_ID_LOCK:
+        return command_id == _COMMAND_ID
+
 
 def stop_speaking():
-    """强制掐断当前正在播放的语音并释放说话锁。"""
+    """强制掐断当前播报，并让尚未回播的异步工具结果过期。"""
     global _SPEAKING_UNTIL, _CURRENT_STOP_EVENT
+    _new_command_id()
     _SPEAKING_UNTIL = 0.0
     if _CURRENT_STOP_EVENT is not None:
         try:
@@ -741,36 +764,11 @@ def _format_tool_say(action, res):
     return summary
 
 
-def execute_plan(plan):
-    if not plan:
-        speak("这条指令我还没学会, 可以换个说法, 比如打开记事本、搜索天气、音量调大")
-        return
+def _perform_plan(plan):
+    """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。"""
     action = plan.get("action")
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
-
-    if plan.get("danger"):
-        if DRY_RUN:
-            print(f"[dry-run] 危险动作 {action} 需要确认, 已跳过执行")
-            return
-        desc = plan.get("guard_desc") or f"执行操作：{action}"
-        question = f"即将{desc}，确定要执行吗，Sir？"
-        verdict = None
-        # 优先在胶囊/全屏 HUD 上唤起高危操作确认卡片（带描述文本）
-        if ui_bridge is not None:
-            try:
-                verdict = ui_bridge.request_guard_confirm(desc)
-            except Exception:
-                verdict = None
-        if verdict is None:
-            verdict = confirm(question)
-        if not verdict:
-            speak("好的，已取消操作，Sir。")
-            return
-
-    if DRY_RUN:
-        print(f"[dry-run] 动作={action} 参数={args} 回复={say}")
-        return
 
     try:
         if action == "chat":
@@ -910,12 +908,127 @@ def execute_plan(plan):
     except Exception as e:
         say = f"执行失败了: {e}"
         print(f"[执行失败] {action}: {e}")
-    speak(say)
+    return say
+
+
+def _async_worker(plan, command_id, status_done):
+    """后台只执行工具；等垫话结束后，把结果交给主循环，不直接播报或操作 UI。"""
+    say = _perform_plan(plan)
+    status_done.wait()
+    if _command_is_current(command_id):
+        _ASYNC_RESULTS.put((command_id, say))
+
+
+def _drain_async_results():
+    """回播最新任务结果；已打断或已有新指令的结果直接丢弃。
+
+    语音主循环与图形界面的调度线程都会调用它，所以用非阻塞锁保证同一时刻
+    只有一个线程在播报，不会两条结果叠在一起念。
+    """
+    if is_speaking():
+        return
+    if not _DRAIN_LOCK.acquire(blocking=False):
+        return
+    try:
+        if is_speaking():
+            return
+        while True:
+            try:
+                command_id, say = _ASYNC_RESULTS.get_nowait()
+            except queue.Empty:
+                return
+            if not _command_is_current(command_id):
+                continue
+            speak(say)
+            if _command_is_current(command_id):
+                _ui_listening()
+            return
+    finally:
+        _DRAIN_LOCK.release()
+
+
+def _ensure_result_dispatcher():
+    """图形界面/全屏 HUD 模式不走语音主循环，这里保底把结果念出来。"""
+    global _ASYNC_DISPATCHER
+    if _ASYNC_DISPATCHER is not None:
+        return
+    _ASYNC_DISPATCHER = threading.Thread(
+        target=_dispatch_loop, name="jarvis-result-dispatch", daemon=True
+    )
+    _ASYNC_DISPATCHER.start()
+
+
+def _dispatch_loop():
+    while True:
+        time.sleep(0.2)
+        try:
+            _drain_async_results()
+        except Exception as e:
+            print(f"[结果回播异常] {e}")
+
+
+def execute_plan(plan, command_id=None):
+    """执行动作；返回 True 表示系统工具已转入后台，最终结果稍后回播。"""
+    if not plan:
+        speak("这条指令我还没学会, 可以换个说法, 比如打开记事本、搜索天气、音量调大")
+        return False
+    action = plan.get("action")
+    args = plan.get("args", {}) or {}
+    say = plan.get("say", "好的")
+
+    # 危险动作必须先在调用线程取得确认，后台线程绝不绕过安全护栏。
+    if plan.get("danger"):
+        if DRY_RUN:
+            print(f"[dry-run] 危险动作 {action} 需要确认, 已跳过执行")
+            return False
+        desc = plan.get("guard_desc") or f"执行操作：{action}"
+        question = f"即将{desc}，确定要执行吗，Sir？"
+        verdict = None
+        if ui_bridge is not None:
+            try:
+                verdict = ui_bridge.request_guard_confirm(desc)
+            except Exception:
+                verdict = None
+        if verdict is None:
+            verdict = confirm(question)
+        if not verdict:
+            speak("好的，已取消操作，Sir。")
+            return False
+
+    if DRY_RUN:
+        print(f"[dry-run] 动作={action} 参数={args} 回复={say}")
+        return False
+
+    status_say = str(plan.get("status_say") or "").strip()
+    if action in _ASYNC_ACTIONS and status_say:
+        if command_id is None:
+            command_id = _new_command_id()
+        if not _command_is_current(command_id):
+            return False
+        status_done = threading.Event()
+        _ensure_result_dispatcher()
+        threading.Thread(
+            target=_async_worker,
+            args=(plan, command_id, status_done),
+            name=f"jarvis-tool-{action}",
+            daemon=True,
+        ).start()
+        try:
+            if _command_is_current(command_id):
+                speak(status_say)
+        finally:
+            status_done.set()
+        return True
+
+    speak(_perform_plan(plan))
+    return False
+
 
 def handle_command(command):
     if not command or not command.strip():
         return
     command = command.strip()
+    command_id = _new_command_id()
     print(f"你: {command}")
     if ON_HEAR is not None:
         try: ON_HEAR(command)
@@ -978,12 +1091,13 @@ def handle_command(command):
 
     if ui_bridge is not None:
         ui_bridge.emit_state("ACTING")
+    async_started = False
     try:
-        execute_plan(plan)
+        async_started = execute_plan(plan, command_id=command_id)
     finally:
         MEMORY.record_turn(command, plan, source=plan_source or "unresolved")
-        # 动作做完 (含失败) 一律回到待命
-        if ui_bridge is not None:
+        # 同步动作已经结束；异步工具仍由主循环等待最终结果。
+        if ui_bridge is not None and not async_started:
             ui_bridge.emit_state("IDLE")
 
 # ---------- 语音输入 ----------
@@ -1169,6 +1283,7 @@ def _wake_loop_vosk(hotkey_event):
 
     try:
         while True:
+            _drain_async_results()
             if hotkey_event.is_set():
                 hotkey_event.clear()
                 speak("我在")
@@ -1276,6 +1391,7 @@ def _wake_loop_winrt(hotkey_event):
         follow_until = time.time() + 12
 
     while True:
+        _drain_async_results()
         if hotkey_event.is_set():
             hotkey_event.clear()
             speak("我在")
@@ -1371,6 +1487,7 @@ def _wake_loop_whisper(hotkey_event):
         follow_until = time.time() + 12
 
     while True:
+        _drain_async_results()
         if worker_dead.is_set():
             # 监听线程真的退出了。绝不能继续在这个循环里空转（那就是"卡死"的样子），
             # 直接起一个新的监听线程，让语音能力自愈。
@@ -1477,6 +1594,7 @@ def wake_loop():
         r.adjust_for_ambient_noise(source, duration=0.8)
     print("正在听唤醒词:", CONFIG["wake_words"])
     while True:
+        _drain_async_results()
         # 热键触发
         if hotkey_event.is_set():
             hotkey_event.clear()
@@ -1510,14 +1628,34 @@ def wake_loop():
 
 def text_loop():
     print("文字模式: 输入指令回车执行, 输入 退出 结束。例如: 打开记事本 / 搜索明天天气 / 音量调大 / 截图")
+    commands = queue.Queue()
+
+    def _read_input():
+        while True:
+            try:
+                commands.put(input("> ").strip())
+            except (EOFError, KeyboardInterrupt):
+                commands.put(None)
+                return
+
+    # 输入放到旁边等待，主线程才能在工具完成时及时取结果回播。
+    threading.Thread(target=_read_input, name="jarvis-text-input", daemon=True).start()
     while True:
+        _drain_async_results()
         try:
-            cmd = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
+            cmd = commands.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        except KeyboardInterrupt:
             break
-        if not cmd: continue
-        try: handle_command(cmd)
-        except SystemExit: break
+        if cmd is None:
+            break
+        if not cmd:
+            continue
+        try:
+            handle_command(cmd)
+        except SystemExit:
+            break
 
 def main():
     global DRY_RUN

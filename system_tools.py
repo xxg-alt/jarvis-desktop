@@ -28,6 +28,22 @@ MAX_SEARCH = 100
 # 中文别名一并保留，便于在特殊环境下也能命中。
 ALLOWED_FOLDER_NAMES = ("Desktop", "Downloads", "Documents", "桌面", "下载", "文档")
 
+# 大模型经常回英文目录名（downloads / desktop），这里统一映射到真实文件夹名。
+FOLDER_ALIASES = {
+    "desktop": "Desktop", "桌面": "Desktop",
+    "downloads": "Downloads", "download": "Downloads", "下载": "Downloads",
+    "documents": "Documents", "document": "Documents", "文档": "Documents",
+}
+
+
+def _alias_folder(path_like):
+    """把单独的目录别名换成授权目录的绝对路径；带分隔符的原样返回。"""
+    raw = str(path_like).strip().strip("\\/")
+    if not raw or "/" in raw or "\\" in raw:
+        return path_like
+    name = FOLDER_ALIASES.get(raw.lower())
+    return Path.home() / name if name else path_like
+
 
 def _result(ok: bool, summary: str, data: Any = None, danger: bool = False) -> dict:
     """构造统一返回体。"""
@@ -58,6 +74,7 @@ def _inside(path_like) -> Path | None:
     """
     if not path_like:
         return None
+    path_like = _alias_folder(path_like)
     try:
         target = Path(str(path_like)).expanduser()
         if not target.is_absolute():
