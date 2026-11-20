@@ -463,6 +463,11 @@ def speak(text):
     global _SPEAKING_UNTIL
     if not str(text).strip():
         return
+    # 已经被更新指令顶掉的旧任务，哪怕算完了也不许出声。
+    owner = getattr(_TL, "command_id", None)
+    if owner is not None and not _command_is_current(owner):
+        print(f"[丢弃过期播报] {text[:30]}")
+        return
     # 播放期间标记"我在说话": 识别端据此丢弃自己声音的回声, 避免自问自答。
     # 这里只给一个初始窗口; _speak() 会按每一句的真实播放起止重新收紧/放开。
     _SPEAKING_UNTIL = time.time() + max(8.0, min(600.0, len(str(text)) * 0.5 + 15.0))
@@ -495,6 +500,10 @@ _DRAIN_LOCK = threading.Lock()
 _ASYNC_DISPATCHER = None
 _COMMAND_ID = 0
 _COMMAND_ID_LOCK = threading.Lock()
+# 同一时刻只处理一条指令：语音输入和文字输入同时到达时，后来的顶掉先来的，
+# 不会各跑一条、各说一套。
+_RUN_LOCK = threading.RLock()
+_TL = threading.local()
 
 
 def _new_command_id():
@@ -509,10 +518,9 @@ def _command_is_current(command_id):
         return command_id == _COMMAND_ID
 
 
-def stop_speaking():
-    """强制掐断当前播报，并让尚未回播的异步工具结果过期。"""
+def _cut_audio():
+    """只掐断正在播放的声音，不动指令编号。"""
     global _SPEAKING_UNTIL, _CURRENT_STOP_EVENT
-    _new_command_id()
     _SPEAKING_UNTIL = 0.0
     if _CURRENT_STOP_EVENT is not None:
         try:
@@ -520,6 +528,12 @@ def stop_speaking():
         except Exception:
             pass
         _CURRENT_STOP_EVENT = None
+
+
+def stop_speaking():
+    """强制掐断当前播报，并让尚未回播的异步工具结果过期。"""
+    _new_command_id()
+    _cut_audio()
 
 
 def is_speaking():
@@ -1025,10 +1039,22 @@ def execute_plan(plan, command_id=None):
 
 
 def handle_command(command):
+    """指令入口：语音和文字共用，串行执行，后来的指令直接顶掉前一条。"""
     if not command or not command.strip():
         return
     command = command.strip()
     command_id = _new_command_id()
+    # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
+    _cut_audio()
+    with _RUN_LOCK:
+        _TL.command_id = command_id
+        try:
+            _handle_command_inner(command, command_id)
+        finally:
+            _TL.command_id = None
+
+
+def _handle_command_inner(command, command_id):
     print(f"你: {command}")
     if ON_HEAR is not None:
         try: ON_HEAR(command)
@@ -1088,6 +1114,11 @@ def handle_command(command):
     previous = MEMORY.last_exchange()
     if plan is not None and previous.get("user") and MEMORY.is_correction(command):
         MEMORY.record_correction(previous["user"], command, plan)
+
+    # 等大模型这段时间里可能又来了新指令，这一条已经作废，别再执行和播报
+    if not _command_is_current(command_id):
+        print("[指令已被新指令取代，丢弃]")
+        return
 
     if ui_bridge is not None:
         ui_bridge.emit_state("ACTING")
