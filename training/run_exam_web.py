@@ -50,7 +50,9 @@ def main():
     cases = json.loads((ROOT / "training" / "exam_web_cases.json").read_text(encoding="utf-8"))["cases"]
     wrong = []
     passed = 0
+    import time
     for case in cases:
+        time.sleep(6)  # 题目间隔, 避免搜索源被连查限流
         answer = web_tools.search_and_answer(case["query"], cfg)
         ok, why = grade(case, answer)
         print(f"[{'PASS' if ok else 'FAIL'}] #{case['id']} ({case['type']}) {case['query']} -> {why}", flush=True)

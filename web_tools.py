@@ -23,6 +23,37 @@ _SEARCH_TIMEOUT = 12
 _FETCH_TIMEOUT = 8
 _MAX_ANSWER_CHARS = 500
 
+_SESSIONS = {}
+_WARM_HOMES = {
+    "www.bing.com": "https://www.bing.com/",
+    "www.so.com": "https://www.so.com/",
+}
+_QUERY_CACHE = {}
+_CACHE_TTL = 600
+
+
+def _fetch_page(url, timeout=_SEARCH_TIMEOUT):
+    """带会话的抓取: 同一搜索引擎先访问首页拿 cookie 再搜, 否则容易被当机器人挡。
+    返回 (status_code, text); 异常返回 (0, "")。"""
+    from urllib.parse import urlsplit as _split
+    host = _split(url).netloc
+    session = _SESSIONS.get(host)
+    if session is None:
+        session = requests.Session()
+        _SESSIONS[host] = session
+        home = _WARM_HOMES.get(host)
+        if home:
+            try:
+                session.get(home, headers=_HEADERS, timeout=8)
+            except Exception:
+                pass
+    try:
+        r = session.get(url, headers=_HEADERS, timeout=timeout)
+        return r.status_code, r.text
+    except Exception as exc:
+        print(f"[联网搜索] 请求失败 {host}: {exc}")
+        return 0, ""
+
 
 def _clean(fragment):
     text = re.sub(r"<[^>]+>", " ", fragment or "")
@@ -32,12 +63,12 @@ def _clean(fragment):
 
 def search_bing(query, limit=5):
     url = "https://www.bing.com/search?q=" + quote(query)
-    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
-    if r.status_code != 200:
+    status, text = _fetch_page(url)
+    if status != 200:
         return []
     results = []
-    for block in re.findall(r'<li class="b_algo".*?</li>', r.text, re.S):
-        m = re.search(r'<h2>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+    for block in re.findall(r'<li class="b_algo".*?</li>', text, re.S):
+        m = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
         if not m:
             continue
         snippet_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.S)
@@ -53,11 +84,11 @@ def search_bing(query, limit=5):
 
 def search_ddg(query, limit=5):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
-    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
-    if r.status_code != 200:
+    status, text = _fetch_page(url)
+    if status != 200:
         return []
     results = []
-    for m in re.finditer(r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.S):
+    for m in re.finditer(r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', text, re.S):
         results.append({"url": html_lib.unescape(m.group(1)),
                         "title": _clean(m.group(2)), "snippet": ""})
         if len(results) >= limit:
@@ -68,10 +99,10 @@ def search_ddg(query, limit=5):
 def search_so360(query, limit=5):
     """360 搜索: 服务端渲染、带 data-mdurl 真实链接, 国内网络最稳。"""
     url = "https://www.so.com/s?q=" + quote(query)
-    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
-    if r.status_code != 200:
+    status, raw = _fetch_page(url)
+    if status != 200:
         return []
-    text = re.sub(r"<style.*?</style>|<script.*?</script>", " ", r.text, flags=re.S | re.I)
+    text = re.sub(r"<style.*?</style>|<script.*?</script>", " ", raw, flags=re.S | re.I)
     results = []
     # 不按 li 切块 (class 写法多变), 直接全局找标题链接, 摘要取其后一段
     pattern = r'<h3[^>]*class="res-title[^"]*"[^>]*>\s*<a([^>]+)>(.*?)</a>'
@@ -95,14 +126,21 @@ def search_so360(query, limit=5):
 
 
 def web_search(query, limit=5):
-    """360 -> Bing -> DDG, 谁先出结果用谁; 全失败返回空列表。"""
-    for finder in (search_so360, search_bing, search_ddg):
+    """Bing(带会话) -> 360 -> DDG, 谁先出结果用谁; 同一问题 10 分钟内走缓存,
+    避免短时间重复请求把搜索源惹毛 (360 连查会给验证码页)。"""
+    import time
+    key = (query, limit)
+    hit = _QUERY_CACHE.get(key)
+    if hit and time.time() - hit[0] < _CACHE_TTL:
+        return hit[1]
+    for finder in (search_bing, search_so360, search_ddg):
         try:
             found = finder(query, limit)
         except Exception as exc:
             print(f"[联网搜索] {finder.__name__} 失败: {exc}")
             found = []
         if found:
+            _QUERY_CACHE[key] = (time.time(), found)
             return found
     return []
 
