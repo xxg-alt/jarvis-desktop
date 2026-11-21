@@ -176,18 +176,23 @@ def _agent_plan_from_llm(goal: str) -> dict:
         {"role": "system", "content": AGENT_PLANNER_PROMPT},
         {"role": "user", "content": str(goal or "").strip()},
     ]
-    try:
-        raw = _provider_chat(CONFIG, messages, json_mode=True)
-        if not str(raw or "").strip():
-            raw = _provider_chat(CONFIG, messages, json_mode=False)
-        plan = json.loads(_strip_json_text(raw))
-        return plan if isinstance(plan, dict) else {}
-    except _LlmError as e:
-        print(f"[Agent 规划失败] {e.message}")
-        return {}
-    except Exception as e:
-        print(f"[Agent 规划失败] {e}")
-        return {}
+    # 模型偶发吐坏 JSON (长计划尤其容易在中途损坏), 解析失败就重试, 最多 3 次
+    last_err = None
+    for attempt in range(3):
+        try:
+            raw = _provider_chat(CONFIG, messages, json_mode=(attempt < 2))
+            if not str(raw or "").strip():
+                continue
+            plan = json.loads(_strip_json_text(raw))
+            if isinstance(plan, dict) and plan.get("steps"):
+                return plan
+            last_err = "计划为空或格式不对"
+        except _LlmError as e:
+            last_err = e.message
+        except Exception as e:
+            last_err = str(e)
+    print(f"[Agent 规划失败] 重试 3 次仍失败: {last_err}")
+    return {}
 
 
 # ---------- 语音输出 ----------
