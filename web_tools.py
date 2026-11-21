@@ -126,6 +126,30 @@ def search_so360(query, limit=5):
     return results
 
 
+def search_sogou(query, limit=5):
+    """搜狗: 服务端渲染, 标题链接多为直达; 360/Bing 被限流时的后备源。"""
+    url = "https://www.sogou.com/web?query=" + quote(query)
+    status, raw = _fetch_page(url)
+    if status != 200 or "验证码" in raw:
+        return []
+    text = re.sub(r"<style.*?</style>|<script.*?</script>", " ", raw, flags=re.S | re.I)
+    results = []
+    pattern = r'<h3[^>]*class="vr-title[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+    for m in re.finditer(pattern, text, re.S):
+        seg = text[m.end():m.end() + 1500]
+        desc = re.search(r'class="str-text-info[^"]*"[^>]*>(.*?)</p>', seg, re.S)
+        if not desc:
+            desc = re.search(r'class="fz-mid[^"]*"[^>]*>(.*?)</div>', seg, re.S)
+        results.append({
+            "url": html_lib.unescape(m.group(1)),
+            "title": _clean(m.group(2)),
+            "snippet": _clean(desc.group(1)) if desc else "",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 def web_search(query, limit=5):
     """Bing(带会话) -> 360 -> DDG, 谁先出结果用谁; 同一问题 10 分钟内走缓存,
     避免短时间重复请求把搜索源惹毛 (360 连查会给验证码页)。"""
@@ -134,7 +158,7 @@ def web_search(query, limit=5):
     hit = _QUERY_CACHE.get(key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
         return hit[1]
-    for finder in (search_bing, search_so360, search_ddg):
+    for finder in (search_bing, search_so360, search_sogou, search_ddg):
         if _ENGINE_FAILS.get(finder.__name__, 0) >= 2:
             continue  # 熔断: 该源已连续失败, 多半被限流, 别再火上浇油
         try:
