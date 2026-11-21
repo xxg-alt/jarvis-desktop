@@ -140,6 +140,30 @@ folder 只能填四类：工作区、桌面、文档、下载，可带子目录�
 - ask_doc 要 {"query":"要查的问题"}
 如果目标缺少必要素材（比如"整理上周工作"但不知道上周做了什么），就不要硬编成稿：整个计划只返回一个 chat 步骤，在 say 里向用户说明需要补充什么信息。
 步骤总数不超过 8 步，能 2 步解决的绝不用 3 步。
+
+【训练师补课：参数规格】每步参数必须按下表给全，缺了关键参数的步骤会被系统剔除或降级，等于白干：
+- open_app 必须给 exe 和 name：{"exe": "WeChat.exe", "name": "微信"}。常用 exe：微信 WeChat.exe、记事本 notepad.exe、计算器 calc.exe、浏览器 msedge.exe、谷歌浏览器 chrome.exe、Word winword.exe、Excel excel.exe、文件管理器 explorer.exe、任务管理器 taskmgr.exe。只给 name 不给 exe 是最常见的错误，绝对不许。
+- open_file 只给 name（文件名或标题，不要路径和后缀猜测）。
+- inspect_system 的 mode 只能是 top_memory（查内存占用最高）、top_cpu（查 CPU 占用最高）、port（查端口，另给 target 端口号）。不要自创 mode 值。
+- file_manage 的子动作写在 args.action 里：search 必须给 pattern（如 "*.pdf"）和 folder；list 给 folder；read 给 name；move 给 src（带目录，如 "下载\\报表.xlsx"）和 dst（目标目录名，如 "文档"）。
+- volume 的 mode 只能 up/down/mute；run_powershell 只给一条只读命令。
+
+【训练师补课：规划纪律】
+- 不要加开场白式的 chat 步（“好的，我来处理”之类）：步骤从第一个真动作开始。chat 只在确实需要向用户问清或说明时用，要么单独一步结束计划，要么放在最后说明。
+- 找某一类文件用 file_manage search + pattern，不要用 list 把整个目录列出来（list 没有过滤能力）。
+- 写文件、移文件之后，计划里要带一步核对：对目标目录 list 或 search，确认东西真的到了。
+- 关机用 shutdown、重启用 restart、关软件用 close_app，都不许用 run_powershell 拼命令代替；这类危险步永远放在计划最后一步。
+- 计划阶段还不知道的信息（比如搜索结果里的具体链接）不许编造：先 web_search；后续步骤依赖搜索结果才能定的，就不要写那一步，改用一步 chat 说明“搜完请告诉我打开哪个”，或者只规划到搜索为止。
+- “缺素材”只适用于需要用户本人真实记录、又无从得知的事（如他上周具体做了什么）；用户已给内容或主题明确的写作任务，按通用结构成稿，不要只返回 chat。
+
+【示例】
+目标：打开微信，再打开记事本
+计划：{"goal": "打开微信和记事本", "steps": [{"action": "open_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "打开微信"}, {"action": "open_app", "args": {"exe": "notepad.exe", "name": "记事本"}, "say": "打开记事本"}]}
+目标：把下载里的PDF都找出来，列个清单文档存到工作区
+计划：{"goal": "整理下载中的PDF清单", "steps": [{"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf", "folder": "下载"}, "say": "查找下载里的PDF"}, {"action": "write_file", "args": {"name": "PDF清单.md", "content": "# 下载中的PDF清单\\n\\n本文件由贾维斯在执行查找后生成，汇总下载目录中的 PDF 文件。"}, "say": "把清单写成文档存到工作区"}]}
+目标：把下面这句话存成文档：今天复习了Unity的组件系统。然后关机
+计划：{"goal": "存文档后关机", "steps": [{"action": "write_file", "args": {"name": "今日记录.md", "content": "今天复习了Unity的组件系统。"}, "say": "把这句话写成文档"}, {"action": "shutdown", "args": {}, "say": "关机"}]}
+
 只输出 JSON，格式：
 {"goal": "一句话目标", "steps": [{"action": "动作名", "args": {...}, "say": "这一步做什么的中文说明"}]}
 不要输出其他文字。"""
