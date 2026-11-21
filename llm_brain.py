@@ -75,6 +75,15 @@ LLM_PROVIDERS = {
         "default_model": "",
         "models": [],
         "type": "openai_compatible"
+    },
+    "Kaggle 免费 35B": {
+        "url": "",
+        "default_model": "qwen3.6-35b-a3b",
+        "models": ["qwen3.6-35b-a3b"],
+        "type": "openai_compatible",
+        "no_auth": True,
+        "disable_thinking": True,
+        "timeout": 120
     }
 }
 
@@ -99,6 +108,10 @@ PROVIDER_ALIASES = {
     "自定义": "自定义 API (OpenAI兼容)",
     "自定义 api": "自定义 API (OpenAI兼容)",
     "自定义 api (openai兼容)": "自定义 API (OpenAI兼容)",
+    "kaggle": "Kaggle 免费 35B",
+    "kaggle-qwen": "Kaggle 免费 35B",
+    "kaggle 35b": "Kaggle 免费 35B",
+    "kaggle 免费 35b": "Kaggle 免费 35B",
 }
 
 
@@ -165,6 +178,24 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 你：{"action": "write_file", "args": {"name": "上周工作周报.md", "content": "# 上周工作周报\n\n## 一、完成事项\n（完整正文…）"}, "say": "这就为您写好周报，Sir", "status_say": "正在撰写文档"}
 用户：这句话是什么意思
 你：{"action": "chat", "args": {}, "say": "Sir，您指的是哪句话？把原句说给我，我为您解释"}
+
+【主人档案】主人叫 ljj，是大学生，喜欢简短直接、先说结论的回答，讨厌长篇大论、重复确认已知信息和客服腔。闲聊默认 1~2 句说清，只有他明确说“详细讲讲”才展开。
+【语音纠错】输入来自语音识别，常有同音字和错字（如“记事版”其实是记事本、“威信”是微信、“截个图”是截图）。先按最合理的真实意图理解再行动，不要因为字面奇怪就说做不了；只有两种解释都成立且后果明显不同时，才在 say 里反问一句。
+【诚实原则】不知道就直说不知道，并给一个下一步建议，绝不编造软件名、文件名、数字或“已经完成”。status_say 只是“正在做”的垫话，say 里不许把还没执行完的事说成已完成。
+【回答质量】action="chat" 时先给答案本身，不要复述问题、不要以“作为AI”开头、不要输出思考过程。涉及数字和常识要给准数，不要含糊其辞。
+补充示例：
+用户：太吵了，小声一点
+你：{"action": "volume", "args": {"mode": "down"}, "say": "好的，已调低音量，Sir"}
+用户：帮我截个图
+你：{"action": "screenshot", "args": {}, "say": "这就为您截图，Sir", "status_say": "正在截图"}
+用户：电脑怎么这么卡
+你：{"action": "inspect_system", "args": {"mode": "top_memory"}, "say": "我看看是什么在吃内存，Sir", "status_say": "正在检查高占用进程"}
+用户：打开威信
+你：{"action": "open_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "这就为您打开微信，Sir"}
+用户：水的沸点是多少度
+你：{"action": "chat", "args": {}, "say": "标准大气压下是 100 摄氏度，Sir"}
+用户：不是这个，我说的是计算器
+你：{"action": "open_app", "args": {"exe": "calc.exe", "name": "计算器"}, "say": "抱歉听错了，这就为您打开计算器，Sir"}
 
 如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；当前用户输入才是本次唯一任务，不要重复执行历史动作。
 无论哪种情况，都必须输出一个完整、可解析的 JSON 对象；要反问也只能写在 say 里，禁止用空白或省略内容来顶替。
@@ -304,8 +335,10 @@ def probe_api_key(config: dict, api_key: str = "") -> tuple:
         return False, "服务商无法识别，请重新选择"
     info = LLM_PROVIDERS[provider_name]
     key = clean_api_key(api_key or cfg.get("api_key"))
-    if not key:
+    if not key and not info.get("no_auth"):
         return False, "没有可用的 API Key"
+    if not key:
+        key = "kaggle-free-35b"
     model = str(cfg.get("ai_model") or "").strip() or info["default_model"]
     if not model:
         return False, "没有填写模型名"
@@ -625,7 +658,10 @@ def _provider_chat(config: dict, messages,
 
     provider_info = LLM_PROVIDERS[provider_name]
     raw_key = (config.get("api_key") or "").strip() or os.environ.get("AI_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
-    api_key = clean_api_key(raw_key)
+    if provider_info.get("no_auth"):
+        api_key = clean_api_key(raw_key) or "kaggle-free-35b"
+    else:
+        api_key = clean_api_key(raw_key)
 
     if not api_key:
         if raw_key:
@@ -657,12 +693,15 @@ def _provider_chat(config: dict, messages,
                 "messages": messages,          # 原样发送, 前缀才不会被重排打乱
                 "temperature": 0.7,
             }
+            if provider_info.get("disable_thinking"):
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
             if max_tokens:
                 payload["max_tokens"] = max_tokens
             if json_mode and ("deepseek" in model or "gpt" in model):
                 payload["response_format"] = {"type": "json_object"}
 
-            r = requests.post(api_url, headers=headers, json=payload, timeout=25)
+            r = requests.post(api_url, headers=headers, json=payload,
+                              timeout=provider_info.get("timeout", 25))
             if r.status_code != 200:
                 raise _LlmError(_http_error_message(provider_name, r))
 
