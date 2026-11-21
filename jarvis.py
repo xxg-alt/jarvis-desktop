@@ -24,11 +24,12 @@ import audio_device
 
 BASE = Path(__file__).resolve().parent
 DRY_RUN = False
-# GUI 外壳回调（终端版保持 None）：文字、语音播放结束和麦克风音量。
+# GUI 外壳回调（终端版保持 None）：文字、语音播放结束、麦克风音量和退出。
 ON_SPEAK = None
 ON_HEAR = None
 ON_SPEAK_END = None
 ON_AUDIO_LEVEL = None
+ON_EXIT = None
 
 # UI 状态总线 (胶囊/穿透层那套界面用; 终端模式没有也不影响)
 try:
@@ -127,6 +128,41 @@ if ui_bridge is not None:
         pass
 from jarvis_memory import JarvisMemory
 MEMORY = JarvisMemory()
+
+# Agent 任务拆解提示词: 只管"把目标拆成步骤", 不执行。
+# 步骤格式沿用现有动作白名单, 由 sanitize_plan 出口统一校验。
+AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
+只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot。
+写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
+各动作的参数必须齐全，缺参数的一律不要写进计划：
+- file_manage search 要 {"action":"search","pattern":"*.pdf","folder":"下载"}；read 要 {"action":"read","name":"文件名"}；list 要 {"action":"list","folder":"下载"}
+- ask_doc 要 {"query":"要查的问题"}
+如果目标缺少必要素材（比如"整理上周工作"但不知道上周做了什么），就不要硬编成稿：整个计划只返回一个 chat 步骤，在 say 里向用户说明需要补充什么信息。
+步骤总数不超过 8 步，能 2 步解决的绝不用 3 步。
+只输出 JSON，格式：
+{"goal": "一句话目标", "steps": [{"action": "动作名", "args": {...}, "say": "这一步做什么的中文说明"}]}
+不要输出其他文字。"""
+
+def _agent_plan_from_llm(goal: str) -> dict:
+    """调用大模型把目标拆成步骤清单。返回原始 JSON (未经校验)。"""
+    from llm_brain import _provider_chat, _strip_json_text, _LlmError, SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": AGENT_PLANNER_PROMPT},
+        {"role": "user", "content": str(goal or "").strip()},
+    ]
+    try:
+        raw = _provider_chat(CONFIG, messages, json_mode=True)
+        if not str(raw or "").strip():
+            raw = _provider_chat(CONFIG, messages, json_mode=False)
+        plan = json.loads(_strip_json_text(raw))
+        return plan if isinstance(plan, dict) else {}
+    except _LlmError as e:
+        print(f"[Agent 规划失败] {e.message}")
+        return {}
+    except Exception as e:
+        print(f"[Agent 规划失败] {e}")
+        return {}
+
 
 # ---------- 语音输出 ----------
 _tts_engine = None
@@ -495,7 +531,7 @@ _CURRENT_STOP_EVENT = None
 # 异步工具只把结果放进队列，由语音主循环取出并播报。
 # 每条指令/每次主动打断都会递增编号，旧任务因此失去回播资格。
 _ASYNC_RESULTS = queue.Queue()
-_ASYNC_ACTIONS = {"file_manage", "inspect_system", "run_powershell"}
+_ASYNC_ACTIONS = {"file_manage", "inspect_system", "run_powershell", "ask_doc"}
 _DRAIN_LOCK = threading.Lock()
 _ASYNC_DISPATCHER = None
 _COMMAND_ID = 0
@@ -602,6 +638,552 @@ def parse_number(s):
     if "十" in s and len(s) == 3: return CN_NUM.get(s[0], 0) * 10 + CN_NUM.get(s[2], 0)
     return None
 
+# ---------- 文档打开: 按文件名找, 而不是把整句话当文件名 ----------
+# 只允许这些类型被"打开", exe/lnk/bat/ps1 一律不在此列, 避免语音指令变成执行程序
+_DOC_EXTS = {".txt", ".md", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+             ".csv", ".rtf", ".wps", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".mp3",
+             ".mp4", ".zip", ".7z"}
+_DOC_ROOTS = [Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"]
+# 口语里的"打开一个名为XX的文本" -> XX
+_DOC_FILLER_HEADS = re.compile(
+    r"^(?:请|帮我|帮忙|麻烦|给我|把|打开|启动|运行|一个|一份|那张|这张|那个|这个|"
+    r"名为|名字叫|名字是|叫做|标题为|标题是|叫)+"
+)
+# "打开下载里的报告.pdf" -> 报告.pdf
+_DOC_FOLDER_HEADS = re.compile(r"^(?:桌面|下载|文档|图片|音乐|视频)(?:里|中|上|下面|里面)?(?:的)?")
+_DOC_FILLER_TAILS = re.compile(r"(?:的)?(?:文本文件|文本|文件|文档|那个文件|那个文本|那份文件)+$")
+
+
+def _normalize_file_query(text):
+    """把"打开下载里那个名为会议纪要的文本"这类口语归一成"会议纪要"。"""
+    s = str(text or "").strip().strip("\"'“”‘’《》")
+    for _ in range(4):   # 逐层剥: 打开 -> 一个 -> 名为 -> 的文本
+        new_s = _DOC_FILLER_HEADS.sub("", s)
+        if new_s == s:
+            break
+        s = new_s
+    for _ in range(2):   # 再剥掉"下载里的""桌面上的"这类位置词
+        new_s = _DOC_FOLDER_HEADS.sub("", s)
+        if new_s == s:
+            break
+        s = new_s
+    s = _DOC_FILLER_TAILS.sub("", s)
+    s = s.strip(" ，,。.、　的")
+    # 语音常把扩展名前的点念成"点": 你好点txt -> 你好.txt
+    s = re.sub(r"点(txt|md|pdf|docx|doc|xlsx|xls|pptx|ppt|csv)$", r".\1", s, flags=re.I)
+    return s.strip()
+
+
+def _looks_like_document(name):
+    """判断这个目标更像文档还是软件: 带文档扩展名, 或用户明说了文本/文件/文档。"""
+    s = str(name or "").strip().lower()
+    if Path(s).suffix in _DOC_EXTS:
+        return True
+    return any(w in s for w in ("文本", "文件", "文档", "表格", "图片", "表格"))
+
+
+def _document_candidates(query):
+    """在桌面/文档/下载里按文件名找文档, 精确命中优先, 同分按修改时间取最新。"""
+    q = _normalize_file_query(query).lower()
+    if not q:
+        return []
+    targets = {q}
+    stem = Path(q).stem
+    if stem:
+        targets.add(stem)
+
+    def _mtime(p):
+        try:
+            return p.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    exact, partial = [], []
+    for root in _DOC_ROOTS:
+        try:
+            if not Path(root).exists():
+                continue
+            for p in Path(root).rglob("*"):
+                try:
+                    if not p.is_file() or p.suffix.lower() not in _DOC_EXTS:
+                        continue
+                    fname, pstem = p.name.lower(), p.stem.lower()
+                    if fname in targets or pstem in targets:
+                        exact.append(p)
+                    elif q in fname:
+                        partial.append(p)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    exact.sort(key=_mtime, reverse=True)
+    partial.sort(key=_mtime, reverse=True)
+    return exact + partial
+
+
+def _open_document(name):
+    """返回 (是否成功, 可直接朗读的中文)。找不到时给最接近的候选, 绝不猜着乱开。"""
+    display = _normalize_file_query(name) or str(name or "").strip()
+    cands = _document_candidates(name)
+    if not cands:
+        return False, f"我在桌面、文档和下载里没找到「{display}」，Sir"
+    best = cands[0]
+    try:
+        os.startfile(str(best))
+    except Exception as exc:
+        print(f"[打开文档失败] {best}: {exc}")
+        return False, f"找到了「{best.name}」，但它没有默认打开的程序，Sir"
+    if len(cands) > 1:
+        others = "、".join(p.name for p in cands[1:3])
+        return True, f"已打开{best.name}；另外还有{others}，要换就说一声"
+    return True, f"已打开{best.name}"
+
+
+# ---------- Agent 地基 ----------
+# 跨会话的任务对象: 一个 goal 拆成多个步骤, 每步都有状态可回填。
+# 存放位置与 memory.json 同目录, 崩溃后能续跑; 也让"它刚才干了什么"可审计。
+# 上限刻意很小: 一个任务最多 8 步, 防止模型一次生成几十步失控。
+AGENT_TASKS_PATH = BASE / "agent_tasks.json"
+AGENT_MAX_STEPS = 8
+AGENT_STATES = ("draft", "approved", "running", "waiting_user", "done", "failed", "cancelled")
+
+# 三级权限: 越界才问, 圈内直接干。agent 连续执行时每一步套这个格子,
+# 计划审批已经放行的圈内操作不再逐条弹确认 —— 否则 agent 名存实亡。
+AGENT_SCOPE_FREE = "free"        # 只读/开东西: list, read, open_*, search, chat, ask_doc, inspect
+AGENT_SCOPE_NOTIFY = "notify"   # 落盘/系统层: write_file, move, volume, screenshot, run_powershell(只读)
+AGENT_SCOPE_ASK = "ask"          # 危险: shutdown, restart, close_app, run_powershell(非只读)
+
+_AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
+                       "web_search", "search_file", "ask_doc", "screenshot", "lock",
+                       "file_manage:read", "file_manage:list", "file_manage:search",
+                       "inspect_system"}
+_AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
+                         "type_text", "press_key", "click"}
+
+
+def agent_scope_of(action: str, args=None) -> str:
+    """一个动作属于哪级权限。file_manage 按子动作细分。"""
+    if action == "file_manage":
+        sub = str((args or {}).get("action") or "")
+        key = f"file_manage:{sub}"
+        if key in _AGENT_FREE_ACTIONS:
+            return AGENT_SCOPE_FREE
+        if key in _AGENT_NOTIFY_ACTIONS:
+            return AGENT_SCOPE_NOTIFY
+        return AGENT_SCOPE_ASK
+    if action in _AGENT_FREE_ACTIONS:
+        return AGENT_SCOPE_FREE
+    if action in _AGENT_NOTIFY_ACTIONS:
+        return AGENT_SCOPE_NOTIFY
+    return AGENT_SCOPE_ASK
+
+
+def _write_document(name: str, content: str) -> tuple:
+    """把模型写好的正文落成文件, 存进贾维斯工作区。返回 (是否成功, 话术)。
+
+    - 名字走裸名校验, 不接受路径分隔符和命令元字符;
+    - .md/.txt 直接写; .docx 生成 .md 后用系统 Word COM 转一遍;
+    - 同名不覆盖: 自动加序号, agent 重跑不会吃掉上一版。
+    """
+    from llm_brain import _SHELL_META_RE
+    raw = str(name or "").strip().strip("\"'“”‘’")
+    if not raw:
+        return False, "要写的文件名是空的，Sir"
+    if len(raw) > 200 or _SHELL_META_RE.search(raw) or "/" in raw or "\\" in raw:
+        return False, "这个文件名我不能用，换一个普通的名字"
+    # 可执行/脚本类型一律拒绝: voice 场景只生成文档, 不生成能跑的东西
+    if Path(raw).suffix.lower() in (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js",
+                                    ".py", ".lnk", ".msi", ".scr", ".com", ".jar",
+                                    ".reg", ".hta"):
+        return False, "出于安全我只能写文档（md/txt/docx），不能生成可执行文件"
+    if Path(raw).suffix.lower() not in (".md", ".txt", ".docx"):
+        raw += ".md"   # 没写扩展名的一律当 Markdown
+
+    text = str(content or "").strip()
+    if not text:
+        return False, "要写入的内容是空的，Sir"
+
+    ws = agent_workspace()
+
+    def _avoid_collision(base: str, suffix: str) -> Path:
+        target = ws / (base + suffix)
+        n = 1
+        while target.exists():
+            target = ws / f"{base}-{n}{suffix}"
+            n += 1
+        return target
+
+    stem = Path(raw).stem
+    want_docx = Path(raw).suffix.lower() == ".docx"
+    try:
+        if want_docx:
+            # 先落 Markdown 保住内容, 再转 Word; 转换失败也不丢稿
+            md_path = _avoid_collision(stem, ".md")
+            md_path.write_text(text, encoding="utf-8")
+            converted = _md_to_docx(md_path)
+            if converted:
+                return True, f"已写好 Word 文档{converted.name}，存在文档的贾维斯工作区里"
+            return True, f"已写好{md_path.name}（Word 不可用，先存了 Markdown 版）"
+        target = _avoid_collision(stem, Path(raw).suffix)
+        target.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        print(f"[写文档失败] {raw}: {exc}")
+        return False, f"写文件失败了：{exc}"
+
+    say = f"已写好{target.name}，存在文档的贾维斯工作区里"
+    try:
+        os.startfile(str(target))   # 写完即开, 和 open_file 闭环
+        say = f"已写好并打开{target.name}"
+    except Exception:
+        pass
+    return True, say
+
+
+def _md_to_docx(md_path: Path):
+    """用系统装的 Word 把 .md 转成 .docx; 没装 Word 返回 None。"""
+    try:
+        import win32com.client
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        doc = word.Documents.Open(str(md_path))
+        docx_path = md_path.with_suffix(".docx")
+        doc.SaveAs2(str(docx_path), FileFormat=16)   # 16 = wdFormatXMLDocument
+        doc.Close(False)
+        word.Quit()
+        return docx_path
+    except Exception as exc:
+        print(f"[Word 转换不可用, 保留 Markdown] {exc}")
+        return None
+
+
+def agent_workspace() -> Path:
+    """Agent 专用工作区: 一切落盘产物只进这里, 出问题删目录即回滚。"""
+    ws = Path.home() / "Documents" / "贾维斯工作区"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def _agent_load_tasks() -> dict:
+    try:
+        if AGENT_TASKS_PATH.exists():
+            data = json.loads(AGENT_TASKS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        print(f"[Agent] 任务记录读不出来, 从空开始: {exc}")
+    return {"tasks": []}
+
+
+def _agent_save_tasks(data: dict):
+    try:
+        AGENT_TASKS_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        print(f"[Agent] 任务记录写不进去: {exc}")
+
+
+def agent_tasks_text() -> str:
+    """给"任务进展"语音查询用的一句话汇总。"""
+    data = _agent_load_tasks()
+    tasks = [t for t in data.get("tasks", []) if t.get("state") in ("running", "waiting_user")]
+    if not tasks:
+        done = [t for t in data.get("tasks", []) if t.get("state") == "done"]
+        if done:
+            return f"当前没有进行中的任务; 最近完成过 {len(done)} 个, 说「任务清单」可以看历史。"
+        return "当前没有任何任务记录, Sir。"
+    lines = []
+    for t in tasks[:3]:
+        done_n = sum(1 for s in t.get("steps", []) if s.get("status") == "done")
+        total = len(t.get("steps", []))
+        if t.get("state") == "running":
+            pending = [i for i, s in enumerate(t.get("steps", [])) if s.get("status") == "pending"]
+            where = f", 正在第 {pending[0] + 1} 步" if pending else ""
+            lines.append(f"「{t.get('goal', '')[:40]}」{done_n}/{total} 步{where}")
+            continue
+        waiting = ", 等您确认" if t.get("state") == "waiting_user" else ""
+        lines.append(f"「{t.get('goal', '')[:40]}」{done_n}/{total} 步{waiting}")
+    return "; ".join(lines)
+
+
+def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict:
+    """把一个目标拆成步骤清单存成待审批任务; steps 为空时调用大模型拆解。
+
+    返回给 UI 的结构: {task, say} —— 展示用, 不执行。
+    只有 agent_approve 之后才真正进入 running。
+    """
+    if steps is None:
+        steps = _agent_plan_from_llm(goal).get("steps")
+    if not isinstance(steps, list) or not steps:
+        return {"error": "步骤清单是空的, 没法立项", "say": "这个任务我拆不出步骤, 您说说具体要做什么"}
+    steps = [dict(s) for s in steps if isinstance(s, dict)][:AGENT_MAX_STEPS]
+    if not steps:
+        return {"error": "步骤格式不对", "say": "任务步骤的格式我读不懂, 您换个说法试试"}
+
+    # 归一 + 预判权限: 审批界面要一眼看出哪几步会动系统
+    # 同时拦"参数不全被静默降级成 chat": 这种步骤执行了也只是一句废话, 宁可剔除
+    from llm_brain import sanitize_plan
+    norm_steps, scopes, needs_ask, dropped, chats = [], [], False, [], []
+    for s in steps:
+        requested = str(s.get("action") or "chat")
+        plan = sanitize_plan({**s, "action": requested, "args": s.get("args", {}),
+                              "say": s.get("say", "")})
+        action = plan.get("action", "chat")
+        if requested != "chat" and action == "chat":
+            dropped.append(f"{requested}←{plan.get('say') or '参数不合法'}")
+            print(f"[Agent] 步骤参数不合法, 已剔除: {requested} {s.get('args')} -> {plan.get('say')}")
+            continue
+        if action == "chat":
+            chats.append(str(plan.get("say") or s.get("say") or ""))
+        scope = agent_scope_of(action, plan.get("args"))
+        needs_ask = needs_ask or scope == AGENT_SCOPE_ASK
+        scopes.append(scope)
+        norm_steps.append({"action": action, "args": plan.get("args", {}),
+                           "say": plan.get("say", "")})
+
+    # 一步可执行的都没有: 不要把空任务立出来, 直接把规划器那句话回给用户
+    if not norm_steps or all(s["action"] == "chat" for s in norm_steps):
+        say = next((c for c in chats if c), "这个任务我拆不出能执行的步骤, 您说说更具体的做法")
+        print(f"[Agent] 计划不可执行, 不立项: {dropped}")
+        return {"error": "no_executable_step", "say": say}
+
+    task = {
+        "goal": str(goal or "")[:200],
+        "state": "draft",
+        "created": time.strftime("%Y-%m-%d %H:%M"),
+        "steps": [{"action": s["action"], "args": s["args"], "say": s["say"],
+                   "status": "pending", "scope": sc}
+                  for s, sc in zip(norm_steps, scopes)],
+    }
+    if needs_ask:
+        task["note"] = "计划里含高危步骤, 审批时会单独标出"
+    if dropped:
+        task["dropped"] = dropped[:5]
+    data = _agent_load_tasks()
+    data.setdefault("tasks", []).append(task)
+    _agent_save_tasks(data)
+
+    text = f"任务已立项待审批「{task['goal']}」, 共 {len(task['steps'])} 步"
+    if needs_ask:
+        text += ", 其中有需要您单独确认的高危步骤"
+    if dropped:
+        text += f"; 另有 {len(dropped)} 步参数不全已剔除"
+    return {"task": task, "say": text}
+
+
+# ---------- Agent 后台执行器 ----------
+# 设计要点:
+#   1. 任务跑在独立线程里, 不占 _RUN_LOCK —— 否则跑几分钟的 agent 会把语音循环锁死;
+#   2. 播报不 worker 里直接喊, 只往 _AGENT_EVENTS 塞, 由主循环统一出口 (避免和普通指令抢话筒);
+#   3. 步骤之间检查 stop/skip 标志: 正在跑的这一步无法打断 (比如一次 25 秒的接口调用),
+#      但一步结束立刻停 —— 这是"插话停得住"的现实边界。
+_AGENT_LOCK = threading.Lock()
+_AGENT_RUN = {"thread": None, "task": None, "stop": False, "skip": False, "gen": 0}
+_AGENT_EVENTS = queue.Queue()
+
+
+def _agent_busy() -> bool:
+    t = _AGENT_RUN.get("thread")
+    return bool(t and t.is_alive())
+
+
+def _agent_notify(text: str, spoken: bool = False):
+    """进度只上 HUD 字幕 (不吵人); 要打断用户的提问/结论才进播报队列。"""
+    text = str(text or "").strip()
+    if not text:
+        return
+    if ui_bridge is not None:
+        try:
+            ui_bridge.emit_subtitle(text, False)
+        except Exception:
+            pass
+    if spoken:
+        _AGENT_EVENTS.put(text)
+
+
+def _agent_persist(task: dict):
+    """按 (goal, created) 身份把任务写回任务文件; 找不到就追加。"""
+    data = _agent_load_tasks()
+    tasks = data.get("tasks", [])
+    ident = (task.get("goal"), task.get("created"))
+    for i, t in enumerate(tasks):
+        if (t.get("goal"), t.get("created")) == ident:
+            tasks[i] = task
+            break
+    else:
+        tasks.append(task)
+    _agent_save_tasks({**data, "tasks": tasks})
+
+
+def _agent_start(task: dict) -> dict:
+    """把任务丢进后台执行器, 立即返回一句"开始执行"——调用方线程不阻塞。"""
+    with _AGENT_LOCK:
+        if _agent_busy():
+            return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
+        _AGENT_RUN["gen"] += 1
+        gen = _AGENT_RUN["gen"]
+        _AGENT_RUN["stop"] = False
+        _AGENT_RUN["skip"] = False
+        _AGENT_RUN["task"] = task
+        thread = threading.Thread(target=_agent_loop, args=(task, gen),
+                                  name="jarvis-agent", daemon=True)
+        _AGENT_RUN["thread"] = thread
+        thread.start()
+    total = len(task.get("steps", []))
+    return {"say": f"开始执行任务「{task.get('goal', '')}」, 共 {total} 步。要中止就说「停」"}
+
+
+def _agent_stop() -> bool:
+    """请求停止。返回是否真的打断了一个在跑的任务。"""
+    with _AGENT_LOCK:
+        if not _agent_busy():
+            return False
+        _AGENT_RUN["stop"] = True
+        _AGENT_RUN["gen"] += 1
+        task = _AGENT_RUN.get("task") or {}
+        if task:
+            task["state"] = "cancelled"
+            _agent_persist(task)
+    return True
+
+
+def _agent_skip() -> bool:
+    with _AGENT_LOCK:
+        if not _agent_busy():
+            return False
+        _AGENT_RUN["skip"] = True
+    return True
+
+
+def _agent_generation_changed(gen: int) -> bool:
+    return _AGENT_RUN.get("gen") != gen
+
+
+def _agent_loop(task: dict, gen: int):
+    """后台执行循环。每步之间检查 stop/skip, 遇 ask 步骤立刻挂起等确认。"""
+    steps = task.get("steps", [])
+    total = len(steps)
+    task["state"] = "running"
+    _agent_persist(task)
+    if ui_bridge is not None:
+        try: ui_bridge.emit_state("ACTING")
+        except Exception: pass
+
+    try:
+        for i, step in enumerate(steps):
+            if _agent_generation_changed(gen) or _AGENT_RUN.get("stop"):
+                task["state"] = "cancelled"
+                _agent_persist(task)
+                _agent_notify("任务已停止, Sir", spoken=True)
+                return
+            if step.get("status") != "pending":
+                continue
+
+            if step.get("scope") == AGENT_SCOPE_ASK:
+                task["state"] = "waiting_user"
+                step["status"] = "waiting"
+                _agent_persist(task)
+                _agent_notify(
+                    f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步要动系统: "
+                    f"{step.get('say') or step.get('action')}。说「继续任务」放行, 说「停」中止",
+                    spoken=True,
+                )
+                return
+
+            if step.get("action") == "chat":
+                step["status"] = "done"
+                _agent_persist(task)
+                continue
+
+            _agent_notify(f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
+            _TL.action_ok = True
+            try:
+                step["result"] = _perform_plan({"action": step.get("action"),
+                                                "args": step.get("args", {}),
+                                                "say": step.get("say", "")})
+                step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
+            except Exception as exc:
+                step["result"] = f"执行失败: {exc}"
+                step["status"] = "failed"
+            _agent_persist(task)
+
+            if _AGENT_RUN.get("skip"):
+                with _AGENT_LOCK:
+                    _AGENT_RUN["skip"] = False
+                for rest in steps[i + 1:]:
+                    if rest.get("status") == "pending":
+                        rest["status"] = "skipped"
+                task["state"] = "done"
+                _agent_persist(task)
+                _agent_notify("已跳过剩余步骤, 任务收尾", spoken=True)
+                return
+
+        failed = [i for i, s in enumerate(steps) if s.get("status") == "failed"]
+        done_n = sum(1 for s in steps if s.get("status") == "done")
+        task["state"] = "failed" if failed and done_n == 0 else "done"
+        _agent_persist(task)
+        if failed:
+            _agent_notify(f"任务「{task.get('goal', '')}」结束, 第 "
+                          f"{'、'.join(str(i + 1) for i in failed)} 步没有成功", spoken=True)
+        else:
+            _agent_notify(f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步", spoken=True)
+    except Exception as exc:
+        print(f"[Agent 执行异常] {exc}")
+        task["state"] = "failed"
+        _agent_persist(task)
+        _agent_notify(f"任务执行出错了: {exc}", spoken=True)
+    finally:
+        if _AGENT_RUN.get("task") is task:
+            _AGENT_RUN["task"] = None
+        if ui_bridge is not None:
+            try: ui_bridge.emit_state("IDLE")
+            except Exception: pass
+
+
+def agent_approve(index: int = -1) -> dict:
+    """把最新的 draft 任务交给后台执行器, 立即返回, 不阻塞指令线程。"""
+    data = _agent_load_tasks()
+    tasks = data.get("tasks", [])
+    drafts = [i for i, t in enumerate(tasks) if t.get("state") == "draft"]
+    if not drafts:
+        return {"say": "没有待审批的任务, 先说「帮我做某某」让它立项"}
+    task = tasks[drafts[-1]]
+    task["state"] = "approved"
+    _agent_save_tasks(data)
+    return _agent_start(task)
+
+
+def agent_continue() -> dict:
+    """waiting_user 的任务放行当前 ask 步骤, 交给后台执行器续跑。"""
+    data = _agent_load_tasks()
+    for task in data.get("tasks", []):
+        if task.get("state") != "waiting_user":
+            continue
+        task["state"] = "approved"
+        for step in task.get("steps", []):
+            if step.get("status") == "waiting":
+                step["status"] = "pending"
+                # 高危步骤既然被用户点名放行, 降级为 notify (留痕但不逐条弹确认)
+                step["scope"] = AGENT_SCOPE_NOTIFY
+        _agent_save_tasks(data)
+        return _agent_start(task)
+    return {"say": "没有在等确认的任务"}
+
+
+def agent_cancel() -> dict:
+    """作废所有未完成任务; 在跑的那个会立刻请求停止。"""
+    _agent_stop()
+    data = _agent_load_tasks()
+    changed = False
+    for task in data.get("tasks", []):
+        if task.get("state") in ("draft", "approved", "running", "waiting_user"):
+            task["state"] = "cancelled"
+            changed = True
+    if changed:
+        _agent_save_tasks(data)
+    return {"say": "任务已全部作废, Sir" if changed else "没有进行中的任务"}
+
+
 def parse_command(text):
     """返回 plan dict 或 None (None = 规则不认识, 交给 Gemini)"""
     t = text.strip().lower().replace(" ", "")
@@ -657,14 +1239,35 @@ def parse_command(text):
         if q:
             return {"action": "web_search", "args": {"query": q}, "say": f"正在搜索{q}"}
 
+    # 读取文件内容: 读取/读一下/念一下 + 带扩展名的文件名 (本地直通, 不必等大模型)
+    m = re.search(r"(?:读取|读一下|读下|念一下|朗读)(.+)", raw)
+    if m:
+        fm = re.search(
+            r"([\w\u4e00-\u9fff\-（）()\[\] ]+[.．]?(?:txt|md|pdf|docx))", m.group(1), re.I
+        )
+        if fm:
+            fname = re.sub(r"^(?:名为|叫做|叫)", "", fm.group(1).strip())
+            # 语音常把扩展名前的点说成“点”: 你好点txt -> 你好.txt
+            dot = re.match(r"^(.+?)点(txt|md|pdf|docx)$", fname, re.I)
+            if dot:
+                fname = f"{dot.group(1)}.{dot.group(2)}"
+            return {
+                "action": "file_manage",
+                "args": {"action": "read", "name": fname},
+                "say": f"正在读取{fname}",
+                "status_say": "正在读取文件",
+                "danger": False,
+            }
+
     # 打开网站
     for name, url in CONFIG["sites"].items():
         if f"打开{name}" in t or f"上{name}" in t:
             return {"action": "open_url", "args": {"url": url}, "say": f"已打开{name}"}
 
-    # 打开文件夹
+    # 打开文件夹 (必须整句就是"打开X(文件夹)", 否则"打开下载里的报告.pdf"会被误判成打开文件夹)
     for name, path in CONFIG["folders"].items():
-        if f"打开{name}" in t:
+        keys = (f"打开{name}", f"打开{name}文件夹", f"打开{name}目录", f"打开我的{name}")
+        if t in keys:
             return {"action": "open_folder", "args": {"path": path}, "say": f"已打开{name}文件夹"}
 
     # 我能打开哪些软件 (从桌面/开始菜单的快捷方式现场扫描)
@@ -678,7 +1281,7 @@ def parse_command(text):
             say = "暂时读不到软件清单"
         return {"action": "chat", "say": say}
 
-    # 打开软件
+    # 打开软件 / 打开文档
     m = re.search(r"(?:打开|启动|运行)(.+)", raw)
     if m:
         target = m.group(1).strip()
@@ -686,8 +1289,14 @@ def parse_command(text):
         for name, exe in CONFIG["apps"].items():
             if name in tl or tl in name:
                 return {"action": "open_app", "args": {"exe": exe, "name": name}, "say": f"已打开{name}"}
+        # 说的是文本/表格/图片这类文件: 按文件名去找, 不要当成软件
+        if _looks_like_document(target):
+            fname = _normalize_file_query(target)
+            return {"action": "open_file", "args": {"name": fname},
+                    "say": f"正在找{fname}", "status_say": "正在查找文件", "danger": False}
         # 在桌面/文档里找同名文件
-        return {"action": "search_file", "args": {"query": target}, "say": f"正在找{target}"}
+        return {"action": "search_file", "args": {"query": _normalize_file_query(target)},
+                "say": f"正在找{_normalize_file_query(target)}"}
 
     # 关闭软件 (危险, 执行时确认)
     m = re.search(r"(?:关闭|关掉|退出)(.+)", raw)
@@ -779,20 +1388,38 @@ def _format_tool_say(action, res):
 
 
 def _perform_plan(plan):
-    """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。"""
+    """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。
+
+    同时把"这一步到底成没成"记到线程本地 _TL.action_ok:
+    话术是给人听的, 不能靠字符串猜成败 —— agent 步骤状态要读这个位。
+    """
     action = plan.get("action")
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
+    _TL.action_ok = True
 
     try:
         if action == "chat":
             pass
         elif action == "open_app":
             from smart_launcher import smart_launch_app
-            app_target = args.get("exe", "")
-            app_name = args.get("name", app_target)
-            success, msg = smart_launch_app(app_target, app_name)
+            app_target = str(args.get("exe", "") or "")
+            app_name = str(args.get("name", "") or app_target)
+            # 模型常把"打开某某文本"塞进 open_app: 目标像文档就按文档开,
+            # 否则找 exe; 找不到时再用文档兜一次, 别一上来就说"定位不到安装路径"
+            if _looks_like_document(app_target) or _looks_like_document(app_name):
+                success, say = _open_document(app_name or app_target)
+            else:
+                success, say = smart_launch_app(app_target, app_name)
+                if not success and _document_candidates(app_name or app_target):
+                    success, say = _open_document(app_name or app_target)
+        elif action == "open_file":
+            success, say = _open_document(args.get("name") or args.get("exe") or "")
+        elif action == "write_file":
+            # 写文档: 只落贾维斯工作区, 同名加序号不覆盖, 写完即开
+            success, msg = _write_document(args.get("name"), args.get("content"))
             say = msg
+            _TL.action_ok = bool(success)
         elif action == "close_app":
             _run(["taskkill", "/im", args["exe"], "/f"])
         elif action == "open_url":
@@ -819,6 +1446,7 @@ def _perform_plan(plan):
                         dst=args.get("dst"),
                         pattern=args.get("pattern"),
                         folder=args.get("folder"),
+                        name=args.get("name"),
                     )
                 elif action == "inspect_system":
                     res = inspect_system(args.get("mode"), args.get("target"))
@@ -829,6 +1457,33 @@ def _perform_plan(plan):
                     say = _format_tool_say(action, res)
                 else:
                     say = str(res.get("summary") or "这个操作没有成功。")
+                    _TL.action_ok = False
+        elif action == "ask_doc":
+            # 文档问答: 本地语义检索最相关的 2~3 段, 再让大模型只依据原文回答
+            query = str(args.get("query", "")).strip()
+            try:
+                import rag_engine
+                hits = rag_engine.search_docs(query, top_k=3)
+            except Exception as exc:
+                print(f"[RAG] 文档检索失败: {exc}")
+                hits = None
+            if hits is None:
+                say = "文档知识库还没准备好，这个暂时答不了，Sir。"
+            elif not hits:
+                say = "我在桌面、下载和文档里没翻到相关内容，Sir。"
+            else:
+                from llm_brain import query_llm_answer
+                parts, names = [], []
+                for i, hit in enumerate(hits):
+                    fname = Path(hit["path"]).name
+                    if fname not in names:
+                        names.append(fname)
+                    parts.append(f"【片段{i + 1} · {fname}】\n{hit['text']}")
+                answer = query_llm_answer(query, "\n\n".join(parts), CONFIG)
+                if any(name in answer for name in names):
+                    say = answer
+                else:
+                    say = f"{answer}（出自{'、'.join(names[:2])}）"
         elif action == "open_folder":
             os.startfile(args["path"])  # Windows only
         elif action == "search_file":
@@ -844,18 +1499,9 @@ def _perform_plan(plan):
                 os.startfile(hit["path"])
                 say = f"找到了, 已打开{hit['name']}"
             else:
-                # 2) 再按文件名找文档 (精确子串)
-                found = None
-                for root_name in ["Desktop", "Documents", "Downloads"]:
-                    root = Path.home() / root_name
-                    if not root.exists(): continue
-                    for p in root.rglob("*"):
-                        if query.lower() in p.name.lower():
-                            found = p; break
-                    if found: break
-                if found:
-                    os.startfile(str(found))
-                    say = f"找到了, 已打开{found.name}"
+                # 2) 再按文件名找文档: 归一化 + 精确优先, 多个候选开最新的
+                if _document_candidates(query):
+                    success, say = _open_document(query)
                 else:
                     guess = suggestions(query) if suggestions else []
                     if guess:
@@ -919,8 +1565,10 @@ def _perform_plan(plan):
             else: pyautogui.click()
         else:
             say = "这个动作我暂时做不了"
+            _TL.action_ok = False
     except Exception as e:
         say = f"执行失败了: {e}"
+        _TL.action_ok = False
         print(f"[执行失败] {action}: {e}")
     return say
 
@@ -950,6 +1598,13 @@ def _drain_async_results():
             try:
                 command_id, say = _ASYNC_RESULTS.get_nowait()
             except queue.Empty:
+                # 工具结果都播完了, 再看有没有 agent 后台任务的进度/提问/结论
+                try:
+                    agent_say = _AGENT_EVENTS.get_nowait()
+                except queue.Empty:
+                    return
+                speak(agent_say)
+                _ui_listening()
                 return
             if not _command_is_current(command_id):
                 continue
@@ -1046,12 +1701,61 @@ def handle_command(command):
     command_id = _new_command_id()
     # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
     _cut_audio()
+    # agent 任务在后台线程跑, 不占 _RUN_LOCK; 停/跳过这类插话要在这里直接吃掉,
+    # 否则会被排队到任务结束才生效 (等于停不住)。
+    if _agent_interrupt(command):
+        return
     with _RUN_LOCK:
         _TL.command_id = command_id
         try:
             _handle_command_inner(command, command_id)
         finally:
             _TL.command_id = None
+
+
+_AGENT_STOP_WORDS = ("停", "停下", "停一下", "别做了", "别干了", "停止", "中止", "打住")
+_AGENT_SKIP_WORDS = ("跳过这步", "跳过这一步", "这步跳过", "跳过", "别做这步")
+
+
+def _agent_interrupt(command: str):
+    """agent 在跑时的插话入口: 返回 True 表示这句话已经被消费掉。
+
+    必须在 _RUN_LOCK 之前调用 —— 任务占着锁跑几分钟时, 「停」也得能立刻生效。
+    """
+    if not _agent_busy():
+        return False
+    low = str(command or "").strip().lower().replace(" ", "")
+    if low in _AGENT_SKIP_WORDS and _agent_skip():
+        speak("这一步跳过, 接着往下走, Sir")
+        return True
+    if low in _AGENT_STOP_WORDS and _agent_stop():
+        speak("好, 停了, Sir")
+        return True
+    return False
+
+
+def _agent_control_command(command: str):
+    """识别 agent 任务控制指令。返回 (kind, goal) 或 None。
+
+    立项触发词刻意带"任务/安排/帮我做"这类字眼, 避免普通聊天误触发。
+    """
+    t = str(command or "").strip()
+    low = t.lower().replace(" ", "")
+    if any(w in low for w in ("任务进展", "任务状态", "任务清单")):
+        return ("status", "")
+    if low in ("继续任务", "放行任务", "任务继续", "确认继续"):
+        return ("continue", "")
+    if low in ("取消任务", "作废任务", "任务作废", "停止任务"):
+        return ("cancel", "")
+    if low in ("执行任务", "开始任务", "审批通过", "任务开始", "批准任务"):
+        return ("approve", "")
+    m = re.search(r"(?:帮我做|安排一个任务|安排任务|立项|帮我完成)(.+)", t)
+    if m:
+        goal = m.group(1).strip().strip("：:，。")
+        goal = re.sub(r"^[个一场件份几]", "", goal).strip()  # "帮我做个演示" -> "演示"
+        if goal:
+            return ("draft", goal)
+    return None
 
 
 def _handle_command_inner(command, command_id):
@@ -1067,12 +1771,28 @@ def _handle_command_inner(command, command_id):
     memory_control = MEMORY.control_command(command)
     if memory_control == "clear":
         MEMORY.clear()
+        try:
+            import rag_engine
+            rag_engine.clear_mem()
+        except Exception:
+            pass
+        try:
+            import llm_brain
+            llm_brain.reset_session()   # 历史留在窗口里会继续进前缀, 一起清掉
+        except Exception:
+            pass
         speak("长期记忆已清空, Sir")
         if ui_bridge is not None:
             ui_bridge.emit_state("IDLE")
         return
     if memory_control == "status":
-        speak(MEMORY.stats_text())
+        text = MEMORY.stats_text()
+        try:
+            import llm_brain
+            text += " " + llm_brain.cache_stats_text()
+        except Exception:
+            pass
+        speak(text)
         if ui_bridge is not None:
             ui_bridge.emit_state("IDLE")
         return
@@ -1084,9 +1804,37 @@ def _handle_command_inner(command, command_id):
             ui_bridge.emit_state("IDLE")
         return
 
-    # 退出词
+    # Agent 任务控制（本地规则, 不进大模型: 这些词必须 100% 可靠）
+    agent_cmd = _agent_control_command(command)
+    if agent_cmd:
+        kind, goal = agent_cmd
+        if kind == "status":
+            speak(agent_tasks_text())
+        elif kind == "approve":
+            res = agent_approve()
+            speak(res.get("say", ""))
+        elif kind == "continue":
+            res = agent_continue()
+            speak(res.get("say", ""))
+        elif kind == "cancel":
+            speak(agent_cancel().get("say", ""))
+        elif kind == "draft":
+            ui_bridge.emit_state("ACTING") if ui_bridge is not None else None
+            res = agent_draft_plan(goal)
+            speak(res.get("say", "任务立项失败, 您说说具体要做什么"))
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
+    # 退出词：GUI 模式关闭整个应用；终端模式仍通过 SystemExit 退出主循环。
     if command in ["退出", "再见", "休息吧", "别听了"]:
         speak("好的, 我先休息了, 随时喊我")
+        if ON_EXIT is not None:
+            try:
+                ON_EXIT()
+            except Exception as e:
+                print(f"[退出回调失败] {e}")
+            return
         raise SystemExit
 
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
@@ -1568,6 +2316,12 @@ def _wake_loop_whisper(hotkey_event):
 def wake_loop():
     import speech_recognition as sr
     speak("贾维斯已上线，随时待命")
+    # RAG: 后台加载向量模型并增量建文档索引, 不阻塞启动
+    try:
+        import rag_engine
+        rag_engine.startup()
+    except Exception as e:
+        print(f"[RAG] 启动预热失败: {e}")
     # 热键线程
     hotkey_event = threading.Event()
     try:
@@ -1659,6 +2413,11 @@ def wake_loop():
 
 def text_loop():
     print("文字模式: 输入指令回车执行, 输入 退出 结束。例如: 打开记事本 / 搜索明天天气 / 音量调大 / 截图")
+    try:
+        import rag_engine
+        rag_engine.startup()
+    except Exception as e:
+        print(f"[RAG] 启动预热失败: {e}")
     commands = queue.Queue()
 
     def _read_input():

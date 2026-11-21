@@ -27,6 +27,8 @@ config.json
 .env
 *.pem
 *.key
+# Agent 任务队列属于运行时数据, 不跟着代码走
+agent_tasks.json
 
 # ===== 日志与预览截图 =====
 *.log

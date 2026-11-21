@@ -10,6 +10,7 @@
 import json
 import os
 import re
+import threading
 from urllib.parse import urlsplit
 
 import requests
@@ -123,52 +124,146 @@ def normalize_openai_endpoint(raw_url) -> str:
         return url + "/v1/chat/completions"
     return url
 
-SYSTEM_PROMPT = """你是一个全能的 Windows 桌面智能语音助手贾维斯 (JARVIS)。
-当用户下达控制电脑的指令时，请将其转换成控制动作并回复；
-当用户提出日常问题、聊天、写代码、分析问题或请教知识时，请用贾维斯忠诚、专业且富有人性化的口吻直接回答！
+SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户通过麦克风说话，本地语音识别转成文字后交给你，因此不要声称"我只能接收文字"或"请打字"。
+回答用中文，默认 1~3 句，口吻忠诚、专业、有管家气质；除非用户明确要求展开，不要长篇大论。
 
-你必须记住自己的真实能力边界：
-- 你运行在用户的 Windows 桌面上，用户通过麦克风说话，本地语音识别会把话转成文字再交给你；因此不要声称“我只能接收文字”“我听不到声音”或“请把话打出来”。
-- 如果用户问“你听得到我说话吗”，应回答“能听到，我是通过本地语音识别接收您的语音的”，然后继续正常交流。
-- 回答默认简洁，控制在 1~3 句；除非用户明确要求详细展开，不要长篇大论。
+只能输出纯 JSON (不要 markdown 代码块)，格式：
+{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
 
-只能输出纯 JSON，格式如下：
-{
-  "action": "动作名(必须是下述之一: chat, open_app, open_url, web_search, screenshot, lock, volume, file_manage, inspect_system, run_powershell)",
-  "args": {动作参数，chat 动作留空即可},
-  "say": "对用户的中文回答",
-  "status_say": "仅调用系统工具时填写：5~12 字的前置垫话"
-}
+动作规则：
+- 闲聊、提问、写代码、请教知识：action="chat"，say 填完整回答，不要 status_say。
+- 允许反问：指令指代不明、信息不足时（如只说“这句话什么意思”“那个再弄一下”“把它也弄了”），action="chat"，在 say 里**直接问清一句**（一次只问一个点，不要连问几个），让用户补齐对象或意图。宁可问一句，也不要猜、不要编造，更不要因此返回空白内容。
+- 打开软件：action="open_app"，args={"exe": "软件exe名", "name": "软件中文名"}
+- 打开文档/文本/表格/图片（如“打开名为会议纪要的文本”“打开下载里的报告.pdf”“帮我打开一个叫周报的文档”）：action="open_file"，args={"name": "文件名或标题"}。name 只写名字本身，去掉“打开”“一个名为”“的文本”“那个文档”这些口语词；绝对不要把 .txt/.docx/.xlsx 这类文件名塞进 open_app。
+- 写文档/写内容存成文件（如“帮我写个周报”“把刚才的方案写成一个文档”“生成一份会议纪要”）：action="write_file"，args={"name": "文件名", "content": "完整的文件正文"}。content 里写完整内容，结构用 Markdown 标题和列表；不要把正文截短，也不要说“内容太长写不下”。name 用 .md 或 .txt 结尾；写 Word 文档用 .docx。不要用 write_file 执行代码或改配置。
+- 打开网址：action="open_url"，args={"url": "http(s)://..."}
+- 搜索：action="web_search"，args={"query": "搜索关键词"}
+- 音量：action="volume"，args={"mode": "up|down|mute"}
+- 截图：action="screenshot"；锁屏：action="lock"
+- 文件管理 action="file_manage"，只允许四种，且只能操作 桌面/下载/文档 三个目录，不能删除：
+  {"action": "list", "folder": "下载"}
+  {"action": "search", "pattern": "*.pdf", "folder": "下载"}
+  {"action": "move", "src": "下载\\报表.xlsx", "dst": "文档"}
+  {"action": "read", "name": "你好.txt"}   读取某个文件的内容（支持 txt/md/pdf/docx）
+- 系统状态 action="inspect_system"：{"mode": "top_memory"} 或 {"mode": "top_cpu"} 或 {"mode": "port", "target": 8080}
+- 执行命令 action="run_powershell"，args={"command": "Get-Process"}；一次只给一条最简单的命令，禁止管道|、重定向>、分号;、反引号和换行；关机、重启、删文件、改注册表、改系统服务一律不要生成。
+- 调用 file_manage / inspect_system / run_powershell / ask_doc 时填 status_say（如"正在检查高占用进程"），它只表示正在处理，不能声称已完成。用户要删除文件时如实说做不到。
 
-说明：
-- 如果是普通聊天、提问或解答：action 填 "chat"，say 填你的详细专业回答，不需要 status_say。
-- 调用 file_manage、inspect_system 或 run_powershell 时，额外填写 5~12 字的 status_say，例如“正在检查高占用进程”；它只表示正在处理，不能声称已经完成。
-- 如果是打开软件：action 填 "open_app"，args 填 {"exe": "软件exe名", "name": "软件名"}
-- 如果是搜索：action 填 "web_search"，args 填 {"query": "搜索关键词"}
-- 如果是静音/调音量：action 填 "volume"，args 填 {"mode": "up/down/mute"}
-- 如果是截图：action 填 "screenshot"
-- 如果是锁屏：action 填 "lock"
+- 查文档内容（如"合同里违约金是多少""我笔记里写的搬家事项是什么"）：action="ask_doc"，args={"query": "问题"}；按文件名找文件、列文件、读取某个具体文件的内容（如"读取你好.txt"）用 file_manage，其中读取用 read 子动作。
 
-【文件管理】action 填 "file_manage"，args 从下面三种里选一种：
-  {"action": "list", "folder": "下载"}                      列目录（folder 可写 桌面/下载/文档）
-  {"action": "search", "pattern": "*.pdf"}                   按通配符找文件
-  {"action": "move", "src": "下载\\报表.xlsx", "dst": "文档"}  归类移动到某个目录
-  只能操作桌面、下载、文档这三个目录。用户要删除文件时，如实说做不到，不要假装完成。
+示例：
+用户：打开豆包
+你：{"action": "open_app", "args": {"exe": "doubao.exe", "name": "豆包"}, "say": "这就为您打开豆包，Sir"}
+用户：下载里有没有pdf文件
+你：{"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf", "folder": "下载"}, "say": "我这就找一下下载里的PDF，Sir", "status_say": "正在查找文件"}
+用户：帮我读取你好.txt的内容
+你：{"action": "file_manage", "args": {"action": "read", "name": "你好.txt"}, "say": "这就为您读一下，Sir", "status_say": "正在读取文件"}
+用户：打开名为会议纪要的文本
+你：{"action": "open_file", "args": {"name": "会议纪要"}, "say": "这就为您打开会议纪要，Sir", "status_say": "正在查找文件"}
+用户：帮我写一份关于上周工作的周报，存成文档
+你：{"action": "write_file", "args": {"name": "上周工作周报.md", "content": "# 上周工作周报\n\n## 一、完成事项\n（完整正文…）"}, "say": "这就为您写好周报，Sir", "status_say": "正在撰写文档"}
+用户：这句话是什么意思
+你：{"action": "chat", "args": {}, "say": "Sir，您指的是哪句话？把原句说给我，我为您解释"}
 
-【系统状态】action 填 "inspect_system"，args 从下面三种里选一种：
-  {"mode": "top_memory"}              最吃内存的前 5 个进程
-  {"mode": "top_cpu"}                 最吃 CPU 的前 5 个进程
-  {"mode": "port", "target": 8080}    谁占用了某个端口
-
-【执行命令】action 填 "run_powershell"，args 填 {"command": "Get-Process"}：
-  一次只给一条最简单的命令。不要用管道 |、重定向 >、分号 ;、反引号和换行，这些会被安全层拒绝。
-  只读的查询命令（Get-*、tasklist、ipconfig 等）会直接执行；带副作用的命令会先让用户确认。
-  关机、重启、删除文件、改注册表、改系统服务这类命令一律不要生成。
-
-注意：不要输出任何 markdown 格式代码块，只返回纯 JSON 字符串！
-如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；历史只作参考，
-当前用户输入才是本次唯一任务，不要重复执行历史动作。
+如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；当前用户输入才是本次唯一任务，不要重复执行历史动作。
+无论哪种情况，都必须输出一个完整、可解析的 JSON 对象；要反问也只能写在 say 里，禁止用空白或省略内容来顶替。
 """
+
+# ---------- 前缀缓存 (DeepSeek 自动上下文缓存) ----------
+# 缓存只认"从第一个 token 开始逐 token 完全相同的前缀", 粒度 64 token, 语义相似不算。
+# 所以这里有三条硬规则, 改动时不要破:
+#   1. system 永远是纯常量 SYSTEM_PROMPT, 绝不拼时间/记忆/随机值;
+#   2. 历史按消息逐条追加进 _SESSION, 而不是每轮重新拼成一段文字塞进 system;
+#   3. 只在尾部追加, 中间插一条或改一条 = 整段缓存作废。
+_SESSION_LOCK = threading.Lock()
+_SESSION = []                  # 历史消息, 只追加, 不含 system
+_SESSION_MAX_CHARS = 8000      # 超过就丢最早的一组问答; 裁剪会一次性全未命中, 所以阈值给大
+_CACHE_STATS = {"hit": 0, "miss": 0, "requests": 0}
+
+_ROLE_CN = {"system": "系统说明", "user": "用户", "assistant": "助手"}
+
+
+def reset_session():
+    """清空对话窗口 (清空记忆、切换模型时调用), 之后第一轮缓存会冷启动。"""
+    with _SESSION_LOCK:
+        _SESSION.clear()
+
+
+def _trim_session():
+    """超出窗口就整组丢掉最早的问答; 调用方需已持有锁。"""
+    total = sum(len(m.get("content", "")) for m in _SESSION)
+    while total > _SESSION_MAX_CHARS and len(_SESSION) >= 4:
+        total -= len(_SESSION.pop(0).get("content", ""))
+
+
+def _append_session(user_content: str, assistant_content: str):
+    """把这一轮原样写回窗口, 必须与请求里发出去的一字不差, 否则下一轮前缀就断了。"""
+    if not user_content:
+        return
+    with _SESSION_LOCK:
+        _SESSION.append({"role": "user", "content": user_content})
+        _SESSION.append({"role": "assistant", "content": assistant_content or "（本轮无回复）"})
+        _trim_session()
+
+
+def _messages_to_prompt(messages) -> str:
+    """给不支持消息数组的协议 (Gemini) 把消息摊平成一段文本, 保持原顺序。"""
+    return "\n\n".join(
+        f"{_ROLE_CN.get(str(m.get('role')), '用户')}：{m.get('content', '')}"
+        for m in messages
+    )
+
+
+def _record_usage(provider_name: str, data) -> None:
+    """读接口返回的 usage, 打印本轮真实命中/未命中 token。
+
+    命中率没有本地估算的余地: 只有 prompt_cache_hit_tokens / miss 这两个数字可信。
+    """
+    usage = (data or {}).get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return
+    hit = int(usage.get("prompt_cache_hit_tokens")
+              or usage.get("cached_tokens")
+              or usage.get("cache_read_input_tokens") or 0)
+    miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+    if not miss:
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        if prompt:
+            miss = max(prompt - hit, 0)
+    if not hit and not miss:
+        return
+    with _SESSION_LOCK:
+        _CACHE_STATS["hit"] += hit
+        _CACHE_STATS["miss"] += miss
+        _CACHE_STATS["requests"] += 1
+        total = _CACHE_STATS["hit"] + _CACHE_STATS["miss"]
+        overall = (_CACHE_STATS["hit"] / total) if total else 0.0
+    total = hit + miss
+    rate = (hit / total) if total else 0.0
+    print(f"[{provider_name} 缓存] 本轮命中 {hit} / 未命中 {miss} = {rate:.1%}, 累计 {overall:.1%}")
+
+
+def cache_stats() -> dict:
+    """当前命中率快照, 供界面/诊断脚本读取。"""
+    with _SESSION_LOCK:
+        hit = _CACHE_STATS["hit"]
+        miss = _CACHE_STATS["miss"]
+        requests_count = _CACHE_STATS["requests"]
+        msgs = len(_SESSION)
+        chars = sum(len(m.get("content", "")) for m in _SESSION)
+    total = hit + miss
+    return {
+        "hit": hit, "miss": miss, "requests": requests_count,
+        "rate": (hit / total) if total else 0.0,
+        "session_messages": msgs, "session_chars": chars,
+    }
+
+
+def cache_stats_text() -> str:
+    s = cache_stats()
+    return (f"缓存命中率 {s['rate']:.1%} (命中 {s['hit']} / 未命中 {s['miss']} tokens, "
+            f"{s['requests']} 次请求), 会话窗口 {s['session_chars']} 字符")
+
 
 _SHELL_META_RE = re.compile(r"[&|;<>`\r\n\x00]")
 
@@ -355,8 +450,8 @@ def sanitize_plan(plan: dict) -> dict:
     # ---- 第二步新增：三个真实系统工具 ----
     if action == "file_manage":
         sub = _safe_text(args.get("action"), 20).lower()
-        if sub not in ("list", "search", "move"):
-            return {"action": "chat", "say": "文件这块我只会列目录、按名字找、归类移动。", "danger": False}
+        if sub not in ("list", "search", "move", "read"):
+            return {"action": "chat", "say": "文件这块我只会列目录、按名字找、归类移动、读取内容。", "danger": False}
 
         out_args = {"action": sub}
         if sub == "list":
@@ -371,6 +466,11 @@ def sanitize_plan(plan: dict) -> dict:
             folder = str(args.get("folder") or "").strip()
             if folder:
                 out_args["folder"] = folder[:260]
+        elif sub == "read":
+            name = _safe_text(args.get("name"), 260) or _safe_text(args.get("path"), 260)
+            if not name:
+                return {"action": "chat", "say": "要读哪个文件？比如说「读取下载里的你好.txt」。", "danger": False}
+            out_args["name"] = name
         else:  # move
             src = str(args.get("src") or "").strip()
             if not src:
@@ -391,6 +491,17 @@ def sanitize_plan(plan: dict) -> dict:
             }, plan)
         return _with_status_say(
             {"action": "file_manage", "args": out_args, "say": say, "danger": False}, plan
+        )
+
+    if action == "open_file":
+        # 打开文档: 只交出文件名, 由 jarvis 在桌面/文档/下载里查找并校验扩展名,
+        # 绝不允许把路径或命令塞进来 (否则语音指令等于执行任意程序)
+        name = _safe_text(args.get("name"), 260) or _safe_text(args.get("path"), 260)
+        if not name:
+            return {"action": "chat", "say": "要打开哪个文件？说个文件名就行，Sir", "danger": False}
+        return _with_status_say(
+            {"action": "open_file", "args": {"name": name}, "say": say or f"正在找{name}", "danger": False},
+            plan,
         )
 
     if action == "inspect_system":
@@ -428,6 +539,38 @@ def sanitize_plan(plan: dict) -> dict:
             "guard_desc": "" if readonly else f"执行命令：{command[:80]}",
         }, plan)
 
+    if action == "write_file":
+        # 写文档动作: 内容上限 12000 字符 (约等于一篇 3 页报告), 名字走裸名规则
+        name = _safe_text(args.get("name"), 200)
+        content = args.get("content")
+        if not name:
+            return {"action": "chat", "say": "要写到哪个文件？说个名字，比如「周报.md」", "danger": False}
+        if not isinstance(content, str) or not content.strip():
+            return {"action": "chat", "say": "要写入的内容是空的，Sir", "danger": False}
+        # 二进制/可执行类型一律拒绝: 语音写文档只能是文本格式
+        suffix = Path(name).suffix.lower()
+        if suffix in (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".lnk", ".msi", ".scr", ".com", ".jar"):
+            return {"action": "chat", "say": "出于安全我不能生成可执行文件，只能写文档（md/txt/docx 等）", "danger": False}
+        return _with_status_say({
+            "action": "write_file",
+            "args": {"name": name, "content": content[:12000]},
+            "say": say or f"这就为您写{name}",
+            "danger": False,
+            "guard_desc": f"写入文档：{name}",
+        }, plan)
+
+    if action == "ask_doc":
+        # 文档问答: 本地 RAG 检索 + 二次调用生成回答, 见 jarvis._perform_plan
+        query = _safe_text(args.get("query"), 200)
+        if not query:
+            return {"action": "chat", "say": "想问文档里的什么内容，Sir?", "danger": False}
+        return _with_status_say({
+            "action": "ask_doc",
+            "args": {"query": query},
+            "say": say or "我翻一下您的文档",
+            "danger": False,
+        }, plan)
+
     if action in ("screenshot", "lock"):
         return {"action": action, "args": {}, "say": say, "danger": False}
 
@@ -441,26 +584,41 @@ def _confirm(message: str) -> dict:
     return {"action": "chat", "say": message, "error": True}
 
 
-def _http_error(provider_name: str, response) -> dict:
+class _LlmError(Exception):
+    """带可直接朗读的中文提示的调用失败。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def _http_error_message(provider_name: str, response) -> str:
     code = int(getattr(response, "status_code", 0) or 0)
     detail = str(getattr(response, "text", "") or "").replace("\n", " ")[:180]
     print(f"[{provider_name} 错误] HTTP {code}: {detail}")
     if code in (401, 403):
-        return _confirm(f"AI 密钥被拒绝（HTTP {code}）：请检查这把 Key 是否属于当前服务商。")
+        return f"AI 密钥被拒绝（HTTP {code}）：请检查这把 Key 是否属于当前服务商。"
     if code == 404:
-        return _confirm("接口地址或模型名不对（HTTP 404）：请检查接口地址与模型名。")
+        return "接口地址或模型名不对（HTTP 404）：请检查接口地址与模型名。"
     if code == 429:
-        return _confirm("AI 接口请求太频繁（HTTP 429）：请稍后再试或检查账户额度。")
+        return "AI 接口请求太频繁（HTTP 429）：请稍后再试或检查账户额度。"
     if code >= 500:
-        return _confirm(f"AI 服务端暂时不可用（HTTP {code}）：请稍后再试。")
-    return _confirm(f"AI 接口返回错误（HTTP {code}）：请检查模型名、接口地址和账户额度。")
+        return f"AI 服务端暂时不可用（HTTP {code}）：请稍后再试。"
+    return f"AI 接口返回错误（HTTP {code}）：请检查模型名、接口地址和账户额度。"
 
 
-def query_llm_plan(command: str, config: dict, memory_context: str = "") -> dict:
-    """根据配置的提供商与 API Key 调用大模型。"""
+def _provider_chat(config: dict, messages,
+                   max_tokens=None, json_mode=False) -> str:
+    """统一三家协议发一次对话请求, 返回模型文本。
+
+    messages: OpenAI 风格的消息数组 [{"role","content"}, ...]。
+    调用方负责让 system 排在最前且内容稳定 —— 这是前缀缓存能命中的前提。
+    失败一律抛 _LlmError, 文案可直接朗读。
+    """
+    messages = list(messages or [])
     provider_name = resolve_provider_name(config.get("ai_provider", "DeepSeek"))
     if not provider_name:
-        return _confirm("当前 AI 服务商配置无法识别，请在左侧配置里重新选择服务商。")
+        raise _LlmError("当前 AI 服务商配置无法识别，请在左侧配置里重新选择服务商。")
 
     provider_info = LLM_PROVIDERS[provider_name]
     raw_key = (config.get("api_key") or "").strip() or os.environ.get("AI_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
@@ -470,126 +628,229 @@ def query_llm_plan(command: str, config: dict, memory_context: str = "") -> dict
         if raw_key:
             # 常见于把聊天内容/带空行的文字粘进了密钥框
             print(f"[AI 密钥格式不对] 密钥应是一串不含空格的字符, 当前 {len(raw_key)} 字符; 请在界面里重新粘贴")
-            return _confirm("API Key 格式不对：应是一串不含空格和换行的可见字符，请重新粘贴。")
-        return _confirm("还没有配置可用的 API Key，请在左侧“AI 大模型配置”里填写并保存。")
+            raise _LlmError("API Key 格式不对：应是一串不含空格和换行的可见字符，请重新粘贴。")
+        raise _LlmError("还没有配置可用的 API Key，请在左侧“AI 大模型配置”里填写并保存。")
 
     model = str(config.get("ai_model") or "").strip() or provider_info["default_model"]
     if not model:
-        return _confirm("当前服务商还没有填写模型名，请在配置里补充模型名。")
+        raise _LlmError("当前服务商还没有填写模型名，请在配置里补充模型名。")
 
     api_url = str(config.get("ai_url") or "").strip() or provider_info["url"]
     if not api_url:
-        return _confirm("当前服务商还没有配置接口地址，请在配置里补充接口地址。")
-    if provider_info["type"] == "openai_compatible":
-        api_url = normalize_openai_endpoint(api_url)
-        if not api_url:
-            return _confirm("接口地址不合法：请填写以 http:// 或 https:// 开头的地址。")
+        raise _LlmError("当前服务商还没有配置接口地址，请在配置里补充接口地址。")
 
     try:
         # 1. OpenAI 兼容协议 (DeepSeek / 通义千问 / 智谱 / Kimi / OpenAI / 自定义)
         if provider_info["type"] == "openai_compatible":
+            api_url = normalize_openai_endpoint(api_url) or api_url
+            if api_url == provider_info["url"]:
+                pass  # 官方地址无需再规范化
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
-            system_content = SYSTEM_PROMPT
-            if memory_context:
-                system_content += "\n\n" + str(memory_context)
             payload = {
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": command}
-                ],
+                "messages": messages,          # 原样发送, 前缀才不会被重排打乱
                 "temperature": 0.7,
-                "response_format": {"type": "json_object"} if "deepseek" in model or "gpt" in model else None
             }
-            if payload["response_format"] is None:
-                del payload["response_format"]
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
+            if json_mode and ("deepseek" in model or "gpt" in model):
+                payload["response_format"] = {"type": "json_object"}
 
             r = requests.post(api_url, headers=headers, json=payload, timeout=25)
             if r.status_code != 200:
-                return _http_error(provider_name, r)
+                raise _LlmError(_http_error_message(provider_name, r))
 
             data = r.json()
+            _record_usage(provider_name, data)
             content = data["choices"][0]["message"]["content"]
-            raw_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            if not str(content or "").strip():
+                # 偶发: 模型返回空白内容 (token 照扣, 但一个字没给), 先记下来方便排查
+                print(f"[{provider_name}] 返回空白内容, finish_reason="
+                      f"{data['choices'][0].get('finish_reason')}")
+            return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
 
         # 2. Anthropic Claude 协议
-        elif provider_info["type"] == "anthropic":
-            system_content = SYSTEM_PROMPT
-            if memory_context:
-                system_content += "\n\n" + str(memory_context)
+        if provider_info["type"] == "anthropic":
             headers = {
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json"
             }
+            system_text = "\n\n".join(
+                str(m.get("content", "")) for m in messages if m.get("role") == "system"
+            )
+            chat_messages = [
+                {"role": m.get("role", "user"), "content": m.get("content", "")}
+                for m in messages if m.get("role") in ("user", "assistant")
+            ]
             payload = {
                 "model": model,
-                "max_tokens": 1024,
-                "system": system_content,
-                "messages": [{"role": "user", "content": command}]
+                "max_tokens": max_tokens or 1024,
+                # Claude 默认不缓存: 不给 cache_control 断点, 每次都是全价
+                "system": ([{"type": "text", "text": system_text,
+                             "cache_control": {"type": "ephemeral"}}] if system_text else []),
+                "messages": chat_messages,
             }
             r = requests.post(api_url, headers=headers, json=payload, timeout=25)
             if r.status_code != 200:
-                return _http_error(provider_name, r)
+                raise _LlmError(_http_error_message(provider_name, r))
             data = r.json()
+            _record_usage(provider_name, data)
             blocks = data.get("content") or []
-            raw_text = "\n".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict)).strip()
+            raw_text = "\n".join(
+                str(block.get("text", "")) for block in blocks if isinstance(block, dict)
+            ).strip()
             if not raw_text:
-                return _confirm("Claude 没有返回可用文本，请检查模型名和账户状态。")
+                raise _LlmError("Claude 没有返回可用文本，请检查模型名和账户状态。")
+            return raw_text
 
         # 3. Google Gemini 协议
-        elif provider_info["type"] == "gemini":
+        if provider_info["type"] == "gemini":
             target_url = api_url.format(model=model)
             headers = {
                 "x-goog-api-key": api_key,
                 "Content-Type": "application/json"
             }
-            prompt_text = SYSTEM_PROMPT
-            if memory_context:
-                prompt_text += "\n\n" + str(memory_context)
-            prompt_text += "\n用户输入: " + command
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt_text}]
-                }]
-            }
+            prompt_text = _messages_to_prompt(messages)
+            payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+            if max_tokens:
+                payload["generationConfig"] = {"maxOutputTokens": max_tokens}
             r = requests.post(target_url, headers=headers, json=payload, timeout=25)
             if r.status_code != 200:
-                return _http_error(provider_name, r)
+                raise _LlmError(_http_error_message(provider_name, r))
 
             data = r.json()
+            _record_usage(provider_name, data)
             candidates = data.get("candidates") or []
             if not candidates:
-                return _confirm("Gemini 没有返回候选结果，请检查模型名和账户状态。")
-            raw_text = candidates[0]["content"]["parts"][0]["text"].strip()
+                raise _LlmError("Gemini 没有返回候选结果，请检查模型名和账户状态。")
+            return candidates[0]["content"]["parts"][0]["text"].strip()
 
-        else:
-            return _confirm("当前 AI 服务商协议暂不支持，请改用 OpenAI 兼容或 Gemini。")
+        raise _LlmError("当前 AI 服务商协议暂不支持，请改用 OpenAI 兼容或 Gemini。")
 
-        # 解析模型返回的 JSON：部分兼容模型会在 JSON 前后加说明文字
-        clean_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.M).strip()
-        start, end = clean_text.find("{"), clean_text.rfind("}")
-        if start != -1 and end > start:
-            clean_text = clean_text[start:end + 1]
-        plan = json.loads(clean_text)
-
-        # 出口统一校验: 白名单动作 + 参数合法性
-        return sanitize_plan(plan)
-
+    except _LlmError:
+        raise
     except requests.exceptions.Timeout:
-        return _confirm("AI 接口响应超时，请稍后重试或检查网络。")
+        raise _LlmError("AI 接口响应超时，请稍后重试或检查网络。")
     except requests.exceptions.ConnectionError:
-        return _confirm("连不上 AI 接口：请检查网络、接口地址或代理设置。")
-    except json.JSONDecodeError:
-        return _confirm("大模型返回的不是可执行 JSON，请确认该模型支持 JSON 输出。")
+        raise _LlmError("连不上 AI 接口：请检查网络、接口地址或代理设置。")
     except Exception as e:
         msg = str(e)
         # 不要把异常原文整个打出来: requests 的 InvalidHeader 会把 Bearer 后面那串带进日志
         if "header value" in msg or type(e).__name__ == "InvalidHeader":
             print("[大模型调用失败] 请求头不合法, 密钥里可能混入了空格/中文, 请重新粘贴")
-            return _confirm("API Key 格式不对：请求头不合法，请重新粘贴一串不含空格的密钥。")
+            raise _LlmError("API Key 格式不对：请求头不合法，请重新粘贴一串不含空格的密钥。")
         print(f"[大模型调用失败] {type(e).__name__}: {msg[:160]}")
-        return _confirm("AI 调用失败，请检查模型名、接口地址和网络后重试。")
+        raise _LlmError("AI 调用失败，请检查模型名、接口地址和网络后重试。")
+
+
+def _strip_json_text(raw_text) -> str:
+    """去掉 markdown 代码块和 JSON 前后的说明文字, 只留 {} 里的部分。"""
+    text = re.sub(r"^```(json)?|```$", "", str(raw_text or ""), flags=re.M).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
+    return text
+
+
+def _plain_reply(text) -> str:
+    """把解析不成 JSON 的返回当普通回答用: 去代码块痕迹、压空白、截断。
+
+    模型偶尔会直接吐一句人话 (或干脆吐空白), 这时没必要把"不是可执行 JSON"
+    这种内部错误甩给用户 —— 能听懂就直接说, 实在没有内容才提示重说。
+    """
+    text = re.sub(r"```[a-zA-Z]*", "", str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip("{}").strip()
+    if not text:
+        return "Sir，这次模型没有返回有效内容，您再说一遍我马上处理。"
+    return text[:300]
+
+
+def query_llm_plan(command: str, config: dict, memory_context: str = "",
+                   use_session: bool = True, reset: bool = False) -> dict:
+    """把用户指令交给大模型, 解析成白名单动作 JSON。
+
+    message 结构就是命中率本身:
+      [纯常量 system] + [历史消息...] + [本轮 user(记忆块+指令)]
+    上一轮的整段内容原样出现在本轮前缀里, 所以只有新加的这几十上百 token 未命中。
+
+    use_session=False 用于探针/测试请求, 不污染对话窗口; reset=True 先清窗再发。
+    """
+    if reset:
+        reset_session()
+
+    user_content = str(command or "").strip()
+    if memory_context:
+        user_content = str(memory_context).strip() + "\n\n" + user_content
+
+    with _SESSION_LOCK:
+        history = list(_SESSION)
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + history
+        + [{"role": "user", "content": user_content}]
+    )
+
+    try:
+        raw_text = _provider_chat(config, messages, json_mode=True)
+
+        if not str(raw_text or "").strip():
+            # 实测: JSON 模式下碰到"模型没有明确答案、想反问"的输入 (比如孤零零一句
+            # "这句话是什么意思"), DeepSeek 会退化成只吐几十个空格就收尾 —— 4 次里 3 次。
+            # 关掉 response_format 它就能正常说话, 所以重发时走普通模式, 再按需解析。
+            print("[AI] JSON 模式返回空白内容, 改用普通模式重发一次")
+            raw_text = _provider_chat(config, messages, json_mode=False)
+
+        clean_text = _strip_json_text(raw_text)
+        try:
+            plan = json.loads(clean_text) if clean_text else None
+        except json.JSONDecodeError:
+            plan = None
+
+        if not isinstance(plan, dict):
+            # 兜底: 宁可当普通聊天回答, 也不要把解析错误变成给用户听的提示
+            reply = _plain_reply(clean_text or raw_text)
+            print(f"[AI 解析] 返回内容不是 JSON, 已降级为普通回答: {reply[:80]!r}")
+            if use_session:
+                _append_session(user_content, reply)
+            return {"action": "chat", "say": reply, "danger": False}
+
+        # 出口统一校验: 白名单动作 + 参数合法性
+        result = sanitize_plan(plan)
+        if use_session and isinstance(result, dict) and not result.get("error"):
+            # 成功的一轮才写回窗口: 失败的请求不进历史, 免得污染前缀
+            _append_session(user_content, str(result.get("say") or ""))
+        return result
+
+    except _LlmError as e:
+        return _confirm(e.message)
+
+
+# 文档问答的固定指令: 单独抽成常量, 让 system 每一次都逐字节一致
+_DOC_ANSWER_SYSTEM = (
+    "你是桌面语音助手贾维斯。请只依据用户消息里的【文档片段】回答用户问题：\n"
+    "1. 用中文口语回答，控制在 3 句以内；\n"
+    "2. 片段里没有相关答案就直说没找到，不要编造；\n"
+    "3. 回答末尾自然带一句出处，例如“出自某某文件”。"
+)
+
+
+def query_llm_answer(question: str, doc_context: str, config: dict) -> str:
+    """基于 RAG 检索到的文档片段回答问题, 返回可直接朗读的纯文本。
+
+    文档片段放在 user 消息里、固定指令放在 system 里: 静态前缀不被检索结果打断。
+    """
+    user_content = f"【文档片段】\n{str(doc_context or '').strip()}\n\n【问题】\n{question}"
+    messages = [
+        {"role": "system", "content": _DOC_ANSWER_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        answer = _provider_chat(config, messages, max_tokens=600)
+        return re.sub(r"\s+", " ", answer).strip()[:800]
+    except _LlmError as e:
+        return e.message
