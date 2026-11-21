@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -122,6 +123,14 @@ class _Child:
         }
 
     def boot(self):
+        # 全屏 HUD 也由托盘托管，不在任务栏额外显示 Python 图标。
+        try:
+            hwnd = int(self.win.native.Handle.ToInt64())
+            user32 = __import__("ctypes").windll.user32
+            ex_style = user32.GetWindowLongW(hwnd, -20)
+            user32.SetWindowLongW(hwnd, -20, ex_style | 0x80)  # WS_EX_TOOLWINDOW
+        except Exception:
+            pass
         threading.Thread(target=self._js_worker, daemon=True).start()
         if self.preview:
             threading.Thread(target=self._demo_loop, daemon=True).start()
@@ -792,7 +801,7 @@ class FullscreenHUDWindow:
         from llm_brain import query_llm_plan
         self.set_output("正在测试 AI 连接，请稍候……")
         try:
-            plan = query_llm_plan("请只回复：连接成功", dict(jarvis.CONFIG))
+            plan = query_llm_plan("请只回复：连接成功", dict(jarvis.CONFIG), use_session=False)
         except Exception as exc:
             plan = {"action": "chat", "say": f"测试请求异常：{exc}", "error": True}
         say = str((plan or {}).get("say") or "AI 没有返回结果").strip()

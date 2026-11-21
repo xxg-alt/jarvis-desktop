@@ -810,6 +810,24 @@ addEventListener('visibilitychange',()=>{
   }
 });
 
+/* 自愈：minimize→restore 之后 WebView2 有时不再派发 visibilitychange，
+   pageVisible 会永久停在 false，frame() 每帧开头就 return，画布保留最后一帧=画面卡死。
+   这里以 document.hidden 为准做兜底，不依赖事件是否到达。 */
+setInterval(()=>{
+  const visibleNow=!document.hidden&&document.visibilityState!=='hidden';
+  if(visibleNow!==pageVisible){
+    pageVisible=visibleNow;
+    if(!pageVisible){
+      if(rafId){cancelAnimationFrame(rafId);rafId=0}
+      if(parId){cancelAnimationFrame(parId);parId=0}
+    }
+  }
+  if(pageVisible&&animating){
+    if(!rafId){lastT=0;lastPaint=0;rafId=requestAnimationFrame(frame)}
+    if(!parId)parId=requestAnimationFrame(par);
+  }
+},400);
+
 /* ============ UI 逻辑 ============ */
 const clock=()=>$('clock').textContent=new Date().toLocaleTimeString('en-GB')+' CST';
 clock();setInterval(clock,1000);
@@ -1014,7 +1032,7 @@ setInterval(()=>{
 
 /* 沉浸模式：空闲 15 秒后面板自动收起并冻结 Canvas；有操作、声音或状态变化时恢复 */
 let calm=false,lastAct=performance.now(),autoCol=[];
-function wake(){lastAct=performance.now();if(!calm)return;calm=false;document.body.classList.remove('calm');autoCol.forEach(id=>$(id).classList.remove('collapsed'));autoCol=[];if(window.JarvisHUD)window.JarvisHUD.setAnimating(true)}
+function wake(){lastAct=performance.now();if(window.JarvisHUD)window.JarvisHUD.setAnimating(true);if(!calm)return;calm=false;document.body.classList.remove('calm');autoCol.forEach(id=>$(id).classList.remove('collapsed'));autoCol=[];}
 function enterCalm(){if(calm)return;calm=true;document.body.classList.add('calm');['pL','pR'].forEach(id=>{const p=$(id);if(!p.classList.contains('collapsed')){p.classList.add('collapsed');autoCol.push(id)}});if(window.JarvisHUD)window.JarvisHUD.setAnimating(false)}
 ['pointerdown','keydown','mousemove','touchstart'].forEach(ev=>addEventListener(ev,wake,{passive:true}));
 setInterval(()=>{if(!calm&&state==='idle'&&performance.now()-lastAct>15000)enterCalm()},1000);

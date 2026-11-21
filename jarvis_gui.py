@@ -132,6 +132,8 @@ jarvis.ON_HEAR = on_hear
 jarvis.ON_SPEAK = on_speak
 jarvis.ON_SPEAK_END = on_speak_end
 jarvis.ON_AUDIO_LEVEL = on_audio_level
+# 语音/文字里的“退出”也走 Tk 主循环关闭整个应用，不能只结束监听线程。
+jarvis.ON_EXIT = lambda: ui_queue.put(("quit", None))
 
 # 配色规范
 CHROMA_KEY = "#02060d"
@@ -821,6 +823,14 @@ from web_fullscreen import FullscreenHUDWindow
 class JarvisAppManager:
     def __init__(self):
         self.root = tk.Tk()
+        # 托盘应用不占任务栏：隐藏主窗口的 Python/PyInstaller 默认图标。
+        try:
+            hwnd = self.root.winfo_id()
+            user32 = ctypes.windll.user32
+            ex_style = user32.GetWindowLongW(hwnd, -20)
+            user32.SetWindowLongW(hwnd, -20, ex_style | 0x80)  # WS_EX_TOOLWINDOW
+        except Exception:
+            pass
         self.root.withdraw()
 
         self.mode = "orb"
@@ -1248,7 +1258,10 @@ class JarvisAppManager:
         try:
             while True:
                 kind, val = ui_queue.get_nowait()
-                if kind == "speak":
+                if kind == "quit":
+                    self.quit_app()
+                    return
+                elif kind == "speak":
                     self.hud_win.set_output(val)
                 elif kind == "level":
                     self.target_audio_level = max(0.0, min(1.0, float(val)))
