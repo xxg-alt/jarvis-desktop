@@ -229,6 +229,7 @@ def reset_session():
     """清空对话窗口 (清空记忆、切换模型时调用), 之后第一轮缓存会冷启动。"""
     with _SESSION_LOCK:
         _SESSION.clear()
+        _CHAT_SESSION.clear()   # 自由对话历史一并清
 
 
 def _trim_session():
@@ -909,3 +910,55 @@ def query_llm_answer(question: str, doc_context: str, config: dict) -> str:
         return re.sub(r"\s+", " ", answer).strip()[:800]
     except _LlmError as e:
         return e.message
+
+
+# ---------- 自由对话通道 ----------
+# 规划通道把模型关在 JSON 里, 聊天走这里: 正常说话、带上下文和主人档案。
+CHAT_SYSTEM_PROMPT = (
+    "你是贾维斯, 是主人 ljj 的桌面管家兼伙伴, 不是客服机器人。\n"
+    "现在是闲聊/答疑时间, 不是执行命令: 像朋友一样自然说话, 能接话、能商量、能给建议、能把一个问题讲清楚。\n"
+    "规矩:\n"
+    "1. 中文口语, 默认简短 (1 到 3 句, 因为要朗读), 主人追问或明确要详细时再展开;\n"
+    "2. 记得前文, 主人提到「上次那个」要能对上; 给出的主人档案和记忆自然地用, 别生硬复述;\n"
+    "3. 诚实: 不懂就说不懂, 不编造事实和数据; 实时信息 (天气、价格、新闻) 你手边没有, 直说要用搜索指令去查;\n"
+    "4. 主人要是其实想让你操作电脑 (开软件、找文件、关机之类), 别假装做了, 提醒他换成一句指令你就能办;\n"
+    "5. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话。"
+)
+
+_CHAT_SESSION = []          # 自由对话历史 [{role, content}...], 与规划窗口分开
+_CHAT_MAX_MSGS = 12         # 最多留最近 6 轮
+
+
+def _clean_chat_reply(text) -> str:
+    text = re.sub(r"```[a-zA-Z]*", "", str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:600]
+
+
+def free_chat(command: str, config: dict, memory_context: str = "") -> str:
+    """自由对话: 返回可直接朗读的纯文本; 失败返回空串, 由调用方回退规划通道。"""
+    raw_command = str(command or "").strip()
+    if not raw_command:
+        return ""
+    send_content = raw_command
+    if memory_context:
+        send_content = str(memory_context).strip() + "\n\n" + raw_command
+    with _SESSION_LOCK:
+        history = list(_CHAT_SESSION)
+    messages = ([{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+                + history
+                + [{"role": "user", "content": send_content}])
+    try:
+        raw = _provider_chat(config, messages, max_tokens=800)
+    except _LlmError as e:
+        print(f"[自由对话] 调用失败, 回退规划通道: {e.message}")
+        return ""
+    reply = _clean_chat_reply(raw)
+    if not reply:
+        return ""
+    with _SESSION_LOCK:
+        _CHAT_SESSION.append({"role": "user", "content": raw_command})
+        _CHAT_SESSION.append({"role": "assistant", "content": reply})
+        del _CHAT_SESSION[:-_CHAT_MAX_MSGS]
+    return reply
+

@@ -1740,6 +1740,32 @@ def parse_command(text):
     return None
 
 # ---------- Gemini 兜底 (免费档, 只返回白名单动作 JSON) ----------
+
+# ---------- 自由对话分流 ----------
+# 只在本地规则不认识时才判: 含操作/实时信息信号的一律不许进聊天通道,
+# 免得把正经指令聊废了; 命中聊天信号才放行。
+_CMD_VETO_RE = re.compile(
+    r"打开|关掉|关闭|关机|重启|锁屏|音量|亮度|搜索|搜一下|查一下|查查|查询|"
+    r"存成|存到|保存|新建|创建|移动|复制|删除|删掉|播放|放一首|截图|截屏|"
+    r"提醒|闹钟|下载|安装|卸载|发给|发送|列出|列个|整理|检查|扫描|打不开|连不上|没反应|报错|出错了|"
+    r"天气|新闻|金价|股价|汇率|股票|热搜|快递|导航|翻译|计算|算一下"
+)
+_CHAT_SIGNAL_RE = re.compile(
+    r"你觉得|你认为|你怎么看|聊聊|聊天|讲讲|讲个|讲一下|故事|笑话|陪我|说说|谈谈|"
+    r"累|开心|难过|伤心|无聊|焦虑|压力|睡不着|失眠|饿了|好烦|郁闷|高兴|生气|"
+    r"怎么办|划不划算|值不值|建议|什么意思|什么梗|为什么|是什么|是怎么|"
+    r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少"
+)
+
+
+def _looks_conversational(command: str) -> bool:
+    """这句话更像聊天/答疑, 而不是要操作电脑的指令吗 (保守判定, 指令优先)。"""
+    text = str(command or "")
+    if _CMD_VETO_RE.search(text):
+        return False
+    return bool(_CHAT_SIGNAL_RE.search(text))
+
+
 def gemini_plan(command, memory_context=""):
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
@@ -2375,6 +2401,25 @@ def _handle_command_inner(command, command_id):
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
     plan = parse_command(command)
     plan_source = "local" if plan is not None else ""
+
+    # 1.5 自由对话通道: 规则不认识、又明显是聊天/答疑的话, 别塞进规划通道硬凑 JSON,
+    # 走 free_chat 正常说话 (带上下文和记忆); 聊天失败自动落回下面的规划通道。
+    if plan is None and _looks_conversational(command):
+        try:
+            from llm_brain import free_chat
+            reply = free_chat(command, CONFIG, memory_context=MEMORY.build_context(command))
+        except Exception as e:
+            print(f"[自由对话异常] {e}")
+            reply = ""
+        if reply:
+            if not _command_is_current(command_id):
+                print("[指令已被新指令取代，丢弃]")
+                return
+            speak(reply)
+            MEMORY.record_turn(command, {"action": "chat", "args": {}, "say": reply}, source="chat")
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+            return
 
     # 2. 规则不认识的指令，交给配置好的 AI 大模型 (DeepSeek / 通义千问 / Gemini 等)
     if plan is None:
