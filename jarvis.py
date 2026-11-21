@@ -935,6 +935,34 @@ def _write_target_scope(hint) -> str:
     return _resolve_write_dir(hint)[2]
 
 
+_WRITE_ROOT_CANON = {"workspace": "工作区", "desktop": "桌面",
+                     "documents": "文档", "downloads": "下载"}
+
+
+def _folder_hint_from_text(text) -> str:
+    """兜底: 模型忘了填 folder 时, 从用户原话里捞存放位置。
+
+    为什么要这层: folder 完全靠模型自觉, 一句"写到桌面"被漏掉, 文件就静悄悄进了工作区,
+    用户只会觉得"它又不听话"。所以写文档这个动作再补一道确定性解析, 不信模型也信原话。
+    """
+    s = str(text or "")
+    for name, aliases in _WRITE_ROOT_ALIASES:
+        for alias in aliases:
+            idx = s.find(alias)
+            if idx < 0:
+                continue
+            tail = s[idx + len(alias):]
+            tail = re.sub(r"^(?:区|上面|上|里面|里|中|下面)", "", tail)
+            tail = tail.lstrip("的\\/ ")
+            tail = re.split(r"[，,。；;！？!?、\s]", tail)[0]
+            tail = re.sub(r"(?:里面|里|中|上面|下面|上)$", "", tail)
+            tail = tail.strip("的\\/ ")
+            if Path(tail).suffix.lower() in _DOC_EXTS or len(tail) > 40:
+                tail = ""          # 后面跟的是文件名, 不是目录
+            return _WRITE_ROOT_CANON[name] + ("\\" + tail if tail else "")
+    return ""
+
+
 def _write_document(name: str, content: str, folder=None, allow_outside: bool = False) -> tuple:
     """把模型写好的正文落成文件, 默认进贾维斯工作区, 也可指定目录。返回 (是否成功, 话术)。
 
@@ -1591,8 +1619,9 @@ def _perform_plan(plan):
             # 越是白名单外的路径, 越必须由 agent 审批流程放行 (direct 指令由用户自己说的, 视为已授权)
             external_ok = (not bool(getattr(_TL, "agent_context", False)) or
                            bool(getattr(_TL, "agent_external_ok", False)))
+            folder = args.get("folder") or _folder_hint_from_text(getattr(_TL, "user_text", ""))
             success, msg = _write_document(args.get("name"), args.get("content"),
-                                           folder=args.get("folder"),
+                                           folder=folder,
                                            allow_outside=external_ok)
             say = msg
             _TL.action_ok = bool(success)
@@ -1875,6 +1904,8 @@ def handle_command(command):
         return
     command = command.strip()
     command_id = _new_command_id()
+    # 原话留在 thread-local: 模型漏填 folder 时, 写文档要用它兜底解析存放位置
+    _TL.user_text = command
     # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
     _cut_audio()
     # agent 任务在后台线程跑, 不占 _RUN_LOCK; 停/跳过这类插话要在这里直接吃掉,
