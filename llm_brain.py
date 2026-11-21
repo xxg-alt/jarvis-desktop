@@ -135,7 +135,8 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 允许反问：指令指代不明、信息不足时（如只说“这句话什么意思”“那个再弄一下”“把它也弄了”），action="chat"，在 say 里**直接问清一句**（一次只问一个点，不要连问几个），让用户补齐对象或意图。宁可问一句，也不要猜、不要编造，更不要因此返回空白内容。
 - 打开软件：action="open_app"，args={"exe": "软件exe名", "name": "软件中文名"}
 - 打开文档/文本/表格/图片（如“打开名为会议纪要的文本”“打开下载里的报告.pdf”“帮我打开一个叫周报的文档”）：action="open_file"，args={"name": "文件名或标题"}。name 只写名字本身，去掉“打开”“一个名为”“的文本”“那个文档”这些口语词；绝对不要把 .txt/.docx/.xlsx 这类文件名塞进 open_app。
-- 写文档/写内容存成文件（如“帮我写个周报”“把刚才的方案写成一个文档”“生成一份会议纪要”）：action="write_file"，args={"name": "文件名", "content": "完整的文件正文"}。content 里写完整内容，结构用 Markdown 标题和列表；不要把正文截短，也不要说“内容太长写不下”。name 用 .md 或 .txt 结尾；写 Word 文档用 .docx。不要用 write_file 执行代码或改配置。
+- 写文档/写内容存成文件（如“帮我写个周报”“把刚才的方案写成一个文档”“生成一份会议纪要”）：action="write_file"，args={"name": "文件名", "content": "完整的文件正文", "folder": "目标目录，可省略"}。content 里写完整内容，结构用 Markdown 标题和列表；不要把正文截短，也不要说“内容太长写不下”。name 用 .md 或 .txt 结尾；写 Word 文档用 .docx。不要用 write_file 执行代码或改配置。
+  folder 只能填四类：工作区、桌面、文档、下载，可以带子目录（如 "下载\\报告"）。用户没说存哪就别写 folder（默认进工作区）；用户明确说存哪（“写到桌面的项目文档里”“存到下载里”），就按他的说法填，别自己改地方。用户给出别处的完整路径（如 "D:\\项目\\资料"）时原样填入，系统会单独向他确认。
 - 打开网址：action="open_url"，args={"url": "http(s)://..."}
 - 搜索：action="web_search"，args={"query": "搜索关键词"}
 - 音量：action="volume"，args={"mode": "up|down|mute"}
@@ -551,12 +552,14 @@ def sanitize_plan(plan: dict) -> dict:
         suffix = Path(name).suffix.lower()
         if suffix in (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".lnk", ".msi", ".scr", ".com", ".jar"):
             return {"action": "chat", "say": "出于安全我不能生成可执行文件，只能写文档（md/txt/docx 等）", "danger": False}
+        # 存放目录: 只做字符层清洗, 路径是否合法/是否越界由 jarvis._resolve_write_dir 判定
+        folder = _safe_text(args.get("folder"), 260)
         return _with_status_say({
             "action": "write_file",
-            "args": {"name": name, "content": content[:12000]},
+            "args": {"name": name, "content": content[:12000], "folder": folder},
             "say": say or f"这就为您写{name}",
             "danger": False,
-            "guard_desc": f"写入文档：{name}",
+            "guard_desc": f"写入文档：{name}" + (f"（{folder}）" if folder else ""),
         }, plan)
 
     if action == "ask_doc":

@@ -133,7 +133,8 @@ MEMORY = JarvisMemory()
 # 步骤格式沿用现有动作白名单, 由 sanitize_plan 出口统一校验。
 AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
 只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot。
-写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
+写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文", "folder": "目标目录，可省略"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
+folder 只能填四类：工作区、桌面、文档、下载，可带子目录（如 "下载\\报告"）。用户没说存哪就省略 folder，默认写进工作区。用户要求存到别处（如 D 盘某个目录）时，folder 填那个完整路径原样，别改写。
 各动作的参数必须齐全，缺参数的一律不要写进计划：
 - file_manage search 要 {"action":"search","pattern":"*.pdf","folder":"下载"}；read 要 {"action":"read","name":"文件名"}；list 要 {"action":"list","folder":"下载"}
 - ask_doc 要 {"query":"要查的问题"}
@@ -643,7 +644,10 @@ def parse_number(s):
 _DOC_EXTS = {".txt", ".md", ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
              ".csv", ".rtf", ".wps", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".mp3",
              ".mp4", ".zip", ".7z"}
-_DOC_ROOTS = [Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"]
+# 查找目录: 贾维斯工作区 + 桌面/文档/下载。工作区单独列出, 因为它已经不在"文档"里了。
+# 名字驱动而非常量驱动: 工作区路径是运行时算的, 写成常量会在换盘/换机器时失效。
+_DOC_PRUNE_DIRS = {".venv", "venv", "node_modules", ".git", "__pycache__", ".skills",
+                   "site-packages", ".idea", "build", "dist"}
 # 口语里的"打开一个名为XX的文本" -> XX
 _DOC_FILLER_HEADS = re.compile(
     r"^(?:请|帮我|帮忙|麻烦|给我|把|打开|启动|运行|一个|一份|那张|这张|那个|这个|"
@@ -652,6 +656,19 @@ _DOC_FILLER_HEADS = re.compile(
 # "打开下载里的报告.pdf" -> 报告.pdf
 _DOC_FOLDER_HEADS = re.compile(r"^(?:桌面|下载|文档|图片|音乐|视频)(?:里|中|上|下面|里面)?(?:的)?")
 _DOC_FILLER_TAILS = re.compile(r"(?:的)?(?:文本文件|文本|文件|文档|那个文件|那个文本|那份文件)+$")
+
+
+def _doc_roots():
+    """会被"打开文档"和"写文档"共用的根目录集合。
+
+    两处必须共用同一份清单: 只进不出的路径等于写完之后自己都找不到,
+    这种不对称 bug 比权限漏洞更难查 (用户只会说"它说不知道")。
+    """
+    try:
+        ws = agent_workspace()
+    except Exception:
+        ws = Path.home() / "Documents" / "贾维斯工作区"
+    return [ws, Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"]
 
 
 def _normalize_file_query(text):
@@ -682,8 +699,22 @@ def _looks_like_document(name):
     return any(w in s for w in ("文本", "文件", "文档", "表格", "图片", "表格"))
 
 
+def _walk_docs(root):
+    """"递归扫目录但跳过依赖/构建目录。
+
+    项目就躺在桌面上, 而桌面是查找根目录之一: 不剪枝的话一次查找会把
+    .venv 里几万个文件走一遍, 语音指令当场卡死几秒到几十秒。
+    """
+    root = Path(root)
+    for cur, dirs, files in os.walk(str(root)):
+        dirs[:] = [d for d in dirs if d.lower() not in _DOC_PRUNE_DIRS]
+        for fn in files:
+            if Path(fn).suffix.lower() in _DOC_EXTS:
+                yield Path(cur) / fn
+
+
 def _document_candidates(query):
-    """在桌面/文档/下载里按文件名找文档, 精确命中优先, 同分按修改时间取最新。"""
+    """在贾维斯工作区/桌面/文档/下载里按文件名找文档, 精确命中优先, 同分按修改时间取最新。"""
     q = _normalize_file_query(query).lower()
     if not q:
         return []
@@ -699,14 +730,12 @@ def _document_candidates(query):
             return 0.0
 
     exact, partial = [], []
-    for root in _DOC_ROOTS:
+    for root in _doc_roots():
         try:
             if not Path(root).exists():
                 continue
-            for p in Path(root).rglob("*"):
+            for p in _walk_docs(root):
                 try:
-                    if not p.is_file() or p.suffix.lower() not in _DOC_EXTS:
-                        continue
                     fname, pstem = p.name.lower(), p.stem.lower()
                     if fname in targets or pstem in targets:
                         exact.append(p)
@@ -762,7 +791,10 @@ _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness
 
 
 def agent_scope_of(action: str, args=None) -> str:
-    """一个动作属于哪级权限。file_manage 按子动作细分。"""
+    """一个动作属于哪级权限。file_manage 按子动作细分, write_file 按目标目录细分。"""
+    if action == "write_file":
+        # 写工作区不打扰; 写桌面/文档/下载只提示; 写到白名单外才问 —— 目录决定权限
+        return _write_target_scope(str((args or {}).get("folder") or ""))
     if action == "file_manage":
         sub = str((args or {}).get("action") or "")
         key = f"file_manage:{sub}"
@@ -778,10 +810,136 @@ def agent_scope_of(action: str, args=None) -> str:
     return AGENT_SCOPE_ASK
 
 
-def _write_document(name: str, content: str) -> tuple:
-    """把模型写好的正文落成文件, 存进贾维斯工作区。返回 (是否成功, 话术)。
+AGENT_WS_FALLBACK = Path.home() / "Documents" / "贾维斯工作区"
+_AGENT_WS_CACHE = {}
+
+
+def agent_workspace() -> Path:
+    """Agent 专用工作区: 落在项目根目录(仓库的上一层), 是落盘产物的默认去处。
+
+    位置选择的三个约束:
+    - 放仓库外面 (BASE.parent 而非 BASE): 产出是你的东西, 不该混进 git status;
+    - 跟着项目走: 整个 jarvis-desktop-v1.2 文件夹拷到别的机器, 代码和产出一起走;
+    - 保底: 打包安装到 Program Files 时那里只读, 探测失败退回 文档\贾维斯工作区,
+      否则整套写文件能力会在别人的机器上直接废掉。
+    """
+    cached = _AGENT_WS_CACHE.get("path")
+    if cached and Path(cached).parent.exists():
+        return Path(cached)
+    candidate = BASE.parent / "贾维斯工作区"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        print(f"[工作区不可写, 退回文档目录] {exc}")
+        candidate = AGENT_WS_FALLBACK
+        candidate.mkdir(parents=True, exist_ok=True)
+    _AGENT_WS_CACHE["path"] = candidate
+    return candidate
+
+
+# ---------- 可写目录白名单 ----------
+# 用户明确要求"能写到指定文件夹", 但全放开等于把能跑 PowerShell 的东西交给模型写任意路径。
+# 分级依据是"这地方是不是用户自己的产出区":
+#   工作区      -> free,   默认去处, 不打扰
+#   桌面/文档/下载 -> notify, 写完告诉你落在哪
+#   其它任何路径 -> ask,    停下来说清楚再动; 用户放行后仅对当前任务有效
+_WRITE_ROOT_ALIASES = (
+    ("workspace", ("贾维斯工作区", "agent工作区", "工作区", "你的工作区", "自己的工作区")),
+    ("desktop", ("桌面",)),
+    ("documents", ("文档区", "我的文档", "文档", "用户文档")),
+    ("downloads", ("下载区", "下载")),
+)
+_WRITE_ROOT_LABELS = {"workspace": "贾维斯工作区", "desktop": "桌面",
+                      "documents": "文档", "downloads": "下载"}
+_WRITE_FOLDER_VERBS = re.compile(
+    r"^(?:请|帮我|帮忙|麻烦|把|写到|写进|写到|存到|存进|放到|放在|保存到|保存在|保存|输出到|导出到|到)+"
+)
+
+
+def _write_root_map() -> dict:
+    return {"workspace": agent_workspace(),
+            "desktop": Path.home() / "Desktop",
+            "documents": Path.home() / "Documents",
+            "downloads": Path.home() / "Downloads"}
+
+
+def _normalize_write_folder(hint) -> str:
+    """把"写到下载里那个报告文件夹"归一成"下载\\报告文件夹"。"""
+    s = str(hint or "").strip().strip("\"'“”‘’《》")
+    s = s.replace("/", "\\")
+    for _ in range(2):
+        new_s = _WRITE_FOLDER_VERBS.sub("", s)
+        if new_s == s:
+            break
+        s = new_s
+    s = re.sub(r"(?:里面|里|中|上面|下面|上)$", "", s)
+    return s.strip(" 的，,。、")
+
+
+def _resolve_write_dir(hint):
+    """解析目标目录 -> (Path, 显示名, 权限级, 错误话术)。
+
+    空提示 -> 工作区; 白名单内(含子目录) -> notify; 绝对路径/其它 -> ask。
+    纯解析, 不建目录: 权限没定之前不能有任何副作用。
+    """
+    raw = _normalize_write_folder(hint)
+    roots = _write_root_map()
+    if not raw:
+        return roots["workspace"], _WRITE_ROOT_LABELS["workspace"], AGENT_SCOPE_FREE, None
+
+    # 绝对路径 (D:\xxx 或 \\server\share): 直接算外部, 交给调用方决定放不放行
+    if re.match(r"^[A-Za-z]:\\", raw) or raw.startswith("\\\\"):
+        p = Path(raw)
+        if any(part == ".." for part in p.parts):
+            return None, raw, AGENT_SCOPE_ASK, "这个路径里有 .. ，我不能用"
+        return p, raw, AGENT_SCOPE_ASK, None
+
+    key, rest = None, raw
+    for name, aliases in _WRITE_ROOT_ALIASES:
+        for alias in aliases:
+            if raw == alias:
+                key, rest = name, ""
+                break
+            if raw.startswith(alias + "\\") or raw.startswith(alias):
+                key, rest = name, raw[len(alias):]
+                if rest[:1] not in ("", "\\"):
+                    continue      # "下载备份" 不匹配 "下载"
+                break
+        if key:
+            break
+
+    if key is None:
+        key, rest = "workspace", raw      # 裸目录名 -> 工作区下的子目录
+    rest = rest.strip("\\").strip()
+    if ".." in rest or ":" in rest:
+        return None, raw, AGENT_SCOPE_ASK, "这个目录名里有非法字符，我不能用"
+
+    root = roots[key]
+    target = (root / rest) if rest else root
+    try:
+        resolved = target.resolve()
+        root_resolved = root.resolve()
+        if os.path.commonpath([str(resolved), str(root_resolved)]) != str(root_resolved):
+            return None, raw, AGENT_SCOPE_ASK, "这个路径跳出了授权目录，我不能用"
+    except Exception:
+        return None, raw, AGENT_SCOPE_ASK, "这个路径解析不了，换一个试试"
+    scope = AGENT_SCOPE_FREE if key == "workspace" else AGENT_SCOPE_NOTIFY
+    label = _WRITE_ROOT_LABELS[key] + (f"\\{rest}" if rest else "")
+    return resolved, label, scope, None
+
+
+def _write_target_scope(hint) -> str:
+    return _resolve_write_dir(hint)[2]
+
+
+def _write_document(name: str, content: str, folder=None, allow_outside: bool = False) -> tuple:
+    """把模型写好的正文落成文件, 默认进贾维斯工作区, 也可指定目录。返回 (是否成功, 话术)。
 
     - 名字走裸名校验, 不接受路径分隔符和命令元字符;
+    - 目标目录必须先过白名单: 白名单外只有在 allow_outside(用户对当前任务放行)时才写;
     - .md/.txt 直接写; .docx 生成 .md 后用系统 Word COM 转一遍;
     - 同名不覆盖: 自动加序号, agent 重跑不会吃掉上一版。
     """
@@ -803,13 +961,23 @@ def _write_document(name: str, content: str) -> tuple:
     if not text:
         return False, "要写入的内容是空的，Sir"
 
-    ws = agent_workspace()
+    target_dir, label, scope, err = _resolve_write_dir(folder)
+    if err:
+        return False, err
+    if scope == AGENT_SCOPE_ASK and not allow_outside:
+        return False, (f"「{label}」不在我的授权目录里（只有工作区、桌面、文档、下载）。"
+                       f"要写到那儿, 请先说「做个任务, 写到 {label}」, 我确认后再动")
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[建目录失败] {target_dir}: {exc}")
+        return False, f"那个目录建不出来：{exc}"
 
     def _avoid_collision(base: str, suffix: str) -> Path:
-        target = ws / (base + suffix)
+        target = target_dir / (base + suffix)
         n = 1
         while target.exists():
-            target = ws / f"{base}-{n}{suffix}"
+            target = target_dir / f"{base}-{n}{suffix}"
             n += 1
         return target
 
@@ -822,15 +990,15 @@ def _write_document(name: str, content: str) -> tuple:
             md_path.write_text(text, encoding="utf-8")
             converted = _md_to_docx(md_path)
             if converted:
-                return True, f"已写好 Word 文档{converted.name}，存在文档的贾维斯工作区里"
-            return True, f"已写好{md_path.name}（Word 不可用，先存了 Markdown 版）"
+                return True, f"已写好 Word 文档{converted.name}，放在{label}里"
+            return True, f"已写好{md_path.name}（Word 不可用，先存了 Markdown 版），放在{label}里"
         target = _avoid_collision(stem, Path(raw).suffix)
         target.write_text(text, encoding="utf-8")
     except Exception as exc:
         print(f"[写文档失败] {raw}: {exc}")
         return False, f"写文件失败了：{exc}"
 
-    say = f"已写好{target.name}，存在文档的贾维斯工作区里"
+    say = f"已写好{target.name}，放在{label}里"
     try:
         os.startfile(str(target))   # 写完即开, 和 open_file 闭环
         say = f"已写好并打开{target.name}"
@@ -854,13 +1022,6 @@ def _md_to_docx(md_path: Path):
     except Exception as exc:
         print(f"[Word 转换不可用, 保留 Markdown] {exc}")
         return None
-
-
-def agent_workspace() -> Path:
-    """Agent 专用工作区: 一切落盘产物只进这里, 出问题删目录即回滚。"""
-    ws = Path.home() / "Documents" / "贾维斯工作区"
-    ws.mkdir(parents=True, exist_ok=True)
-    return ws
 
 
 def _agent_load_tasks() -> dict:
@@ -1097,6 +1258,9 @@ def _agent_loop(task: dict, gen: int):
 
             _agent_notify(f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
             _TL.action_ok = True
+            # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
+            _TL.agent_context = True
+            _TL.agent_external_ok = bool(step.get("external_ok"))
             try:
                 step["result"] = _perform_plan({"action": step.get("action"),
                                                 "args": step.get("args", {}),
@@ -1105,6 +1269,9 @@ def _agent_loop(task: dict, gen: int):
             except Exception as exc:
                 step["result"] = f"执行失败: {exc}"
                 step["status"] = "failed"
+            finally:
+                _TL.agent_context = False
+                _TL.agent_external_ok = False
             _agent_persist(task)
 
             if _AGENT_RUN.get("skip"):
@@ -1162,9 +1329,13 @@ def agent_continue() -> dict:
         task["state"] = "approved"
         for step in task.get("steps", []):
             if step.get("status") == "waiting":
-                step["status"] = "pending"
                 # 高危步骤既然被用户点名放行, 降级为 notify (留痕但不逐条弹确认)
+                was_ask = step.get("scope") == AGENT_SCOPE_ASK
+                step["status"] = "pending"
                 step["scope"] = AGENT_SCOPE_NOTIFY
+                if was_ask and step.get("action") == "write_file":
+                    # 写白名单外目录这一步已被用户放行, 只对本次执行有效
+                    step["external_ok"] = True
         _agent_save_tasks(data)
         return _agent_start(task)
     return {"say": "没有在等确认的任务"}
@@ -1416,8 +1587,13 @@ def _perform_plan(plan):
         elif action == "open_file":
             success, say = _open_document(args.get("name") or args.get("exe") or "")
         elif action == "write_file":
-            # 写文档: 只落贾维斯工作区, 同名加序号不覆盖, 写完即开
-            success, msg = _write_document(args.get("name"), args.get("content"))
+            # 写文档: 默认落工作区, 也可指定 桌面/文档/下载 或子目录;
+            # 越是白名单外的路径, 越必须由 agent 审批流程放行 (direct 指令由用户自己说的, 视为已授权)
+            external_ok = (not bool(getattr(_TL, "agent_context", False)) or
+                           bool(getattr(_TL, "agent_external_ok", False)))
+            success, msg = _write_document(args.get("name"), args.get("content"),
+                                           folder=args.get("folder"),
+                                           allow_outside=external_ok)
             say = msg
             _TL.action_ok = bool(success)
         elif action == "close_app":
