@@ -65,9 +65,38 @@ def search_ddg(query, limit=5):
     return results
 
 
+def search_so360(query, limit=5):
+    """360 搜索: 服务端渲染、带 data-mdurl 真实链接, 国内网络最稳。"""
+    url = "https://www.so.com/s?q=" + quote(query)
+    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
+    if r.status_code != 200:
+        return []
+    text = re.sub(r"<style.*?</style>|<script.*?</script>", " ", r.text, flags=re.S | re.I)
+    results = []
+    # 不按 li 切块 (class 写法多变), 直接全局找标题链接, 摘要取其后一段
+    pattern = r'<h3[^>]*class="res-title[^"]*"[^>]*>\s*<a([^>]+)>(.*?)</a>'
+    for m in re.finditer(pattern, text, re.S):
+        attrs, title_html = m.group(1), m.group(2)
+        href = re.search(r'href="([^"]+)"', attrs)
+        if not href:
+            continue
+        md = re.search(r'data-mdurl="([^"]+)"', attrs)
+        real_url = html_lib.unescape(md.group(1) if md else href.group(1))
+        seg = text[m.end():m.end() + 1500]
+        desc = re.search(r'class="res-desc[^"]*"[^>]*>(.*?)</(?:p|div)>', seg, re.S)
+        results.append({
+            "url": real_url,
+            "title": _clean(title_html),
+            "snippet": _clean(desc.group(1)) if desc else "",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 def web_search(query, limit=5):
-    """先 Bing 后 DDG, 谁先出结果用谁; 全失败返回空列表。"""
-    for finder in (search_bing, search_ddg):
+    """360 -> Bing -> DDG, 谁先出结果用谁; 全失败返回空列表。"""
+    for finder in (search_so360, search_bing, search_ddg):
         try:
             found = finder(query, limit)
         except Exception as exc:
