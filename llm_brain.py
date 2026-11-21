@@ -912,6 +912,60 @@ def query_llm_answer(question: str, doc_context: str, config: dict) -> str:
         return e.message
 
 
+# 失败修复的固定指令: 让模型只回一步修正后的白名单动作, 不写解释文字
+_REPAIR_STEP_SYSTEM = (
+    "你是桌面助手贾维斯的任务修复器。一个多步任务里有一步执行失败了，你要只给出修正后的那一步。\n"
+    "只输出一个完整 JSON 对象：{\"action\": \"动作名\", \"args\": {...}, \"say\": \"给用户的中文说明\"}。\n"
+    "动作只能用现有白名单：chat/open_app/open_file/open_url/web_search/file_manage/write_file/"
+    "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart。\n"
+    "参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
+    "不要一次给出多步；确实改不动就返回 action=chat 并在 say 里说明原因。"
+)
+
+
+def repair_step(goal, step, error_text, config):
+    """让模型根据失败信息重出一步，返回原始 step dict；解析或调用失败返回 None。
+
+    这里只取回模型给的一步，不过白名单和参数校验 —— 调用方仍要过 sanitize_plan，
+    权限也仍由 agent_scope_of 判定，修复通道不绕开任何一道关卡。
+    """
+    step = step if isinstance(step, dict) else {}
+    try:
+        args_text = json.dumps(step.get("args") or {}, ensure_ascii=False, default=str)[:800]
+    except Exception:
+        args_text = str(step.get("args") or "")[:800]
+    user = (
+        f"【任务目标】{str(goal or '')[:300]}\n"
+        f"【失败步骤】动作={str(step.get('action') or '')[:60]}；参数={args_text}；"
+        f"原本要说={str(step.get('say') or '')[:200]}\n"
+        f"【失败结果】{str(error_text or '')[:800]}\n"
+        "请给出修正后的这一步 JSON。"
+    )
+    messages = [
+        {"role": "system", "content": _REPAIR_STEP_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    try:
+        raw = _provider_chat(config or {}, messages, max_tokens=400, json_mode=True)
+    except Exception as exc:
+        print(f"[步骤修复] 调用失败, 放弃本次修复: {type(exc).__name__}")
+        return None
+    try:
+        plan = json.loads(_strip_json_text(raw)) if str(raw or "").strip() else None
+    except (TypeError, ValueError):
+        plan = None
+    if not isinstance(plan, dict) or not str(plan.get("action") or "").strip():
+        return None
+    out = {
+        "action": str(plan["action"]).strip(),
+        "args": plan.get("args") if isinstance(plan.get("args"), dict) else {},
+        "say": str(plan.get("say") or "")[:2000],
+    }
+    if plan.get("danger"):
+        out["danger"] = True
+    return out
+
+
 # ---------- 自由对话通道 ----------
 # 规划通道把模型关在 JSON 里, 聊天走这里: 正常说话、带上下文和主人档案。
 CHAT_SYSTEM_PROMPT = (

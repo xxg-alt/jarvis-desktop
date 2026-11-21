@@ -1392,25 +1392,131 @@ def _agent_generation_changed(gen: int) -> bool:
     return _AGENT_RUN.get("gen") != gen
 
 
-def _tool_data_text(action, res):
-    """把工具的结构化结果压成一段可传递的文本, 供后续步骤 (尤其写文件) 使用。
+def _tool_items_text(items):
+    """把 data.items 全量列出来 (最多 50 项), 让"先查后写"能照抄真实结果。"""
+    names = []
+    for item in items[:50]:
+        if not isinstance(item, dict):
+            names.append(str(item)[:80])
+            continue
+        if item.get("path"):
+            names.append(Path(str(item["path"])).name)
+        elif item.get("name"):
+            extra = f"({item['memory_mb']}MB)" if item.get("memory_mb") else ""
+            names.append(f"{item['name']}{extra}")
+        elif item.get("pid") is not None:
+            detail = item.get("state") or item.get("local") or item.get("remote") or ""
+            names.append(f"PID {item['pid']}{f'({detail})' if detail else ''}")
+    return f"共 {len(items)} 项: " + "、".join(names) if names else ""
 
-    _perform_plan 平时只留下一句口头 summary, 具体名单/数字会丢;
-    这里把 data 里的 items 全量列出 (最多 50 项), 让"先查后写"能写对。
+
+def _tool_data_text(action, res):
+    """把工具的结构化结果压成一段可传递的文本, 供修复判断和后续步骤引用。
+
+    _perform_plan 平时只留下一句口头 summary, 具体成败/路径/条目数会丢;
+    这里按动作补齐这些结构化回读, 并保留原来的 items 全量名录。
     """
-    data = res.get("data") or {}
+    res = res if isinstance(res, dict) else {}
+    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    ok = bool(res.get("ok", True))
+    head = f"{action}: 成功={'是' if ok else '否'}"
+    summary = str(res.get("summary") or "").strip()[:300]
+
+    if action == "open_app":
+        parts = [head]
+        if data.get("name"):
+            parts.append(f"应用={data['name']}")
+        if data.get("exe"):
+            parts.append(f"启动名={data['exe']}")
+        if data.get("path"):
+            parts.append(f"实际路径={data['path']}")
+        if summary:
+            parts.append(f"结果={summary}")
+        return "；".join(parts)
+
+    if action == "close_app":
+        parts = [head]
+        name = str(data.get("name") or "")
+        exe = str(data.get("exe") or "")
+        if name or exe:
+            target = name + (f"({exe})" if exe and exe != name else "")
+            parts.append(f"目标={target}")
+        if "remaining" in data:
+            remaining = data.get("remaining")
+            parts.append("同名进程剩余=" + ("无法核验" if remaining is None else f"{remaining} 个"))
+        if summary:
+            parts.append(f"结果={summary}")
+        return "；".join(parts)
+
     items = data.get("items") or []
-    if items:
-        names = []
-        for item in items[:50]:
-            if item.get("path"):
-                names.append(Path(str(item["path"])).name)
-            elif item.get("name"):
-                extra = f"({item['memory_mb']}MB)" if item.get("memory_mb") else ""
-                names.append(f"{item['name']}{extra}")
-        if names:
-            return f"共 {len(items)} 项: " + "、".join(names)
-    return ""
+    item_text = _tool_items_text(items) if isinstance(items, list) else ""
+
+    if action == "file_manage":
+        parts = [head]
+        if data.get("action"):
+            parts.append(f"子动作={data['action']}")
+        # 移动看 dst, 读取看 path, 列目录看 folder: 操作后的落点是否存在要回读
+        target = data.get("dst") or data.get("path") or data.get("folder")
+        if target:
+            parts.append(f"目标={target}")
+            try:
+                parts.append(f"操作后存在={'是' if Path(str(target)).exists() else '否'}")
+            except Exception:
+                pass
+        if data.get("pattern"):
+            parts.append(f"匹配={data['pattern']}")
+        if "total" in data:
+            parts.append(f"条目数={data['total']}")
+        elif items:
+            parts.append(f"条目数={len(items)}")
+        if summary:
+            parts.append(f"结果={summary}")
+        if item_text:
+            parts.append(item_text)
+        return "；".join(parts)
+
+    if action == "inspect_system":
+        parts = [head]
+        if data.get("mode"):
+            parts.append(f"模式={data['mode']}")
+        if data.get("port"):
+            parts.append(f"端口={data['port']}")
+        if items:
+            parts.append(f"条目数={len(items)}")
+        if summary:
+            parts.append(f"结果={summary}")
+        if item_text:
+            parts.append(item_text)
+        return "；".join(parts)
+
+    return item_text
+
+
+def _opened_app_path(args):
+    """回读软件实际启动路径: 先用启动器缓存, 缓存没有再按 exe 名解析一次。"""
+    name = str((args or {}).get("name") or "")
+    exe = str((args or {}).get("exe") or "")
+    try:
+        from smart_launcher import APP_PATH_CACHE, resolve_program
+        hit = APP_PATH_CACHE.get(name) or APP_PATH_CACHE.get(exe)
+        if hit:
+            return hit
+        return resolve_program(exe) or ""
+    except Exception:
+        return ""
+
+
+def _remaining_process_count(exe):
+    """尽力回读同名进程数; 读不到返回 None, 绝不假装核验过。"""
+    if not exe:
+        return None
+    try:
+        import psutil
+        name = Path(str(exe)).name.lower()
+        return sum(1 for p in psutil.process_iter(["name"])
+                   if str((p.info or {}).get("name") or "").lower() == name)
+    except Exception:
+        return None
 
 
 _AGENT_COMPOSE_SYSTEM = (
@@ -1449,6 +1555,50 @@ def _agent_compose_write(goal, step, results_text):
         return draft
 
 
+def _agent_execute_step(step, note=""):
+    """执行一步并回读结果, 返回 (是否成功, 结构化数据文本); 成败写回 step。"""
+    if note:
+        _agent_notify(note)
+    _TL.action_ok = True
+    _TL.last_tool_text = ""
+    # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
+    _TL.agent_context = True
+    _TL.agent_external_ok = bool(step.get("external_ok"))
+    try:
+        step["result"] = _perform_plan({"action": step.get("action"),
+                                        "args": step.get("args", {}),
+                                        "say": step.get("say", "")})
+        step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
+    except Exception as exc:
+        step["result"] = f"执行失败: {exc}"
+        step["status"] = "failed"
+    finally:
+        _TL.agent_context = False
+        _TL.agent_external_ok = False
+    return step.get("status") == "done", getattr(_TL, "last_tool_text", "")
+
+
+def _agent_repair_step(task, step, error_text):
+    """失败后请模型重出一步: 先过 sanitize/作用域校验, 返回 (修正步, 未采用原因)。
+
+    危险修正步不在这里执行, 只把 danger 标出来, 交给调用方走现有护栏。
+    """
+    from llm_brain import repair_step, sanitize_plan
+    fixed = repair_step(task.get("goal", ""), step, error_text, CONFIG)
+    if not isinstance(fixed, dict):
+        return None, "模型没给出修正步"
+    requested = str(fixed.get("action") or "chat")
+    plan = sanitize_plan(fixed)
+    action = plan.get("action", "chat")
+    if action == "chat":
+        reason = f"修正步参数不合法({requested})" if requested != "chat" else "模型只回了聊天"
+        return None, reason
+    scope = agent_scope_of(action, plan.get("args"))
+    danger = bool(fixed.get("danger")) or bool(plan.get("danger")) or scope == AGENT_SCOPE_ASK
+    return {"action": action, "args": plan.get("args", {}),
+            "say": plan.get("say", ""), "scope": scope, "danger": danger}, ""
+
+
 def _agent_loop(task: dict, gen: int):
     """后台执行循环。每步之间检查 stop/skip, 遇 ask 步骤立刻挂起等确认。"""
     steps = task.get("steps", [])
@@ -1459,7 +1609,7 @@ def _agent_loop(task: dict, gen: int):
         try: ui_bridge.emit_state("ACTING")
         except Exception: pass
 
-    results_log = []
+    results_log, repaired_nums = [], []
     try:
         for i, step in enumerate(steps):
             if _agent_generation_changed(gen) or _AGENT_RUN.get("stop"):
@@ -1493,28 +1643,50 @@ def _agent_loop(task: dict, gen: int):
                 if composed and composed != (step.get("args", {}) or {}).get("content"):
                     step.setdefault("args", {})["content"] = composed
 
-            _agent_notify(f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
-            _TL.action_ok = True
-            # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
-            _TL.agent_context = True
-            _TL.agent_external_ok = bool(step.get("external_ok"))
-            try:
-                step["result"] = _perform_plan({"action": step.get("action"),
-                                                "args": step.get("args", {}),
-                                                "say": step.get("say", "")})
-                step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
-            except Exception as exc:
-                step["result"] = f"执行失败: {exc}"
-                step["status"] = "failed"
-            finally:
-                _TL.agent_context = False
-                _TL.agent_external_ok = False
+            ok, extra = _agent_execute_step(
+                step, f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
+
+            # 失败修复: 每步只给模型一次机会, 危险修正步必须走原来的确认护栏
+            if not ok and not step.get("repair_attempted"):
+                step["repair_attempted"] = True
+                error_text = str(step.get("result") or "")
+                if extra:
+                    error_text += f" | 数据: {extra}"
+                fixed, reason = _agent_repair_step(task, step, error_text)
+                if fixed and fixed.get("danger"):
+                    step.update({"action": fixed["action"], "args": fixed["args"],
+                                 "say": fixed["say"], "scope": AGENT_SCOPE_ASK,
+                                 "status": "waiting",
+                                 "result": (step.get("result") or "") + "；修正方案待确认"})
+                    task["state"] = "waiting_user"
+                    _agent_persist(task)
+                    _agent_notify(
+                        f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步失败, "
+                        f"修正方案要动系统: {fixed['say'] or fixed['action']}。"
+                        "说「继续任务」放行, 说「停」中止",
+                        spoken=True,
+                    )
+                    return
+                if fixed:
+                    step.update({"action": fixed["action"], "args": fixed["args"],
+                                 "say": fixed["say"], "scope": fixed["scope"],
+                                 "status": "pending"})
+                    step["repaired"] = True
+                    ok, extra = _agent_execute_step(
+                        step, f"第 {i + 1}/{total} 步修正后重试 · {step.get('say') or step.get('action')}")
+                    if not ok:
+                        step["result"] = f"修复后仍失败: {step.get('result') or ''}; 原错误: {error_text}"
+                else:
+                    step["result"] = f"{step.get('result') or ''}；修复未采用: {reason}"
+
             if step.get("status") == "done":
-                entry = f"第{i + 1}步({step.get('say') or step.get('action')}): {step.get('result', '')}"
-                extra = getattr(_TL, "last_tool_text", "")
+                label = f"第{i + 1}步" + ("经修复完成" if step.get("repaired") else "")
+                entry = f"{label}({step.get('say') or step.get('action')}): {step.get('result', '')}"
                 if extra:
                     entry += f" | 数据: {extra}"
                 results_log.append(entry)
+                if step.get("repaired"):
+                    repaired_nums.append(i + 1)
             _agent_persist(task)
 
             if _AGENT_RUN.get("skip"):
@@ -1532,11 +1704,12 @@ def _agent_loop(task: dict, gen: int):
         done_n = sum(1 for s in steps if s.get("status") == "done")
         task["state"] = "failed" if failed and done_n == 0 else "done"
         _agent_persist(task)
+        fix_note = ("；" + "；".join(f"第{n}步经修复完成" for n in repaired_nums)) if repaired_nums else ""
         if failed:
             _agent_notify(f"任务「{task.get('goal', '')}」结束, 第 "
-                          f"{'、'.join(str(i + 1) for i in failed)} 步没有成功", spoken=True)
+                          f"{'、'.join(str(i + 1) for i in failed)} 步没有成功{fix_note}", spoken=True)
         else:
-            _agent_notify(f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步", spoken=True)
+            _agent_notify(f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步{fix_note}", spoken=True)
     except Exception as exc:
         print(f"[Agent 执行异常] {exc}")
         task["state"] = "failed"
@@ -1935,6 +2108,9 @@ def _perform_plan(plan):
                 success, say = smart_launch_app(app_target, app_name)
                 if not success and _document_candidates(app_name or app_target):
                     success, say = _open_document(app_name or app_target)
+            if len(names) <= 1 and getattr(_TL, "agent_context", False):
+                # agent 步骤要靠成败位判断是否需要修复; 直接指令的播报行为保持不变
+                _TL.action_ok = bool(success)
         elif action == "open_file":
             success, say = _open_document(args.get("name") or args.get("exe") or "")
         elif action == "write_file":
@@ -1949,7 +2125,21 @@ def _perform_plan(plan):
             say = msg
             _TL.action_ok = bool(success)
         elif action == "close_app":
-            _run(["taskkill", "/im", args["exe"], "/f"])
+            exe = str(args.get("exe") or "")
+            name = str(args.get("name") or exe)
+            try:
+                _run(["taskkill", "/im", exe, "/f"])
+                launch_ok = True
+            except Exception as exc:
+                launch_ok = False
+                print(f"[关闭程序失败] {exe}: {exc}")
+            _TL.action_ok = bool(launch_ok)
+            _TL.last_tool_text = _tool_data_text("close_app", {
+                "ok": launch_ok,
+                "summary": say,
+                "data": {"exe": exe, "name": name,
+                         "remaining": _remaining_process_count(exe)},
+            })
         elif action == "open_url":
             url = str(args.get("url", "")).strip()
             if is_safe_url(url):
@@ -2109,6 +2299,13 @@ def _perform_plan(plan):
         say = f"执行失败了: {e}"
         _TL.action_ok = False
         print(f"[执行失败] {action}: {e}")
+    if action == "open_app":
+        _TL.last_tool_text = _tool_data_text("open_app", {
+            "ok": bool(getattr(_TL, "action_ok", True)),
+            "summary": say,
+            "data": {"exe": args.get("exe") or "", "name": args.get("name") or "",
+                     "path": _opened_app_path(args)},
+        })
     return say
 
 
