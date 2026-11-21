@@ -130,8 +130,8 @@ def search_sogou(query, limit=5):
     """搜狗: 服务端渲染, 标题链接多为直达; 360/Bing 被限流时的后备源。"""
     url = "https://www.sogou.com/web?query=" + quote(query)
     status, raw = _fetch_page(url)
-    if status != 200 or "验证码" in raw:
-        return []
+    if status != 200 or "vr-title" not in raw:
+        return []  # 验证码页/异常页没有结果标题, 直接判无结果
     text = re.sub(r"<style.*?</style>|<script.*?</script>", " ", raw, flags=re.S | re.I)
     results = []
     pattern = r'<h3[^>]*class="vr-title[^"]*"[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
@@ -158,19 +158,23 @@ def web_search(query, limit=5):
     hit = _QUERY_CACHE.get(key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
         return hit[1]
+    now = time.time()
     for finder in (search_bing, search_so360, search_sogou, search_ddg):
-        if _ENGINE_FAILS.get(finder.__name__, 0) >= 2:
-            continue  # 熔断: 该源已连续失败, 多半被限流, 别再火上浇油
+        fails, last_fail = _ENGINE_FAILS.get(finder.__name__, (0, 0))
+        if fails >= 2 and now - last_fail < 600:
+            continue  # 熔断 10 分钟: 该源刚被限流, 别火上浇油; 过期自动再试
         try:
             found = finder(query, limit)
         except Exception as exc:
             print(f"[联网搜索] {finder.__name__} 失败: {exc}")
             found = []
         if found:
-            _ENGINE_FAILS[finder.__name__] = 0
-            _QUERY_CACHE[key] = (time.time(), found)
+            _ENGINE_FAILS[finder.__name__] = (0, 0)
+            if len(_QUERY_CACHE) > 50:
+                _QUERY_CACHE.clear()
+            _QUERY_CACHE[key] = (now, found)
             return found
-        _ENGINE_FAILS[finder.__name__] = _ENGINE_FAILS.get(finder.__name__, 0) + 1
+        _ENGINE_FAILS[finder.__name__] = (fails + 1, now)
     return []
 
 

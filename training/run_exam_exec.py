@@ -72,7 +72,8 @@ def main():
             txt = f.read_text(encoding="utf-8", errors="ignore")
             if "内存" in txt and "MB" in txt:
                 c2 += txt
-    ok2 = bool(re.search(r"\d+(\.\d+)?\s*MB", c2))
+    # 文档可能是表格形式 (MB 在表头, 数字单独成列), 两种写法都算对
+    ok2 = "MB" in c2 and len(re.findall(r"\d+\.\d+", c2)) >= 2
     print("E2 content_ok:", ok2, flush=True)
     print(c2[:260], flush=True)
     print("RESULT E1", ok1, "E2", ok2, flush=True)
