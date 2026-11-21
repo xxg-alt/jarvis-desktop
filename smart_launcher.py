@@ -152,10 +152,11 @@ def resolve_program(target: str) -> str:
     return find_app_paths_exe(exe)
 
 
-def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str]:
+def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str, str]:
     """
     智能启动应用
-    返回: (是否成功, 语音回复文字)
+    返回: (是否成功, 语音回复文字, 核验状态)
+    核验状态: "ok" 已确认启动, "unverified" 仅尝试启动/回退打开同名文档(未核实), "fail" 未启动
     """
     # 1. 优先查缓存
     if app_name in APP_PATH_CACHE and os.path.exists(APP_PATH_CACHE[app_name]):

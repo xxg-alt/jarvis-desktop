@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """失败修复桩测: 假模型给出修正步, 验证修复路径/最多一次/危险修正步不直接执行。"""
 import sys
+import json
 sys.path.insert(0, "/data/workspace/jarvis-desktop")
 
 import jarvis
 import llm_brain
 
 REAL_PERFORM = jarvis._perform_plan
+REAL_PERSIST = jarvis._agent_persist
+REAL_LOAD_TASKS = jarvis._agent_load_tasks
+REAL_SAVE_TASKS = jarvis._agent_save_tasks
+REAL_REPAIR_STEP = jarvis._agent_repair_step
 fails = []
 calls = []          # _perform_plan 实际收到的动作
 chat_calls = []     # 假 _provider_chat 被叫了几次
@@ -199,9 +204,102 @@ text = jarvis._tool_data_text("file_manage", {"summary":"3项","data":{"action":
 if "无法核验" not in text or "成功=是" in text or "成功=否" in text:
     fails.append(f"缺ok应回读无法核验: {text}")
 
+# 6. 第二轮审查修复回归
+# 6a. R2-1: open_app 抛异常 -> 成败位 False, 回读不报成功
+def boom_launch(target, name):
+    raise RuntimeError("launch exploded")
+try:
+    smart_launcher.smart_launch_app = boom_launch
+    jarvis._document_candidates = lambda q: []
+    jarvis._TL.agent_context = False
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"open_app","args":{"exe":"Boom.exe","name":"Boom"},"say":"打开Boom"})
+    text = jarvis._TL.last_tool_text
+    if jarvis._TL.action_ok is not False:
+        fails.append(f"启动抛异常应置 action_ok=False: {jarvis._TL.action_ok}")
+    if "成功=是" in text or "成功=否" not in text:
+        fails.append(f"启动抛异常回读不应报成功: {text}")
+finally:
+    smart_launcher.smart_launch_app = _real_smart
+    jarvis._document_candidates = _real_doc_cands
+    jarvis._TL.agent_context = False
+
+# 6b. R2-2: 直接指令多开, 未核实项不许混进确认成功的播报
+try:
+    smart_launcher.smart_launch_app = lambda t, n: (True, f"已尝试为您启动{n}", "unverified")
+    jarvis._document_candidates = lambda q: []
+    from unittest.mock import patch
+    seen_say = []
+    with patch.object(jarvis.MEMORY, "control_command", lambda c: None), \
+         patch.object(jarvis.MEMORY, "extract_note", lambda c: None), \
+         patch.object(jarvis.MEMORY, "record_turn", lambda *a, **k: None), \
+         patch.object(jarvis, "_command_is_current", lambda cid: True), \
+         patch.object(jarvis, "speak", lambda t: seen_say.append(t)):
+        jarvis._handle_command_inner("同时打开微信和QQ", "stub")
+    if not seen_say or "已尝试" not in seen_say[0] or "未核实" not in seen_say[0]:
+        fails.append(f"多开未核实项话术不对: {seen_say}")
+    if any("已为您启动" in s for s in seen_say):
+        fails.append(f"多开未核实项被报成启动成功: {seen_say}")
+finally:
+    smart_launcher.smart_launch_app = _real_smart
+    jarvis._document_candidates = _real_doc_cands
+
+# 6c. R2-4: taskkill 返回 0 但仍有同名进程 -> 未关干净; 读不到剩余数 -> 按返回码但注明未核实
+_real_remaining = jarvis._remaining_process_count
+try:
+    _subprocess.run = lambda *a, **k: _R(0, "", "")
+    jarvis._remaining_process_count = lambda exe: 2
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"close_app","args":{"exe":"WeChat.exe","name":"微信"},"say":"关掉"})
+    text = jarvis._TL.last_tool_text
+    if jarvis._TL.action_ok is not False or "成功=否" not in text or "仍有 2 个同名进程在运行" not in text:
+        fails.append(f"进程残留应记为未关干净: action_ok={jarvis._TL.action_ok}, {text}")
+    jarvis._remaining_process_count = lambda exe: None
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"close_app","args":{"exe":"WeChat.exe","name":"微信"},"say":"关掉"})
+    text2 = jarvis._TL.last_tool_text
+    if jarvis._TL.action_ok is not True or "未核实" not in text2 or "同名进程剩余=无法核验" not in text2:
+        fails.append(f"剩余数读不到应沿用返回码并注明未核实: action_ok={jarvis._TL.action_ok}, {text2}")
+finally:
+    _subprocess.run = _real_run
+    jarvis._remaining_process_count = _real_remaining
+
+# 6d. R2-5: 置 repair_attempted 后立即落盘, 修复调用前崩溃重载后标记仍在
+store = {"tasks": []}
+snapshot = {}
+def crash_before_repair(task, step, error_text):
+    snapshot["tasks"] = json.loads(json.dumps(store["tasks"]))
+    raise RuntimeError("模拟修复调用前崩溃")
+try:
+    jarvis._agent_persist = REAL_PERSIST
+    jarvis._agent_load_tasks = lambda: store
+    jarvis._agent_save_tasks = lambda data: store.update(data)
+    jarvis._agent_repair_step = crash_before_repair
+    jarvis._perform_plan = fake_perform
+    task = {"goal": "落盘窗口测试", "state": "approved", "created": "R2-5",
+            "steps": [{"action": "open_app", "args": {"exe": "bad.exe", "name": "记事本"},
+                       "say": "打开", "status": "pending", "scope": jarvis.AGENT_SCOPE_FREE}]}
+    gen["n"] += 1
+    jarvis._AGENT_RUN.update({"task": task, "gen": gen["n"]})
+    jarvis._agent_loop(task, gen["n"])
+    if "tasks" not in snapshot or not snapshot["tasks"][0]["steps"][0].get("repair_attempted"):
+        fails.append("修复调用前 repair_attempted 没有立即落盘")
+    reloaded = jarvis._agent_load_tasks()
+    if not reloaded["tasks"][0]["steps"][0].get("repair_attempted"):
+        fails.append(f"崩溃重载后 repair_attempted 丢失: {reloaded}")
+finally:
+    jarvis._agent_persist = lambda task: None
+    jarvis._agent_load_tasks = REAL_LOAD_TASKS
+    jarvis._agent_save_tasks = REAL_SAVE_TASKS
+    jarvis._agent_repair_step = REAL_REPAIR_STEP
+    jarvis._perform_plan = REAL_PERFORM
+
 if fails:
     print("FAIL")
     for f in fails:
         print(" -", f)
     sys.exit(1)
-print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+审查回归")
+print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+两轮审查回归")

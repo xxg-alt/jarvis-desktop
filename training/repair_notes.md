@@ -59,3 +59,31 @@
 - `python3 training/test_chat_channel.py`：PASS。
 - `python3 training/test_repair.py`：PASS。
 - 本地规则四条回归：打开记事本→open_app、现在几点→chat、关机→shutdown、音量调大→volume，结果不变。
+
+## 第二轮审查修复
+
+### R2-1 open_app 异常路径回读仍谎报成功
+- 改法：新增 `_open_app_verify_status(action_ok)`，成败位为 False 时把预置的 `open_app_verify="ok"` 纠正为 `fail`；open_app 最终回读与直接指令多开汇总都走这一处判断，异常路径回读只可能是 `成功=否/无法核验`，不再出现 `成功=是`。
+- 测试：桩测把 `smart_launch_app` 换成抛异常的桩，断言 `action_ok=False` 且回读含 `成功=否`、不含 `成功=是`。
+
+### R2-2 直接指令多开未核实也播报成功
+- 改法：直接指令多开结果改为四元组，把 `_TL.open_app_verify` 带进汇总；`_multi_open_say` 对 `unverified` 统一输出「已尝试，未核实（原话）」，失败项仍单独说清，只有确认成功才进「已为您启动…」。其他播报未动。
+- 测试：桩测直接走 `_handle_command_inner("同时打开微信和QQ", ...)`，启动器返回 unverified，断言播报含「已尝试」「未核实」且不含「已为您启动」。
+
+### R2-3 smart_launcher.py 契约文档过期
+- 改法：`smart_launch_app` 标注改为 `tuple[bool, str, str]`，docstring 写明三元含义及 `ok/unverified/fail` 三种核验状态。全仓 grep `smart_launch_app`：jarvis.py 两处调用与 test_repair.py 桩均为三元解包，没有二元组解包点。
+- 测试：随全量 py_compile 与 test_repair.py 通过。
+
+### R2-4 close_app 以 taskkill 返回码定成败、与进程残留矛盾
+- 改法：去掉动作前的进程数预读；taskkill 后读到剩余数 > 0 时按未关干净处理——`action_ok=False`、回读 `成功=否`，并在原因/结果里注明「仍有 N 个同名进程在运行」；剩余数读不到时才沿用 taskkill 返回码定成败，并在原因中注明「同名进程剩余数无法核验, 未核实是否关闭」，回读保留 `同名进程剩余=无法核验`。
+- 测试：桩测 mock taskkill 返回 0 + 剩余 2 → 失败且含残留说明；返回 0 + 剩余数读不到 → 沿用返回码成功且注明未核实。
+
+### R2-5 repair_attempted 持久化窗口
+- 改法：`_agent_loop` 置 `step["repair_attempted"]=True` 后立即 `_agent_persist(task)`，再组装错误文本并调修复模型；修复调用前崩溃重载不会丢标记。
+- 测试：桩测用内存任务文件并在 `_agent_repair_step` 前抛异常模拟崩溃：修复调用发生时的落盘快照已含 `repair_attempted=true`，重新 `_agent_load_tasks` 后标记仍在。
+
+### 本轮自跑日志（2026-11-21）
+- `python3 -m compileall -q .`：`COMPILEALL_OK`（smart_launcher.py 第 9 行 `\,`、第 84 行 `\W` 两处既有 SyntaxWarning，非本轮引入）。
+- `python3 training/test_repair.py`：PASS（修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+两轮审查回归）。
+- `python3 training/test_chat_channel.py`：PASS（17 句分流 + free_chat 桩测全过）。
+- 本地规则四条：`打开记事本→open_app、现在几点→chat、关机→shutdown、音量调大→volume`，结果不变。

@@ -1665,6 +1665,7 @@ def _agent_loop(task: dict, gen: int):
             # 失败修复: 每步只给模型一次机会, 危险修正步必须走原来的确认护栏
             if not ok and not step.get("repair_attempted"):
                 step["repair_attempted"] = True
+                _agent_persist(task)
                 error_text = str(step.get("result") or "")
                 if extra:
                     error_text += f" | 数据: {extra}"
@@ -2071,7 +2072,7 @@ def _multi_open_plans(command):
 
 
 def _multi_open_say(results):
-    """把多目标启动结果拼成人话: 成功的并列, 失败的单独说清。"""
+    """把多目标启动结果拼成人话: 成功的并列, 未核实/失败的单独说清。"""
     ok, bad = [], []
     for item in results:
         if len(item) == 4:
@@ -2079,12 +2080,12 @@ def _multi_open_say(results):
         else:
             name, good, msg = item
             verify = "ok" if good else "fail"
-        if good and verify != "unverified":
-            ok.append(name)
-        elif good and verify == "unverified":
-            bad.append((name, msg or "已尝试启动，但未核实"))
-        else:
+        if not good or verify == "fail":
             bad.append((name, msg))
+        elif verify == "unverified":
+            bad.append((name, "已尝试，未核实" + (f"（{msg}）" if msg else "")))
+        else:
+            ok.append(name)
     parts = []
     if ok:
         parts.append("已为您启动" + "、".join(ok))
@@ -2092,6 +2093,11 @@ def _multi_open_say(results):
         hint = msg.split("。")[0] if msg else f"没找到{name}"
         parts.append(f"{name}没起来：{hint}")
     return "；".join(parts) if parts else "这几个我一个都没启动起来，Sir"
+
+
+def _open_app_verify_status(action_ok):
+    verify = getattr(_TL, "open_app_verify", "ok" if action_ok else "fail")
+    return "fail" if not action_ok and verify == "ok" else verify
 
 
 def _perform_plan(plan):
@@ -2179,7 +2185,6 @@ def _perform_plan(plan):
             name = str(args.get("name") or exe).strip()
             launch_ok = False
             fail_reason = ""
-            remaining = _remaining_process_count(exe)
             if not exe:
                 fail_reason = "缺少进程名"
             else:
@@ -2197,10 +2202,16 @@ def _perform_plan(plan):
                     fail_reason = str(exc)
                     print(f"[关闭程序失败] {exe}: {exc}")
             remaining_after = _remaining_process_count(exe)
+            if remaining_after is not None and remaining_after > 0:
+                fail_reason = (fail_reason + "；" if fail_reason else "") + \
+                              f"仍有 {remaining_after} 个同名进程在运行"
+                launch_ok = False
+            elif remaining_after is None:
+                fail_reason = (fail_reason + "；" if fail_reason else "") + \
+                              "同名进程剩余数无法核验, 未核实是否关闭"
             _TL.action_ok = bool(launch_ok)
             summary = say if launch_ok else (fail_reason or "关闭失败")
-            close_data = {"exe": exe, "name": name,
-                          "remaining": remaining_after if remaining_after is not None else remaining}
+            close_data = {"exe": exe, "name": name, "remaining": remaining_after}
             if fail_reason:
                 close_data["reason"] = fail_reason
             _TL.last_tool_text = _tool_data_text("close_app", {
@@ -2375,7 +2386,8 @@ def _perform_plan(plan):
         _TL.action_ok = False
         print(f"[执行失败] {action}: {e}")
     if action == "open_app":
-        verify = getattr(_TL, "open_app_verify", "ok" if bool(getattr(_TL, "action_ok", True)) else "fail")
+        action_ok = bool(getattr(_TL, "action_ok", True))
+        verify = _open_app_verify_status(action_ok)
         reason = getattr(_TL, "open_app_verify_reason", "")
         path = _opened_app_path(args)
         if verify == "unverified" and not path:
@@ -2667,7 +2679,9 @@ def _handle_command_inner(command, command_id):
                     print("[指令已被新指令取代，丢弃]")
                     return
                 msg = _perform_plan(p)
-                results.append((p["args"]["name"], bool(getattr(_TL, "action_ok", True)), msg))
+                action_ok = bool(getattr(_TL, "action_ok", True))
+                results.append((p["args"]["name"], action_ok, msg,
+                                _open_app_verify_status(action_ok)))
             say = _multi_open_say(results)
             speak(say)
             MEMORY.record_turn(command, {"action": "open_app",
