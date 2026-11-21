@@ -2080,10 +2080,10 @@ def _multi_open_say(results):
         else:
             name, good, msg = item
             verify = "ok" if good else "fail"
-        if not good or verify == "fail":
-            bad.append((name, msg))
-        elif verify == "unverified":
+        if verify == "unverified":
             bad.append((name, "已尝试，未核实" + (f"（{msg}）" if msg else "")))
+        elif not good or verify == "fail":
+            bad.append((name, msg))
         else:
             ok.append(name)
     parts = []

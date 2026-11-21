@@ -87,3 +87,8 @@
 - `python3 training/test_repair.py`：PASS（修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+两轮审查回归）。
 - `python3 training/test_chat_channel.py`：PASS（17 句分流 + free_chat 桩测全过）。
 - 本地规则四条：`打开记事本→open_app、现在几点→chat、关机→shutdown、音量调大→volume`，结果不变。
+
+## 第三轮审查修复
+
+- R3-1：`_multi_open_say` 把 `verify == "unverified"` 判定提到失败分支之前，good=False + unverified 也按「已尝试，未核实」口径播报，不再丢成纯失败；其他话术未动。
+- 测试：`training/test_repair.py` 新增构造 good=False + verify="unverified" 多开结果的桩测，断言汇总含「未核实」而非纯失败措辞；四条回归全过。

@@ -297,9 +297,22 @@ finally:
     jarvis._agent_repair_step = REAL_REPAIR_STEP
     jarvis._perform_plan = REAL_PERFORM
 
+# 7. 第三轮审查修复回归
+# 7a. R3-1: good=False + verify=unverified 先按「未核实」口径, 不落到纯失败分支
+say = jarvis._multi_open_say([
+    ("微信", False, "启动失败: 系统没能定位到微信的安装路径", "unverified"),
+    ("QQ", True, "已为您启动QQ", "ok"),
+])
+if "未核实" not in say or "已尝试" not in say:
+    fails.append(f"good=False+unverified 应按未核实口径播报: {say}")
+if "微信没起来：启动失败" in say:
+    fails.append(f"未核实项被当成纯失败播报: {say}")
+if "已为您启动QQ" not in say or "已为您启动微信" in say:
+    fails.append(f"多开汇总的成功项/未核实项口径不对: {say}")
+
 if fails:
     print("FAIL")
     for f in fails:
         print(" -", f)
     sys.exit(1)
-print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+两轮审查回归")
+print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+三轮审查回归")
