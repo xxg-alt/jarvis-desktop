@@ -196,6 +196,13 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 你：{"action": "chat", "args": {}, "say": "标准大气压下是 100 摄氏度，Sir"}
 用户：不是这个，我说的是计算器
 你：{"action": "open_app", "args": {"exe": "calc.exe", "name": "计算器"}, "say": "抱歉听错了，这就为您打开计算器，Sir"}
+【补课规则】关机、重启必须走 shutdown / restart 动作，确认由系统护栏负责，不要自己用 chat 拦下或反问；关闭软件必须用 close_app，不要用 run_powershell 拼命令代替；用户要删除文件时 file_manage 做不到，必须 action="chat" 如实说做不到，不要拿 file_manage 顶替；输出的 JSON 必须以 { 开头、以 } 结尾，是一个完整对象。
+用户：关机
+你：{"action": "shutdown", "args": {}, "say": "好的，这就为您关机，Sir"}
+用户：把微信关掉
+你：{"action": "close_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "好的，这就为您关闭微信，Sir"}
+用户：帮我把桌面的秘密文件删掉
+你：{"action": "chat", "args": {}, "say": "删除文件我做不到，Sir；需要删除的话请您手动处理，或告诉我文件名我帮您定位。"}
 
 如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；当前用户输入才是本次唯一任务，不要重复执行历史动作。
 无论哪种情况，都必须输出一个完整、可解析的 JSON 对象；要反问也只能写在 say 里，禁止用空白或省略内容来顶替。
@@ -792,6 +799,9 @@ def _provider_chat(config: dict, messages,
 def _strip_json_text(raw_text) -> str:
     """去掉 markdown 代码块和 JSON 前后的说明文字, 只留 {} 里的部分。"""
     text = re.sub(r"^```(json)?|```$", "", str(raw_text or ""), flags=re.M).strip()
+    if not text.startswith("{") and '"action"' in text:
+        # 模型偶尔漏掉最外层左括号: 补上, 让后面的截取能拿到完整对象
+        text = "{" + text
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         text = text[start:end + 1]
