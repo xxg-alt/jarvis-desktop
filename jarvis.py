@@ -155,6 +155,7 @@ folder 只能填四类：工作区、桌面、文档、下载，可带子目录�
 - 关机用 shutdown、重启用 restart、关软件用 close_app，都不许用 run_powershell 拼命令代替；这类危险步永远放在计划最后一步。
 - 计划阶段还不知道的信息（比如搜索结果里的具体链接）不许编造：先 web_search；后续步骤依赖搜索结果才能定的，就不要写那一步，改用一步 chat 说明“搜完请告诉我打开哪个”，或者只规划到搜索为止。
 - “缺素材”只适用于需要用户本人真实记录、又无从得知的事（如他上周具体做了什么）；用户已给内容或主题明确的写作任务，按通用结构成稿，不要只返回 chat。
+- 先查后写类任务（先查找/检查、再写文档）：write_file 的 content 只写清标题、结构和口径，不要编造将要查到的数据——执行时系统会把前面步骤的真实结果交给成稿环节，名单和数字都会照真实结果写进文件。
 
 【示例】
 目标：打开微信，再打开记事本
@@ -1272,6 +1273,63 @@ def _agent_generation_changed(gen: int) -> bool:
     return _AGENT_RUN.get("gen") != gen
 
 
+def _tool_data_text(action, res):
+    """把工具的结构化结果压成一段可传递的文本, 供后续步骤 (尤其写文件) 使用。
+
+    _perform_plan 平时只留下一句口头 summary, 具体名单/数字会丢;
+    这里把 data 里的 items 全量列出 (最多 50 项), 让"先查后写"能写对。
+    """
+    data = res.get("data") or {}
+    items = data.get("items") or []
+    if items:
+        names = []
+        for item in items[:50]:
+            if item.get("path"):
+                names.append(Path(str(item["path"])).name)
+            elif item.get("name"):
+                extra = f"({item['memory_mb']}MB)" if item.get("memory_mb") else ""
+                names.append(f"{item['name']}{extra}")
+        if names:
+            return f"共 {len(items)} 项: " + "、".join(names)
+    return ""
+
+
+_AGENT_COMPOSE_SYSTEM = (
+    "你是桌面助手贾维斯的文档成稿器。一个多步任务正在执行, 现在轮到写文件这一步。\n"
+    "前面步骤已经拿到了真实结果 (名单、数字、进程名都在【前面步骤的真实结果】里)。\n"
+    "你必须只用这些真实结果成稿: 名称和数字逐项照抄, 不许编造、不许用占位符、不许写“待补充”。\n"
+    "按【规划时的草稿/要求】的结构和口径写, 用中文, Markdown 格式, 简洁完整。只输出文件正文, 不要解释。"
+)
+
+
+def _agent_compose_write(goal, step, results_text):
+    """写文件步执行前, 用前面步骤的真实结果把 content 成稿。
+
+    - content 里有 {{结果}} 占位符: 直接把结果原文填进去 (确定性, 不调模型);
+    - 否则调大模型按真实结果重写; 失败就退回原草稿, 绝不阻塞执行。
+    """
+    args = step.get("args", {}) or {}
+    draft = str(args.get("content") or "")
+    if "{{结果}}" in draft or "{{上一步结果}}" in draft:
+        return draft.replace("{{上一步结果}}", results_text).replace("{{结果}}", results_text)
+    try:
+        from llm_brain import _provider_chat
+        user = (f"【任务目标】{goal}\n"
+                f"【要写的文件】{args.get('name', '文档')}\n"
+                f"【规划时的草稿/要求】\n{draft}\n"
+                f"【前面步骤的真实结果】\n{results_text}\n"
+                "请写出最终文件正文。")
+        text = _provider_chat(CONFIG, [
+            {"role": "system", "content": _AGENT_COMPOSE_SYSTEM},
+            {"role": "user", "content": user},
+        ], max_tokens=900)
+        text = str(text or "").strip()
+        return text or draft
+    except Exception as exc:
+        print(f"[Agent 成稿失败, 用原草稿] {exc}")
+        return draft
+
+
 def _agent_loop(task: dict, gen: int):
     """后台执行循环。每步之间检查 stop/skip, 遇 ask 步骤立刻挂起等确认。"""
     steps = task.get("steps", [])
@@ -1282,6 +1340,7 @@ def _agent_loop(task: dict, gen: int):
         try: ui_bridge.emit_state("ACTING")
         except Exception: pass
 
+    results_log = []
     try:
         for i, step in enumerate(steps):
             if _agent_generation_changed(gen) or _AGENT_RUN.get("stop"):
@@ -1308,6 +1367,13 @@ def _agent_loop(task: dict, gen: int):
                 _agent_persist(task)
                 continue
 
+            if step.get("action") == "write_file" and results_log:
+                # 传结果: 写文件步先按前面步骤的真实结果成稿, 再执行
+                composed = _agent_compose_write(task.get("goal", ""), step,
+                                                "\n".join(results_log))
+                if composed and composed != (step.get("args", {}) or {}).get("content"):
+                    step.setdefault("args", {})["content"] = composed
+
             _agent_notify(f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
             _TL.action_ok = True
             # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
@@ -1324,6 +1390,12 @@ def _agent_loop(task: dict, gen: int):
             finally:
                 _TL.agent_context = False
                 _TL.agent_external_ok = False
+            if step.get("status") == "done":
+                entry = f"第{i + 1}步({step.get('say') or step.get('action')}): {step.get('result', '')}"
+                extra = getattr(_TL, "last_tool_text", "")
+                if extra:
+                    entry += f" | 数据: {extra}"
+                results_log.append(entry)
             _agent_persist(task)
 
             if _AGENT_RUN.get("skip"):
@@ -1620,6 +1692,7 @@ def _perform_plan(plan):
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
     _TL.action_ok = True
+    _TL.last_tool_text = ""
 
     try:
         if action == "chat":
@@ -1694,6 +1767,7 @@ def _perform_plan(plan):
 
                 if res.get("ok"):
                     say = _format_tool_say(action, res)
+                    _TL.last_tool_text = _tool_data_text(action, res)
                 else:
                     say = str(res.get("summary") or "这个操作没有成功。")
                     _TL.action_ok = False
