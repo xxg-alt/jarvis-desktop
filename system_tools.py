@@ -108,8 +108,36 @@ def _fmt_time(ts: float) -> str:
 
 # ---------------------------------------------------------------- 工具 1：文件管家
 
-def file_manage(action, src=None, dst=None, pattern=None, folder=None) -> dict:
-    """列出 / 搜索 / 归类移动文件，全部限定在授权目录内。"""
+def _find_read_target(name: str) -> Path | None:
+    """把「读取 xxx」里的文件名定位到授权目录内的真实文件。"""
+    raw = str(name or "").strip().strip('"').strip("'")
+    if not raw:
+        return None
+    lowered = raw.lower()
+    # 带路径的交给 _inside 做授权校验
+    if "\\" in raw or "/" in raw:
+        p = _inside(raw)
+        return p if p and p.is_file() else None
+    # 不带路径: 先试三个授权目录根下, 再按深度找同名文件
+    for root in allowed_roots():
+        direct = root / raw
+        try:
+            if direct.is_file():
+                return direct
+        except OSError:
+            continue
+    try:
+        import rag_engine
+        for path in rag_engine._iter_doc_files():
+            if path.name.lower() == lowered:
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def file_manage(action, src=None, dst=None, pattern=None, folder=None, name=None) -> dict:
+    """列出 / 搜索 / 归类移动 / 读取文件，全部限定在授权目录内。"""
     act = str(action or "").strip().lower()
 
     if act == "list":
@@ -185,6 +213,28 @@ def file_manage(action, src=None, dst=None, pattern=None, folder=None) -> dict:
         return _result(True, f"找到 {len(hits)} 个匹配 {pat} 的文件。",
                        {"pattern": pat, "items": hits})
 
+    if act == "read":
+        path = _find_read_target(name)
+        if path is None:
+            return _result(False, "我在桌面、下载和文档里没找到这个文件；授权范围外的文件我也不读。")
+        if path.suffix.lower() not in (".txt", ".md", ".pdf", ".docx"):
+            return _result(False, f"{path.name} 这种格式我还读不了，目前支持 txt、md、pdf、docx。")
+        try:
+            from rag_engine import _parse_file
+            text = _parse_file(path)
+        except Exception as exc:
+            return _result(False, f"读取 {path.name} 失败了：{exc}")
+        text = str(text or "").strip()
+        if not text:
+            return _result(False, f"{path.name} 里没读出文字，可能是扫描件或空文件。")
+        head, truncated = text[:600], len(text) > 600
+        tail = "（内容较长，先念到这里）" if truncated else ""
+        return _result(
+            True,
+            f"{path.name} 共 {len(text)} 字。内容是：{head}{tail}",
+            {"path": str(path), "text": text, "truncated": truncated},
+        )
+
     if act == "move":
         src_path = _inside(src)
         if src_path is None:
@@ -234,7 +284,7 @@ def file_manage(action, src=None, dst=None, pattern=None, folder=None) -> dict:
             danger=True,
         )
 
-    return _result(False, "文件这块我只会「列目录、按名字找、归到某个目录」三件事。")
+    return _result(False, "文件这块我只会「列目录、按名字找、归类移动、读取内容」四件事。")
 
 
 # ---------------------------------------------------------- 工具 2：系统状态感知

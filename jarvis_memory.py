@@ -285,10 +285,37 @@ class JarvisMemory:
             relevant = items[-min(2, len(items)):]
         return relevant
 
+    @staticmethod
+    def _rag_entries(notes, learned, corrections, older):
+        """整理成 rag_engine.sync_memory 需要的 (kind, 检索文本, 原始item) 列表。"""
+        entries = []
+        for item in notes:
+            text = str(item.get("text", "")).strip()
+            if text:
+                entries.append(("note", text, item))
+        for item in learned:
+            text = str(item.get("command", "")).strip()
+            if text:
+                entries.append(("learned", text, item))
+        for item in corrections:
+            text = str(item.get("after", "")).strip()
+            if text:
+                entries.append(("correction", text, item))
+        for item in older:
+            text = str(item.get("text", "")).strip()
+            if len(text) >= 4:
+                who = "用户说：" if item.get("role") == "user" else "助手答："
+                entries.append(("conversation", who + text, item))
+        return entries
+
     def build_context(self, current_text: str) -> str:
-        """构建给大模型的最小必要记忆块；历史不会覆盖当前指令。"""
+        """构建给大模型的最小必要记忆块；历史不会覆盖当前指令。
+        RAG 语义检索可用时按意思召回，不可用时自动退回字面相似度。"""
         with self._lock:
-            conversations = list(self.data["conversations"][-10:])
+            all_convs = list(self.data["conversations"])
+            # 最近 10 轮已经由 llm_brain 的消息窗口原样带进上下文, 这里不再重复拼一遍:
+            # 重复既多花 token, 又会让每轮前缀都发生变化, 直接拉低缓存命中率
+            older = all_convs[:-10] if len(all_convs) > 10 else []
             notes = list(self.data["notes"])
             learned = list(self.data["learned"])
             corrections = list(self.data["corrections"])
@@ -298,28 +325,31 @@ class JarvisMemory:
             "历史仅用于理解指代、延续话题和学习用户纠正；当前用户输入才是本次唯一任务，"
             "不要重复执行历史动作。",
         ]
-        if conversations:
-            lines.append("【最近对话】")
-            for item in conversations:
-                role = "用户" if item.get("role") == "user" else "助手"
-                text = _clean_text(item.get("text", ""), 280)
-                action = _clean_text(item.get("action", ""), 60)
-                if role == "助手" and action:
-                    lines.append(f"{role}：{text}（执行动作 {action}）")
-                else:
-                    lines.append(f"{role}：{text}")
 
-        relevant_notes = self._select_relevant(
-            notes, current_text, lambda item: item.get("text", ""), limit=3
-        )
+        # 语义检索（RAG）：按意思召回，而不是字面撞词
+        rag_note = rag_learn = rag_corr = rag_conv = None
+        try:
+            import rag_engine
+            if rag_engine.sync_memory(self._rag_entries(notes, learned, corrections, older)):
+                rag_note = rag_engine.search_mem(current_text, kinds=("note",), top_k=3)
+                rag_learn = rag_engine.search_mem(current_text, kinds=("learned",), top_k=3)
+                rag_corr = rag_engine.search_mem(current_text, kinds=("correction",), top_k=3)
+                rag_conv = rag_engine.search_mem(current_text, kinds=("conversation",), top_k=1)
+        except Exception as exc:
+            print(f"[记忆] 语义检索不可用, 退回字面匹配: {exc}")
+
+        def _pick(rag_hits, items, getter, limit=3):
+            if rag_hits:
+                return [hit["item"] for hit in rag_hits]
+            return self._select_relevant(items, current_text, getter, limit=limit)
+
+        relevant_notes = _pick(rag_note, notes, lambda item: item.get("text", ""))
         if relevant_notes:
             lines.append("【用户明确要求记住的事】")
             for item in relevant_notes:
                 lines.append(f"- {_clean_text(item.get('text', ''), 400)}")
 
-        relevant_learned = self._select_relevant(
-            learned, current_text, lambda item: item.get("command", ""), limit=3
-        )
+        relevant_learned = _pick(rag_learn, learned, lambda item: item.get("command", ""))
         if relevant_learned:
             lines.append("【相似历史操作】")
             for item in relevant_learned:
@@ -329,9 +359,7 @@ class JarvisMemory:
                     f"参数 {_clean_text(item.get('args', ''), 250)}"
                 )
 
-        relevant_corrections = self._select_relevant(
-            corrections, current_text, lambda item: item.get("after", ""), limit=3
-        )
+        relevant_corrections = _pick(rag_corr, corrections, lambda item: item.get("after", ""))
         if relevant_corrections:
             lines.append("【用户纠正案例】")
             for item in relevant_corrections:
@@ -341,4 +369,17 @@ class JarvisMemory:
                     f"应执行 {_clean_text(item.get('action', ''), 60)}，"
                     f"参数 {_clean_text(item.get('args', ''), 250)}"
                 )
-        return "\n".join(lines)[:4200]
+
+        if rag_conv:
+            lines.append("【更早的相关对话】")
+            for hit in rag_conv:
+                item = hit["item"]
+                role = "用户" if item.get("role") == "user" else "助手"
+                text = _clean_text(item.get("text", ""), 220)
+                action = _clean_text(item.get("action", ""), 60)
+                if role == "助手" and action:
+                    lines.append(f"{role}：{text}（执行动作 {action}）")
+                else:
+                    lines.append(f"{role}：{text}")
+
+        return "\n".join(lines)[:2400]
