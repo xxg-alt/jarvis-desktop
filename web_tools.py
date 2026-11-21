@@ -30,6 +30,7 @@ _WARM_HOMES = {
 }
 _QUERY_CACHE = {}
 _CACHE_TTL = 600
+_ENGINE_FAILS = {}
 
 
 def _fetch_page(url, timeout=_SEARCH_TIMEOUT):
@@ -134,14 +135,18 @@ def web_search(query, limit=5):
     if hit and time.time() - hit[0] < _CACHE_TTL:
         return hit[1]
     for finder in (search_bing, search_so360, search_ddg):
+        if _ENGINE_FAILS.get(finder.__name__, 0) >= 2:
+            continue  # 熔断: 该源已连续失败, 多半被限流, 别再火上浇油
         try:
             found = finder(query, limit)
         except Exception as exc:
             print(f"[联网搜索] {finder.__name__} 失败: {exc}")
             found = []
         if found:
+            _ENGINE_FAILS[finder.__name__] = 0
             _QUERY_CACHE[key] = (time.time(), found)
             return found
+        _ENGINE_FAILS[finder.__name__] = _ENGINE_FAILS.get(finder.__name__, 0) + 1
     return []
 
 
@@ -180,7 +185,7 @@ def search_and_answer(query, config):
     parts = []
     for i, item in enumerate(results, 1):
         parts.append(f"[{i}] {item['title']}\n{item['url']}\n{item['snippet']}")
-    for item in results[:2]:
+    for item in results[:1]:
         body = fetch_text(item["url"])
         if body:
             parts.append(f"【网页正文: {item['title']}】\n{body}")

@@ -52,7 +52,7 @@ def main():
     passed = 0
     import time
     for case in cases:
-        time.sleep(6)  # 题目间隔, 避免搜索源被连查限流
+        time.sleep(25)  # 题目间隔, 避免搜索源被连查限流 (免费抓取的真实约束)
         answer = web_tools.search_and_answer(case["query"], cfg)
         ok, why = grade(case, answer)
         print(f"[{'PASS' if ok else 'FAIL'}] #{case['id']} ({case['type']}) {case['query']} -> {why}", flush=True)
