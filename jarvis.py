@@ -626,6 +626,120 @@ def _run(cmd, **kw):
         return
     subprocess.Popen(cmd, shell=isinstance(cmd, str), **kw)
 
+# ---------- 高危动作确认: 语音/文字/界面谁先答算谁 ----------
+# 旧实现的两个坑:
+#   1. confirm() 自己抢麦克风听 6 秒, 而主循环同时在收音 —— 两个识别器抢同一路输入;
+#   2. 守卫在业务线程里阻塞等, "确认"却被主循环当成下一条指令, 守卫始终听不到,
+#      最后超时按取消处理, 用户只看到"确认什么"。
+# 新做法: 守卫把"待确认"登记成模块级状态; 指令入口在拿 _RUN_LOCK 之前先问一句
+# "这是不是在回答守卫", 是就消费掉; 界面点击照旧生效, 两边谁先到算谁。
+GUARD_TTL = 60.0
+_GUARD_LOCK = threading.Lock()
+_GUARD = {"token": 0, "desc": "", "event": None, "answer": "", "ts": 0.0, "active": False}
+_GUARD_YES = ("确认", "确定", "确认执行", "确定执行", "好的", "好", "可以", "是的", "是",
+              "对", "嗯", "同意", "执行", "关吧", "继续", "没问题", "行", "y", "yes")
+_GUARD_NO = ("取消", "算了", "不用", "不要", "别", "不关", "停下", "停", "不做", "免了",
+             "不", "n", "no")
+_GUARD_PUNCT = re.compile(r"[。！？!?，,.、\s]")
+
+
+def _guard_begin(desc):
+    with _GUARD_LOCK:
+        _GUARD["token"] += 1
+        _GUARD.update(desc=str(desc or ""), event=threading.Event(),
+                      answer="", ts=time.time(), active=True)
+        return _GUARD["token"]
+
+
+def _guard_end(token):
+    with _GUARD_LOCK:
+        if _GUARD["token"] == token:
+            _GUARD["active"] = False
+            _GUARD["event"] = None
+
+
+def _guard_answer(text) -> bool:
+    """指令入口的守卫拦截: 这句话若是在回答"待确认", 消费掉并返回 True。"""
+    low = _GUARD_PUNCT.sub("", str(text or "")).lower()
+    if not low:
+        return False
+
+    def _hit(words):
+        # 精确命中, 或短句以该词开头 ("算了不要了" / "取消吧" 这类口语);
+        # 长句不算确认 —— "确认一下微信关了吗" 是问题, 不是回答
+        for w in words:
+            if low == w or (len(low) <= 6 and low.startswith(w)):
+                return True
+        return False
+
+    with _GUARD_LOCK:
+        if not _GUARD.get("active"):
+            return False
+        if time.time() - float(_GUARD.get("ts") or 0) > GUARD_TTL:
+            return False
+        if _hit(_GUARD_NO):
+            _GUARD["answer"] = "no"
+            handled = True
+        elif _hit(_GUARD_YES):
+            _GUARD["answer"] = "yes"
+            handled = True
+        else:
+            # 不是回答确认, 而是另一条指令: 按"取消"收尾, 这句话继续走正常流程。
+            # 否则守卫会一直占着 _RUN_LOCK, 用户得等满 60 秒才能干别的事。
+            _GUARD["answer"] = "no"
+            handled = False
+        event = _GUARD["event"]
+    # 界面上的确认框也一起收掉, 免得它继续挂着等 60 秒
+    if ui_bridge is not None:
+        try:
+            ui_bridge.resolve_guard(_GUARD["answer"] == "yes")
+        except Exception:
+            pass
+    if event is not None:
+        event.set()
+    if handled and _GUARD["answer"] == "yes":
+        speak("好，这就执行，Sir")
+    return handled
+
+
+def _guard_confirm(desc, timeout=GUARD_TTL) -> bool:
+    """等一个确认: 界面点击 / 语音或文字回答, 谁先到算谁。"""
+    token = _guard_begin(desc)
+    speak(f"即将{desc}。确认就说「确认」，取消就说「取消」，Sir")
+    ui_box = {"v": None}
+    ui_thread = None
+
+    def _ask_ui():
+        try:
+            ui_box["v"] = ui_bridge.request_guard_confirm(desc, timeout=timeout)
+        except Exception:
+            ui_box["v"] = None
+
+    if ui_bridge is not None:
+        ui_thread = threading.Thread(target=_ask_ui, name="jarvis-guard", daemon=True)
+        ui_thread.start()
+
+    deadline = time.time() + timeout
+    verdict = None
+    try:
+        while time.time() < deadline:
+            event = _GUARD.get("event")
+            if event is not None and event.wait(0.15):
+                verdict = _GUARD.get("answer") == "yes"
+                break
+            if ui_thread is not None and not ui_thread.is_alive():
+                if ui_box["v"] is not None:      # 界面在跑: 点了确认或超时
+                    verdict = bool(ui_box["v"])
+                    break
+                ui_thread = None                 # 没有界面: 继续等语音回答
+    finally:
+        _guard_end(token)
+    if verdict is None:
+        speak("等不到您的确认，这个操作我先不做了，Sir")
+        return False
+    return bool(verdict)
+
+
 def confirm(question):
     """危险动作二次确认: 优先语音, 失败退回键盘输入"""
     speak(question + "。请说确认, 或者在窗口里输入 y")
@@ -1969,15 +2083,8 @@ def execute_plan(plan, command_id=None):
             print(f"[dry-run] 危险动作 {action} 需要确认, 已跳过执行")
             return False
         desc = plan.get("guard_desc") or f"执行操作：{action}"
-        question = f"即将{desc}，确定要执行吗，Sir？"
-        verdict = None
-        if ui_bridge is not None:
-            try:
-                verdict = ui_bridge.request_guard_confirm(desc)
-            except Exception:
-                verdict = None
-        if verdict is None:
-            verdict = confirm(question)
+        # 语音/文字回答与界面点击并行等, 谁先到算谁 (详见 _guard_confirm 注释)
+        verdict = _guard_confirm(desc)
         if not verdict:
             speak("好的，已取消操作，Sir。")
             return False
@@ -2024,6 +2131,10 @@ def handle_command(command):
     # agent 任务在后台线程跑, 不占 _RUN_LOCK; 停/跳过这类插话要在这里直接吃掉,
     # 否则会被排队到任务结束才生效 (等于停不住)。
     if _agent_interrupt(command):
+        return
+    # 高危动作在等确认时, "确认/取消"必须先在这里被消费;
+    # 否则它会排到 _RUN_LOCK 后面, 表现就是"我确认了, 它却问我确认什么"。
+    if _guard_answer(command):
         return
     with _RUN_LOCK:
         _TL.command_id = command_id
