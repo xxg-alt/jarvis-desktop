@@ -151,7 +151,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 写文档/写内容存成文件（如“帮我写个周报”“把刚才的方案写成一个文档”“生成一份会议纪要”）：action="write_file"，args={"name": "文件名", "content": "完整的文件正文", "folder": "目标目录，可省略"}。content 里写完整内容，结构用 Markdown 标题和列表；不要把正文截短，也不要说“内容太长写不下”。name 用 .md 或 .txt 结尾；写 Word 文档用 .docx。不要用 write_file 执行代码或改配置。
   folder 只能填四类：工作区、桌面、文档、下载，可以带子目录（如 "下载\\报告"）。用户没说存哪就别写 folder（默认进工作区）；用户明确说存哪（“写到桌面的项目文档里”“存到下载里”），就按他的说法填，别自己改地方。用户给出别处的完整路径（如 "D:\\项目\\资料"）时原样填入，系统会单独向他确认。
 - 打开网址：action="open_url"，args={"url": "http(s)://..."}
-- 搜索：action="web_search"，args={"query": "搜索关键词"}
+- 搜索：action="web_search"，args={"query": "搜索关键词"}。系统会真联网检索并把带出处的答案直接朗读给用户，所以 say 只写垫话（如“我查一下”），不要在 say 里自己编答案；需要实时信息（天气、价格、新闻、最新版本）的问题一律走 web_search，不要凭记忆回答。
 - 音量：action="volume"，args={"mode": "up|down|mute"}
 - 截图：action="screenshot"；锁屏：action="lock"
 - 文件管理 action="file_manage"，只允许四种，且只能操作 桌面/下载/文档 三个目录，不能删除：

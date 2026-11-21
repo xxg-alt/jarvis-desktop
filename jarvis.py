@@ -1658,8 +1658,18 @@ def _perform_plan(plan):
             else:
                 say = "这个链接不是普通网址, 我只打开 http 或 https, Sir"
         elif action == "web_search":
-            from urllib.parse import quote
-            webbrowser.open("https://www.baidu.com/s?wd=" + quote(str(args.get("query", ""))))
+            query = str(args.get("query", "")).strip()
+            answered = ""
+            try:
+                from web_tools import search_and_answer
+                answered = search_and_answer(query, CONFIG)
+            except Exception as exc:
+                print(f"[联网搜索失败] {exc}")
+            if answered:
+                say = answered
+            else:
+                from urllib.parse import quote
+                webbrowser.open("https://www.baidu.com/s?wd=" + quote(query))
         elif action in ("file_manage", "inspect_system", "run_powershell"):
             # 第二步接入的三个真实系统工具：统一走 system_tools，结果再转成口吻
             try:

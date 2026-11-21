@@ -1,0 +1,137 @@
+# -*- coding: utf-8 -*-
+"""贾维斯真联网搜索工具 (训练科目: 真联网搜索)
+
+流程: 搜索引擎拿结果 -> 抓前几条网页正文 -> 交给大模型按出处回答。
+- 搜索源: Bing 国际版为主 (实测可直连、结果块稳定), DuckDuckGo HTML 兜底。
+- 全程只用 requests + 标准库, 不加新依赖; 任何一步失败都返回空, 由调用方
+  退回老行为 (打开百度搜索页), 绝不让主流程崩。
+- 回答纪律: 只依据抓到的内容, 带出处, 查不到就直说, 不编造。
+"""
+import html as html_lib
+import re
+from urllib.parse import quote, urlsplit
+
+import requests
+
+_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/126.0 Safari/537.36"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+}
+_SEARCH_TIMEOUT = 12
+_FETCH_TIMEOUT = 8
+_MAX_ANSWER_CHARS = 500
+
+
+def _clean(fragment):
+    text = re.sub(r"<[^>]+>", " ", fragment or "")
+    text = html_lib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def search_bing(query, limit=5):
+    url = "https://www.bing.com/search?q=" + quote(query)
+    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
+    if r.status_code != 200:
+        return []
+    results = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', r.text, re.S):
+        m = re.search(r'<h2>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not m:
+            continue
+        snippet_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.S)
+        results.append({
+            "url": html_lib.unescape(m.group(1)),
+            "title": _clean(m.group(2)),
+            "snippet": _clean(snippet_m.group(1)) if snippet_m else "",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def search_ddg(query, limit=5):
+    url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+    r = requests.get(url, headers=_HEADERS, timeout=_SEARCH_TIMEOUT)
+    if r.status_code != 200:
+        return []
+    results = []
+    for m in re.finditer(r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.S):
+        results.append({"url": html_lib.unescape(m.group(1)),
+                        "title": _clean(m.group(2)), "snippet": ""})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def web_search(query, limit=5):
+    """先 Bing 后 DDG, 谁先出结果用谁; 全失败返回空列表。"""
+    for finder in (search_bing, search_ddg):
+        try:
+            found = finder(query, limit)
+        except Exception as exc:
+            print(f"[联网搜索] {finder.__name__} 失败: {exc}")
+            found = []
+        if found:
+            return found
+    return []
+
+
+def fetch_text(url, limit=2500):
+    """抓网页正文纯文本 (去脚本/样式/标签), 失败返回空串。"""
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+        if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", "text/html"):
+            return ""
+        text = r.text
+    except Exception as exc:
+        print(f"[联网搜索] 抓取失败 {url}: {exc}")
+        return ""
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text, flags=re.S | re.I)
+    text = _clean(text)
+    return text[:limit]
+
+
+_WEB_SYSTEM = (
+    "你是桌面语音助手贾维斯的联网检索回答器。只依据用户消息里的【搜索结果】回答问题:\n"
+    "1. 用中文回答, 先给答案本身, 默认 1~3 句, 能朗读;\n"
+    "2. 涉及数字、日期、价格必须来自搜索结果, 结果里没有就直说没查到, 绝不编造;\n"
+    "3. 回答末尾带一句出处, 格式: (来源: 网站名或域名);\n"
+    "4. 搜索结果互相矛盾时, 优先更新、更权威的一条, 并说明有出入。"
+)
+
+
+def search_and_answer(query, config):
+    """搜 + 读 + 答一条龙。返回可直接朗读的答案; 搜不到返回空串。"""
+    query = str(query or "").strip()
+    if not query:
+        return ""
+    results = web_search(query)
+    if not results:
+        return ""
+    parts = []
+    for i, item in enumerate(results, 1):
+        parts.append(f"[{i}] {item['title']}\n{item['url']}\n{item['snippet']}")
+    for item in results[:2]:
+        body = fetch_text(item["url"])
+        if body:
+            parts.append(f"【网页正文: {item['title']}】\n{body}")
+    context = "\n\n".join(parts)[:7000]
+    from llm_brain import _provider_chat, _LlmError
+    messages = [
+        {"role": "system", "content": _WEB_SYSTEM},
+        {"role": "user", "content": f"【问题】{query}\n\n【搜索结果】\n{context}"},
+    ]
+    try:
+        answer = _provider_chat(config, messages, max_tokens=600)
+    except _LlmError as exc:
+        print(f"[联网搜索] 模型回答失败: {exc}")
+        return ""
+    answer = re.sub(r"\s+", " ", str(answer or "")).strip()
+    if not answer:
+        return ""
+    if "来源" not in answer:
+        host = urlsplit(results[0]["url"]).netloc or results[0]["title"]
+        answer += f" (来源: {host})"
+    return answer[:_MAX_ANSWER_CHARS]
