@@ -1801,6 +1801,73 @@ def _format_tool_say(action, res):
     return summary
 
 
+_APP_SPLIT_RE = re.compile(r"(?:以及|还有|和|、|与|跟|＋|\+|,|，)")
+_APP_BAD_IN_PART = ("打开", "启动", "运行", "帮我", "帮忙", "那个", "这个", "昨天", "明天",
+                    "说的", "一下", "请", "顺便")
+_MULTI_OPEN_HEAD_RE = re.compile(
+    r"^(?:请|帮我|帮忙|麻烦|给我)?(?:同时|一起|分别|都|依次)?(?:打开|启动|运行|开)(?:一下|下)?"
+)
+
+
+def _split_app_targets(text):
+    """"微信和QQ" -> ["微信", "QQ"]; 不是并列目标就返回 []。
+
+    为什么要在执行层做: "同时打开A和B" 是并列目标, 但 open_app 只收一个名字,
+    模型会把整串"微信和QQ"塞进 name, 启动器按整串去开始菜单找, 必然找不到 ——
+    这就是"它说桌面没有这个应用"的直接原因。拆开这一层不依赖模型是否听话。
+    """
+    s = str(text or "").strip().strip("\"'“”‘’")
+    if not s:
+        return []
+    parts = [p.strip(" 的。，,、") for p in _APP_SPLIT_RE.split(s)]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return []
+    # 长句 / 路径 / 带动作词或指代词的, 一律不拆: "帮我打开那个昨天说的微信和QQ" 不是并列目标
+    if any(len(p) > 12 or "/" in p or "\\" in p or any(b in p for b in _APP_BAD_IN_PART)
+           for p in parts):
+        return []
+    # 全是文档 或 全不是文档才拆; 混着(一个软件一个文档)交给单目标逻辑按文档兜底
+    docs = [_looks_like_document(p) for p in parts]
+    if any(docs) and not all(docs):
+        return []
+    return parts
+
+
+def _multi_open_plans(command):
+    """'同时打开微信和QQ' -> 两条 open_app 计划。
+
+    本地规则 parse_command 遇到并列目标只会认第一个(实测 "同时打开微信和QQ" 只开了微信),
+    所以并列句必须在这一层先截住, 既补全目标, 又不消耗模型 token。
+    """
+    s = str(command or "").strip().strip("。！？!?")
+    if not s or not _APP_SPLIT_RE.search(s):
+        return None
+    compact = s.replace(" ", "")
+    m = _MULTI_OPEN_HEAD_RE.match(compact)
+    if not m:
+        return None
+    rest = compact[m.end():].strip(" 的，,、")
+    parts = _split_app_targets(rest)
+    if len(parts) < 2:
+        return None
+    return [{"action": "open_app", "args": {"exe": p, "name": p}, "say": f"打开{p}"}
+            for p in parts]
+
+
+def _multi_open_say(results):
+    """把多目标启动结果拼成人话: 成功的并列, 失败的单独说清。"""
+    ok = [name for name, good, _msg in results if good]
+    bad = [(name, msg) for name, good, msg in results if not good]
+    parts = []
+    if ok:
+        parts.append("已为您启动" + "、".join(ok))
+    for name, msg in bad:
+        hint = msg.split("。")[0] if msg else f"没找到{name}"
+        parts.append(f"{name}没起来：{hint}")
+    return "；".join(parts) if parts else "这几个我一个都没启动起来，Sir"
+
+
 def _perform_plan(plan):
     """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。
 
@@ -1820,9 +1887,23 @@ def _perform_plan(plan):
             from smart_launcher import smart_launch_app
             app_target = str(args.get("exe", "") or "")
             app_name = str(args.get("name", "") or app_target)
+            # 并列目标先拆: "微信和QQ" 必须变成两次启动, 整串丢给启动器一定找不到
+            names = _split_app_targets(app_name) or _split_app_targets(app_target)
+            if len(names) > 1:
+                results = []
+                for nm in names:
+                    if _looks_like_document(nm):
+                        good, msg = _open_document(nm)
+                    else:
+                        good, msg = smart_launch_app(nm, nm)
+                        if not good and _document_candidates(nm):
+                            good, msg = _open_document(nm)
+                    results.append((nm, good, msg))
+                say = _multi_open_say(results)
+                _TL.action_ok = all(good for _n, good, _m in results)
             # 模型常把"打开某某文本"塞进 open_app: 目标像文档就按文档开,
             # 否则找 exe; 找不到时再用文档兜一次, 别一上来就说"定位不到安装路径"
-            if _looks_like_document(app_target) or _looks_like_document(app_name):
+            elif _looks_like_document(app_target) or _looks_like_document(app_name):
                 success, say = _open_document(app_name or app_target)
             else:
                 success, say = smart_launch_app(app_target, app_name)
@@ -2267,6 +2348,29 @@ def _handle_command_inner(command, command_id):
                 print(f"[退出回调失败] {e}")
             return
         raise SystemExit
+
+    # 并列打开: "同时打开微信和QQ"。本地规则只认第一个, 模型又会把整串当软件名,
+    # 所以这里先按目标拆分, 逐个启动, 最后一句汇总(哪个没起来要点名)。
+    multi = _multi_open_plans(command)
+    if multi:
+        if ui_bridge is not None:
+            ui_bridge.emit_state("ACTING")
+        results = []
+        try:
+            for p in multi:
+                if not _command_is_current(command_id):
+                    print("[指令已被新指令取代，丢弃]")
+                    return
+                msg = _perform_plan(p)
+                results.append((p["args"]["name"], bool(getattr(_TL, "action_ok", True)), msg))
+            say = _multi_open_say(results)
+            speak(say)
+            MEMORY.record_turn(command, {"action": "open_app",
+                                         "args": {"names": [r[0] for r in results]}}, source="local")
+        finally:
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+        return
 
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
     plan = parse_command(command)
