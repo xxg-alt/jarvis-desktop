@@ -1418,8 +1418,19 @@ def _tool_data_text(action, res):
     """
     res = res if isinstance(res, dict) else {}
     data = res.get("data") if isinstance(res.get("data"), dict) else {}
-    ok = bool(res.get("ok", True))
-    head = f"{action}: 成功={'是' if ok else '否'}"
+    has_ok = "ok" in res
+    ok_val = res.get("ok")
+    if not has_ok:
+        ok_text = "无法核验"
+    elif ok_val is True or ok_val == "ok":
+        ok_text = "是"
+    elif ok_val is False or ok_val == "fail":
+        ok_text = "否"
+    elif ok_val == "unverified":
+        ok_text = "无法核验"
+    else:
+        ok_text = "无法核验" if not has_ok else ("是" if bool(ok_val) else "否")
+    head = f"{action}: 成功={ok_text}"
     summary = str(res.get("summary") or "").strip()[:300]
 
     if action == "open_app":
@@ -1429,7 +1440,10 @@ def _tool_data_text(action, res):
         if data.get("exe"):
             parts.append(f"启动名={data['exe']}")
         if data.get("path"):
-            parts.append(f"实际路径={data['path']}")
+            path_label = "尝试路径" if ok_text == "无法核验" else "实际路径"
+            parts.append(f"{path_label}={data['path']}")
+        if data.get("verify_reason"):
+            parts.append(f"原因={data['verify_reason']}")
         if summary:
             parts.append(f"结果={summary}")
         return "；".join(parts)
@@ -1444,6 +1458,8 @@ def _tool_data_text(action, res):
         if "remaining" in data:
             remaining = data.get("remaining")
             parts.append("同名进程剩余=" + ("无法核验" if remaining is None else f"{remaining} 个"))
+        if data.get("reason"):
+            parts.append(f"原因={data['reason']}")
         if summary:
             parts.append(f"结果={summary}")
         return "；".join(parts)
@@ -2056,8 +2072,19 @@ def _multi_open_plans(command):
 
 def _multi_open_say(results):
     """把多目标启动结果拼成人话: 成功的并列, 失败的单独说清。"""
-    ok = [name for name, good, _msg in results if good]
-    bad = [(name, msg) for name, good, msg in results if not good]
+    ok, bad = [], []
+    for item in results:
+        if len(item) == 4:
+            name, good, msg, verify = item
+        else:
+            name, good, msg = item
+            verify = "ok" if good else "fail"
+        if good and verify != "unverified":
+            ok.append(name)
+        elif good and verify == "unverified":
+            bad.append((name, msg or "已尝试启动，但未核实"))
+        else:
+            bad.append((name, msg))
     parts = []
     if ok:
         parts.append("已为您启动" + "、".join(ok))
@@ -2078,6 +2105,9 @@ def _perform_plan(plan):
     say = plan.get("say", "好的")
     _TL.action_ok = True
     _TL.last_tool_text = ""
+    _TL.open_app_verify = "ok"
+    _TL.open_app_verify_reason = ""
+    _TL.open_app_actual_is_doc = False
 
     try:
         if action == "chat":
@@ -2086,6 +2116,9 @@ def _perform_plan(plan):
             from smart_launcher import smart_launch_app
             app_target = str(args.get("exe", "") or "")
             app_name = str(args.get("name", "") or app_target)
+            verify = "ok"
+            verify_reason = ""
+            actual_is_doc = False
             # 并列目标先拆: "微信和QQ" 必须变成两次启动, 整串丢给启动器一定找不到
             names = _split_app_targets(app_name) or _split_app_targets(app_target)
             if len(names) > 1:
@@ -2093,24 +2126,41 @@ def _perform_plan(plan):
                 for nm in names:
                     if _looks_like_document(nm):
                         good, msg = _open_document(nm)
+                        v = "ok" if good else "fail"
+                        reason = ""
                     else:
-                        good, msg = smart_launch_app(nm, nm)
-                        if not good and _document_candidates(nm):
-                            good, msg = _open_document(nm)
-                    results.append((nm, good, msg))
+                        good, msg, v = smart_launch_app(nm, nm)
+                        reason = "仅尝试启动，未核实" if v == "unverified" else ""
+                        if (not good or v == "unverified") and _document_candidates(nm):
+                            dgood, dmsg = _open_document(nm)
+                            if dgood:
+                                good, msg, v, reason = True, dmsg, "unverified", "实际打开的是同名文档"
+                    results.append((nm, good, msg, v))
                 say = _multi_open_say(results)
-                _TL.action_ok = all(good for _n, good, _m in results)
+                verify = "ok" if all(v == "ok" for _n, _g, _m, v in results) else ("fail" if any(v == "fail" for _n, _g, _m, v in results) else "unverified")
+                _TL.action_ok = (verify == "ok")
             # 模型常把"打开某某文本"塞进 open_app: 目标像文档就按文档开,
             # 否则找 exe; 找不到时再用文档兜一次, 别一上来就说"定位不到安装路径"
             elif _looks_like_document(app_target) or _looks_like_document(app_name):
                 success, say = _open_document(app_name or app_target)
+                verify = "ok" if success else "fail"
             else:
-                success, say = smart_launch_app(app_target, app_name)
-                if not success and _document_candidates(app_name or app_target):
-                    success, say = _open_document(app_name or app_target)
+                success, say, verify = smart_launch_app(app_target, app_name)
+                if verify == "unverified":
+                    verify_reason = "仅尝试启动，未核实"
+                if (not success or verify == "unverified") and _document_candidates(app_name or app_target):
+                    dgood, dmsg = _open_document(app_name or app_target)
+                    if dgood:
+                        success, say = dgood, dmsg
+                        verify = "unverified"
+                        verify_reason = "实际打开的是同名文档"
+                        actual_is_doc = True
             if len(names) <= 1 and getattr(_TL, "agent_context", False):
-                # agent 步骤要靠成败位判断是否需要修复; 直接指令的播报行为保持不变
-                _TL.action_ok = bool(success)
+                # agent 步骤要靠成败位判断是否需要修复; 无法核验也不能当成功
+                _TL.action_ok = (verify == "ok")
+            _TL.open_app_verify = verify
+            _TL.open_app_verify_reason = verify_reason
+            _TL.open_app_actual_is_doc = actual_is_doc
         elif action == "open_file":
             success, say = _open_document(args.get("name") or args.get("exe") or "")
         elif action == "write_file":
@@ -2125,20 +2175,38 @@ def _perform_plan(plan):
             say = msg
             _TL.action_ok = bool(success)
         elif action == "close_app":
-            exe = str(args.get("exe") or "")
-            name = str(args.get("name") or exe)
-            try:
-                _run(["taskkill", "/im", exe, "/f"])
-                launch_ok = True
-            except Exception as exc:
-                launch_ok = False
-                print(f"[关闭程序失败] {exe}: {exc}")
+            exe = str(args.get("exe") or "").strip()
+            name = str(args.get("name") or exe).strip()
+            launch_ok = False
+            fail_reason = ""
+            remaining = _remaining_process_count(exe)
+            if not exe:
+                fail_reason = "缺少进程名"
+            else:
+                try:
+                    proc = subprocess.run(["taskkill", "/im", exe, "/f"],
+                                          capture_output=True, text=True)
+                    rc = proc.returncode
+                    if rc == 0:
+                        launch_ok = True
+                    else:
+                        err = (proc.stderr or proc.stdout or "").strip()
+                        fail_reason = f"taskkill返回码{rc}" + (f": {err[:120]}" if err else "")
+                        print(f"[关闭程序失败] {exe}: {fail_reason}")
+                except Exception as exc:
+                    fail_reason = str(exc)
+                    print(f"[关闭程序失败] {exe}: {exc}")
+            remaining_after = _remaining_process_count(exe)
             _TL.action_ok = bool(launch_ok)
+            summary = say if launch_ok else (fail_reason or "关闭失败")
+            close_data = {"exe": exe, "name": name,
+                          "remaining": remaining_after if remaining_after is not None else remaining}
+            if fail_reason:
+                close_data["reason"] = fail_reason
             _TL.last_tool_text = _tool_data_text("close_app", {
                 "ok": launch_ok,
-                "summary": say,
-                "data": {"exe": exe, "name": name,
-                         "remaining": _remaining_process_count(exe)},
+                "summary": summary,
+                "data": close_data,
             })
         elif action == "open_url":
             url = str(args.get("url", "")).strip()
@@ -2166,6 +2234,12 @@ def _perform_plan(plan):
             except Exception as exc:
                 print(f"[系统工具不可用] {exc}")
                 say = "系统工具箱没加载上，这个动作暂时做不了。"
+                _TL.action_ok = False
+                _TL.last_tool_text = _tool_data_text(action, {
+                    "ok": False,
+                    "summary": f"系统工具不可用: {exc}",
+                    "data": {"action": action, "reason": f"系统工具不可用: {exc}"},
+                })
             else:
                 if action == "file_manage":
                     res = file_manage(
@@ -2187,6 +2261,7 @@ def _perform_plan(plan):
                 else:
                     say = str(res.get("summary") or "这个操作没有成功。")
                     _TL.action_ok = False
+                    _TL.last_tool_text = _tool_data_text(action, res)
         elif action == "ask_doc":
             # 文档问答: 本地语义检索最相关的 2~3 段, 再让大模型只依据原文回答
             query = str(args.get("query", "")).strip()
@@ -2300,11 +2375,18 @@ def _perform_plan(plan):
         _TL.action_ok = False
         print(f"[执行失败] {action}: {e}")
     if action == "open_app":
+        verify = getattr(_TL, "open_app_verify", "ok" if bool(getattr(_TL, "action_ok", True)) else "fail")
+        reason = getattr(_TL, "open_app_verify_reason", "")
+        path = _opened_app_path(args)
+        if verify == "unverified" and not path:
+            path = str(args.get("exe") or args.get("name") or "")
+        data = {"exe": args.get("exe") or "", "name": args.get("name") or "", "path": path}
+        if reason:
+            data["verify_reason"] = reason
         _TL.last_tool_text = _tool_data_text("open_app", {
-            "ok": bool(getattr(_TL, "action_ok", True)),
+            "ok": verify,
             "summary": say,
-            "data": {"exe": args.get("exe") or "", "name": args.get("name") or "",
-                     "path": _opened_app_path(args)},
+            "data": data,
         })
     return say
 

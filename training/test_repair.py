@@ -6,6 +6,7 @@ sys.path.insert(0, "/data/workspace/jarvis-desktop")
 import jarvis
 import llm_brain
 
+REAL_PERFORM = jarvis._perform_plan
 fails = []
 calls = []          # _perform_plan 实际收到的动作
 chat_calls = []     # 假 _provider_chat 被叫了几次
@@ -118,9 +119,89 @@ for key, text in zip(("成功", "目标", "条目数", "模式"), texts):
 if "实际路径" not in texts[0] or "操作后存在" not in texts[2]:
     fails.append(f"路径/存在性回读缺失: {texts[0]} | {texts[2]}")
 
+# 5. 审查修复轮回归
+jarvis._perform_plan = REAL_PERFORM
+import io, contextlib, builtins, types, subprocess as _subprocess
+
+# 5a. taskkill 非零退出 -> close_app 失败
+_real_run = _subprocess.run
+class _R:
+    def __init__(self, rc=1, out="", err="not found"):
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = err
+try:
+    _subprocess.run = lambda *a, **k: _R(1, "", "not found")
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    say = jarvis._perform_plan({"action":"close_app","args":{"exe":"Nope.exe","name":"Nope"},"say":"关掉"})
+    if jarvis._TL.action_ok is not False:
+        fails.append(f"taskkill非零退出应失败: action_ok={jarvis._TL.action_ok}")
+    if "成功=否" not in jarvis._TL.last_tool_text:
+        fails.append(f"close_app失败回读缺成功=否: {jarvis._TL.last_tool_text}")
+    if "剩余" not in jarvis._TL.last_tool_text and "无法核验" not in jarvis._TL.last_tool_text:
+        fails.append(f"close_app回读应保留剩余/无法核验语义: {jarvis._TL.last_tool_text}")
+finally:
+    _subprocess.run = _real_run
+
+# 5b. system_tools 导入失败 -> action_ok False 且有失败回读
+_real_import = builtins.__import__
+def _fake_import(name, *a, **k):
+    if name == "system_tools":
+        raise ImportError("boom")
+    return _real_import(name, *a, **k)
+try:
+    builtins.__import__ = _fake_import
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"file_manage","args":{"action":"list","folder":"下载"},"say":"列一下"})
+    if jarvis._TL.action_ok is not False:
+        fails.append(f"system_tools导入失败应置action_ok=False: {jarvis._TL.action_ok}")
+    if "成功=否" not in jarvis._TL.last_tool_text or "系统工具不可用" not in jarvis._TL.last_tool_text:
+        fails.append(f"导入失败回读缺失败信息: {jarvis._TL.last_tool_text}")
+finally:
+    builtins.__import__ = _real_import
+
+# 5c. 回退开文档/仅尝试 -> 回读含无法核验且不含成功=是
+import smart_launcher
+_real_smart = smart_launcher.smart_launch_app
+_real_doc_cands = jarvis._document_candidates
+_real_open_doc = jarvis._open_document
+try:
+    smart_launcher.smart_launch_app = lambda t, n: (True, f"已尝试为您启动{n}", "unverified")
+    jarvis._document_candidates = lambda q: ["dummy.txt"]
+    jarvis._open_document = lambda name: (True, "已打开dummy.txt")
+    jarvis._TL.agent_context = True
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"open_app","args":{"exe":"WeChat.exe","name":"微信"},"say":"打开微信"})
+    text = jarvis._TL.last_tool_text
+    if "无法核验" not in text:
+        fails.append(f"回退开文档应回读无法核验: {text}")
+    if "成功=是" in text:
+        fails.append(f"回退开文档不应回读成功=是: {text}")
+    # 仅尝试启动
+    jarvis._document_candidates = lambda q: []
+    jarvis._TL.action_ok = True
+    jarvis._TL.last_tool_text = ""
+    jarvis._perform_plan({"action":"open_app","args":{"exe":"Mystery.exe","name":"Mystery"},"say":"打开"})
+    text2 = jarvis._TL.last_tool_text
+    if "无法核验" not in text2 or "成功=是" in text2:
+        fails.append(f"仅尝试启动回读应为无法核验: {text2}")
+finally:
+    smart_launcher.smart_launch_app = _real_smart
+    jarvis._document_candidates = _real_doc_cands
+    jarvis._open_document = _real_open_doc
+    jarvis._TL.agent_context = False
+
+# 5d. res 缺 ok -> 回读为无法核验
+text = jarvis._tool_data_text("file_manage", {"summary":"3项","data":{"action":"list","folder":"下载","total":3,"items":[]}})
+if "无法核验" not in text or "成功=是" in text or "成功=否" in text:
+    fails.append(f"缺ok应回读无法核验: {text}")
+
 if fails:
     print("FAIL")
     for f in fails:
         print(" -", f)
     sys.exit(1)
-print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚")
+print("PASS: 修复最多一次、危险修正步走护栏、失败如实记录、结果回读加厚+审查回归")
