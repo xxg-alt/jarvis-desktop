@@ -44,6 +44,9 @@ def grade(case, steps):
         return False, f"第一步期望 {case['first_in']} 之一, 实际 {actions[0]}"
     if case.get("seq") and not is_subseq(case["seq"], actions):
         return False, f"期望顺序 {case['seq']}, 实际 {actions}"
+    if case.get("second_in"):
+        if len(actions) < 2 or actions[1] not in case["second_in"]:
+            return False, f"第二步期望 {case['second_in']} 之一, 实际 {actions}"
     for bad in case.get("forbid") or []:
         if bad in actions:
             return False, f"不该出现 {bad}, 实际 {actions}"
