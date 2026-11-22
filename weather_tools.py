@@ -10,6 +10,7 @@ import requests
 
 _UA = {"User-Agent": "jarvis-weather/1.0"}
 _TIMEOUT = 8
+_CST = datetime.timezone(datetime.timedelta(hours=8))
 
 _WMO = {
     0: "晴",
@@ -123,8 +124,12 @@ def _day_label(offset: int) -> str:
     return {0: "今天", 1: "明天", 2: "后天"}.get(offset, "今天")
 
 
+def _today_cn():
+    return datetime.datetime.now(_CST).date()
+
+
 def _target_date(offset: int):
-    return datetime.date.today() + datetime.timedelta(days=offset)
+    return _today_cn() + datetime.timedelta(days=offset)
 
 
 def _fmt_date(d) -> str:

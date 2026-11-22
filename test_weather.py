@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, "/data/workspace/jarvis-desktop")
 
 import datetime
+import re
 
 import weather_tools
 
@@ -26,12 +27,19 @@ class _Resp:
         return self._data
 
 
+_CST = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _today_cn():
+    return datetime.datetime.now(_CST).date()
+
+
 def _tomorrow():
-    return (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+    return (_today_cn() + datetime.timedelta(days=1)).isoformat()
 
 
 def _today():
-    return datetime.date.today().isoformat()
+    return _today_cn().isoformat()
 
 
 def main():
@@ -63,11 +71,13 @@ def main():
         for key in ("景德镇", "明天", "24", "14", "40%", "Open-Meteo"):
             if key not in ans:
                 fails.append(f"明天查询缺少 {key}: {ans}")
-        if _tomorrow()[5:7].lstrip("0") not in ans:
-            # 日期格式 M月D日
-            t = datetime.date.today() + datetime.timedelta(days=1)
-            if f"{t.month}月{t.day}日" not in ans:
-                fails.append(f"明天查询缺少日期: {ans}")
+        expected = _today_cn() + datetime.timedelta(days=1)
+        printed = re.search(r"（(\d+)月(\d+)日）", ans)
+        if not printed or (int(printed.group(1)), int(printed.group(2))) != (
+            expected.month,
+            expected.day,
+        ):
+            fails.append(f"明天回答日期应为 UTC+8 明天 {expected.month}月{expected.day}日: {ans}")
 
         # 2. 今天：北京今天天气
         def fake_get_today(url, params=None, headers=None, timeout=None):
