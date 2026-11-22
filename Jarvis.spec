@@ -68,7 +68,7 @@ a = Analysis(
                    "huggingface_hub", "ui_bridge", "capsule", "hud_overlay",
                    "web_capsule", "web_fullscreen", "lyric_subtitle",
                    "audio_device", "diagnostics", "system_tools", "proc_tree",
-                   "rag_engine", "web_tools", "onnxruntime", "pypdf", "docx"] + winrt_hidden + fw_hidden + wv_hidden,
+                   "rag_engine", "web_tools", "agent_core", "onnxruntime", "pypdf", "docx"] + winrt_hidden + fw_hidden + wv_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
