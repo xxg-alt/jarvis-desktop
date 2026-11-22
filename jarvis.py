@@ -75,6 +75,8 @@ def load_config():
         # auto = 优先本地 whisper(中英文都准) -> 系统引擎 -> Vosk
         "stt_engine": "auto",
         "whisper_model": "small",
+        # 截图落盘目录; 空 = 用默认 图片\贾维斯截图 (可由"以后截图放到工作区"这类指令改)
+        "screenshot_dir": "",
         "gemini_model": "gemini-flash-latest",
         "apps": {
             "记事本": "notepad.exe", "计算器": "calc.exe", "画图": "mspaint.exe",
@@ -119,6 +121,31 @@ def load_config():
 
 load_env()
 CONFIG = load_config()
+
+
+def save_user_config(updates: dict) -> bool:
+    """把用户设置写回 %APPDATA%\\Jarvis\\config.json (只合并给出的键, 不覆盖整份)。
+
+    为什么要单独一个函数: 以前没有任何"运行时改设置"的入口, 模型遇到
+    "以后截图放到哪" 这种请求只能编一个 write_file 文档来搪塞。
+    """
+    try:
+        existing = {}
+        if USER_CFG_FILE.exists():
+            raw = USER_CFG_FILE.read_text(encoding="utf-8")
+            existing = json.loads(raw) if raw.strip() else {}
+            if not isinstance(existing, dict):
+                existing = {}
+        existing.update({k: v for k, v in (updates or {}).items()})
+        USER_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USER_CFG_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception as exc:
+        print(f"[保存设置失败] {exc}")
+        return False
+
+
 if ui_bridge is not None:
     try:
         ui_bridge.update_flags(
@@ -930,6 +957,7 @@ AGENT_SCOPE_ASK = agent_core.SCOPE_ASK          # 危险: shutdown, restart, clo
 
 _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
                        "web_search", "search_file", "ask_doc", "screenshot", "lock",
+                       "set_screenshot_dir",
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
 _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
@@ -1760,6 +1788,33 @@ def _parse_rules(text):
     if "锁屏" in t or "锁定屏幕" in t:
         return {"action": "lock", "say": "已锁屏"}
 
+    # 截图保存目录: 省略宾语的续问 "能不能放到你的工作区内"(上一句就在问截图)
+    #   只认 授权别名/盘符路径, 且句子里没有"文档/文件/报告"这类宾语, 免得把
+    #   "把报告存到桌面" 抢成"改截图目录"。
+    if (any(w in t for w in ("能不能", "可不可以", "可以吗", "以后", "默认", "帮我"))
+            and any(w in t for w in ("放到", "存到", "保存到", "改到", "移到"))
+            and not any(w in t for w in ("文档", "文件", "周报", "报告", "清单", "总结",
+                                         "写", "生成", "表格", "图片", "照片"))):
+        m_b = re.search(r"(?:放到|存到|保存到|改到|移到)(.+)", raw)
+        cand = m_b.group(1).strip() if m_b else ""
+        cand = re.sub(r"^(?:你的|我的|我们的|咱的)", "", cand).strip()
+        cand = re.sub(r"(?:里面|里|内|中|文件夹|目录|吧|好吗|可以吗)+$", "", cand).strip()
+        aliases = [a for _n, aa in _WRITE_ROOT_ALIASES for a in aa]
+        if cand and (cand in aliases or re.match(r"^[A-Za-z]:\\", cand)):
+            return {"action": "set_screenshot_dir", "args": {"dir": cand},
+                    "say": "好，我把截图目录改到那儿"}
+
+    # 截图保存目录 (必须排在"截图"之前, 否则会被当成"再截一张")
+    #   "以后截图都放到工作区" / "把截图存到 D:\shots" / "能不能把截图放到另一个文件夹"
+    if ("截图" in t or "截屏" in t) and any(w in t for w in (
+            "放到", "放回", "存到", "保存到", "改到", "移到", "存进")):
+        m_t = re.search(r"(?:放到|放回|存到|保存到|改到|移到|存进)(.+)", raw)
+        target = m_t.group(1).strip() if m_t else ""
+        target = re.sub(r"^(?:你的|我的|我们的|咱的)", "", target).strip()
+        target = re.sub(r"(?:里面|里|文件夹|目录|吧|好吗|可以吗|行吗|了|去吧)+$", "", target).strip()
+        return {"action": "set_screenshot_dir", "args": {"dir": target},
+                "say": "好，我把截图目录改到那儿"}
+
     # 截图 (含口语"截个图")
     if "截图" in t or "截屏" in t or "截个图" in t:
         return {"action": "screenshot", "say": "已截图, 保存在图片文件夹的贾维斯截图里"}
@@ -1918,8 +1973,11 @@ _STATE_ACTIONS = {
     "screenshot", "shutdown", "restart", "lock", "volume", "brightness",
     "open_app", "open_file", "open_url", "close_app", "file_manage",
     "file_delete", "write_file", "run_powershell", "web_search", "play_music",
-    "search_file",
+    "search_file", "set_screenshot_dir",
 }
+
+# 礼貌请求式命令: "能不能把截图放到工作区" 是请求, 不是提问, 照命令执行
+_REQUEST_ACTIONS = {"set_screenshot_dir"}
 
 # 动作 → 触发它的关键词, 用于回溯"这句话是不是在否定这个动作"
 _ACTION_WORDS = {
@@ -1940,6 +1998,7 @@ _ACTION_WORDS = {
     "web_search": ("搜索", "百度", "搜一下"),
     "play_music": ("播放", "放一首"),
     "search_file": ("找", "搜索", "查", "文件"),
+    "set_screenshot_dir": ("截图", "截屏"),
 }
 
 _NEG_ACK = {
@@ -1960,6 +2019,7 @@ _NEG_ACK = {
     "web_search": "好，不搜",
     "play_music": "好，不放",
     "search_file": "好，不找了",
+    "set_screenshot_dir": "好，不改截图目录",
 }
 
 # 强问句标志: 命中即判定在问事, 哪怕句子以动词开头("查一下截图在哪")
@@ -2005,14 +2065,70 @@ def _is_question(text: str) -> bool:
     return any(w in low for w in _Q_WORDS)
 
 
+def screenshot_dir() -> Path:
+    """截图实际落盘的目录: 用户设过的优先, 否则 图片\\贾维斯截图。"""
+    raw = str(CONFIG.get("screenshot_dir") or "").strip()
+    if raw:
+        try:
+            p = Path(raw).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception as exc:
+            print(f"[截图目录不可用, 沿用默认] {exc}")
+    p = Path.home() / "Pictures" / "贾维斯截图"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _screenshot_dir_text() -> str:
-    """截图实际落在哪个目录 (Windows 的"图片"可能被 OneDrive 接管)。"""
-    for p in (Path.home() / "Pictures" / "贾维斯截图",
-              Path.home() / "OneDrive" / "图片" / "贾维斯截图",
-              Path.home() / "OneDrive" / "Pictures" / "贾维斯截图"):
-        if p.exists():
-            return str(p)
-    return str(Path.home() / "Pictures" / "贾维斯截图")
+    """给用户报路径用 (Windows 的"图片"可能被 OneDrive 接管)。"""
+    return str(screenshot_dir())
+
+
+def _resolve_screenshot_target(raw: str):
+    """把"以后截图放到 X"里的 X 解析成可写目录。返回 (path|None, 追问话术)。
+
+    只接受三类: 授权别名(工作区/桌面/文档/下载) + 子目录、盘符绝对路径、
+    或者模糊说法 —— 模糊的一律反问, 绝不猜一个目录出来乱建。
+    """
+    raw = str(raw or "").strip().strip("，,。.；;、")
+    raw = re.sub(r"^(?:把|将|以后的|以后|新的|所有)", "", raw).strip()
+    if not raw:
+        return None, "以后截图要存到哪个目录？说个名字：工作区、桌面、文档、下载，或者给我完整路径"
+    if any(w in raw for w in ("什么文件夹", "哪个", "另一个", "别的", "其他", "某")):
+        return None, "要放到哪个具体目录？工作区、桌面、文档、下载，或给我一个完整路径"
+    if re.match(r"^[A-Za-z]:\\", raw) or raw.startswith("\\\\"):
+        target = Path(raw)
+        if any(part == ".." for part in target.parts):
+            return None, "这个路径里有 .. ，我不能用"
+    else:
+        hit, rest = None, raw
+        for name, aliases in _WRITE_ROOT_ALIASES:
+            for alias in aliases:
+                if raw == alias:
+                    hit, rest = name, ""
+                    break
+                if raw.startswith(alias + "\\") or raw.startswith(alias):
+                    tail = raw[len(alias):]
+                    if tail[:1] in ("", "\\"):
+                        hit, rest = name, tail.strip("\\")
+                        break
+            if hit:
+                break
+        if not hit:
+            return None, f"「{raw}」我听不出是哪个目录，只能说工作区、桌面、文档、下载，或给我完整路径"
+        root = _write_root_map().get(hit)
+        if root is None:
+            return None, "这个目录暂时定位不到，换个说法试试"
+        target = (root / rest) if rest else root
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / ".jarvis_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        return None, f"「{target}」写不进去（{exc}），换个目录吧"
+    return target, ""
 
 
 # 已知事实: 这类问句不用绕模型, 直接照实答
@@ -2041,7 +2157,22 @@ def parse_command(text):
         return {"action": "chat", "say": ack}
 
     # ② 问句: 不是在命令我, 而是在问事 → 有事实就直接答, 否则让位给模型
-    if _is_question(text):
+    # 例外: "截图放到哪" 有歧义 —— 问现状("放到哪个文件夹"?) 还是请求修改?
+    #       "能不能/帮我/以后/默认" 这类词在, 就是请求, 照命令走;
+    #       否则当成问现状, 直接答当前目录, 别把目录改成一个叫"哪个"的文件夹。
+    if action == "set_screenshot_dir":
+        d = str((plan.get("args") or {}).get("dir") or "")
+        requestish = any(w in low for w in
+                         ("能不能", "可不可以", "可以吗", "帮我", "给我", "我想",
+                          "我要", "改", "以后", "默认", "设", "换"))
+        if _is_question(text) and not requestish:
+            return {"action": "chat",
+                    "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
+        if any(w in d for w in ("哪", "什么", "另一个", "别的", "其他", "某")) and not requestish:
+            return {"action": "chat",
+                    "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
+
+    if _is_question(text) and action not in _REQUEST_ACTIONS:
         fact = _FACT_ANSWERS.get(action)
         if fact:
             print(f"[仲裁] 问句 → 事实答复 {action}", flush=True)
@@ -2427,10 +2558,23 @@ def _perform_plan(plan):
                         say = f"没找到{query}, 你是不是想打开「{'」或「'.join(guess)}」?"
                     else:
                         say = f"在桌面、文档和下载里没找到{query}"
+        elif action == "set_screenshot_dir":
+            target, why = _resolve_screenshot_target(args.get("dir") or "")
+            if target is None:
+                say = why          # 解析不了就反问, 绝不猜目录乱建
+                _TL.action_ok = True
+            else:
+                CONFIG["screenshot_dir"] = str(target)
+                saved = save_user_config({"screenshot_dir": str(target)})
+                if saved:
+                    say = f"好，以后截图都存到 {target}，Sir（以前的旧截图没动）"
+                else:
+                    say = f"目录我改到 {target} 了，但这次没写进配置文件，重启后会恢复原样"
+                _TL.action_ok = True
+                print(f"[截图目录] 已改为 {target}", flush=True)
         elif action == "screenshot":
             import pyautogui
-            folder = Path.home() / "Pictures" / "贾维斯截图"
-            folder.mkdir(parents=True, exist_ok=True)
+            folder = screenshot_dir()
             fp = folder / f"截图_{datetime.datetime.now():%Y%m%d_%H%M%S}.png"
             vision_on = bool(CONFIG.get("vision_enabled", True))
             if ui_bridge is not None and vision_on:
