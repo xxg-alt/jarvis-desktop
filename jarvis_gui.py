@@ -823,6 +823,11 @@ from web_fullscreen import FullscreenHUDWindow
 class JarvisAppManager:
     def __init__(self):
         self.root = tk.Tk()
+        # 所有窗口默认用贾维斯图标, 而不是 Tk / .py 的默认图标
+        try:
+            self.root.iconbitmap(default=str(BASE / "assets" / "jarvis.ico"))
+        except Exception:
+            pass
         # 托盘应用不占任务栏：隐藏主窗口的 Python/PyInstaller 默认图标。
         try:
             hwnd = self.root.winfo_id()
@@ -1361,5 +1366,11 @@ class JarvisAppManager:
         print("[退出] mainloop 已返回 —— Tk 认为没有窗口可服务了", flush=True)
 
 if __name__ == "__main__":
+    # 所有窗口归到同一个任务栏按钮 + 用贾维斯自己的图标 (而不是 .py 的 Python 通用图标)
+    try:
+        import win_taskbar
+        win_taskbar.set_app_id()
+    except Exception:
+        pass
     app = JarvisAppManager()
     app.run()

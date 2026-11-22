@@ -19,6 +19,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=assets\jarvis.ico
 VersionInfoVersion=1.2.0.0
 VersionInfoDescription={#MyAppName} Windows 安装包
 CloseApplications=yes

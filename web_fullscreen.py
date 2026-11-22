@@ -483,6 +483,13 @@ def run_child(port=0, preview=False):
         background_color=BG_COLOR,
         js_api=_Api(child),
     )
+    # 全屏 HUD 保留在任务栏, 但图标换成贾维斯自己的, 不再用 .py 通用图标
+    try:
+        import win_taskbar
+        win_taskbar.set_app_id()
+        win_taskbar.setup_window_async("J.A.R.V.I.S.", hide=False)
+    except Exception:
+        pass
     webview.start(child.boot, debug=False)
 
 
