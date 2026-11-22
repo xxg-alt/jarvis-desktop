@@ -820,8 +820,57 @@ from web_fullscreen import FullscreenHUDWindow
 # =========================================================================
 # 模块四：主控总协调器 (Manager)
 # =========================================================================
+def _sweep_web_children(include_own=False):
+    """清掉 web 子进程 (web_capsule.py / web_fullscreen.py --child)。
+
+    为什么需要它：旧版 quit_app 的顺序是
+        web_capsule.stop()  →  alive=False  →  os._exit(0)
+    中间那一拍 Tk 主循环会看到"胶囊掉线"，立刻按看门狗逻辑重启子进程，
+    紧接着主进程 os._exit 走人 —— 新起的子进程父进程没了，变成孤儿常驻。
+    Windows 拿被执行的 .py 文件当进程图标，任务栏上就多出一个"Python 脚本"。
+    所以每退出一次多一个。
+
+    这里只处理孤儿 (父进程已死) 或 include_own=True 时处理自己的子进程，
+    绝不碰另一个还活着的贾维斯实例正在用的子进程。
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0
+    me = os.getpid()
+    killed = 0
+    for p in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            pid = p.info.get("pid")
+            if pid == me:
+                continue
+            cmd = " ".join(p.info.get("cmdline") or [])
+            if "--child" not in cmd:
+                continue
+            if "web_capsule.py" not in cmd and "web_fullscreen.py" not in cmd:
+                continue
+            ppid = p.info.get("ppid") or 0
+            if ppid == me and not include_own:
+                continue
+            if ppid and ppid != me and psutil.pid_exists(ppid):
+                continue   # 父进程还活着 → 别动别人的
+            p.kill()
+            killed += 1
+        except Exception:
+            continue
+    if killed:
+        print(f"[进程清理] 清掉 {killed} 个遗留 web 子进程")
+    return killed
+
+
 class JarvisAppManager:
     def __init__(self):
+        # 开局先扫一遍上次遗留的孤儿，避免图标越攒越多
+        try:
+            _sweep_web_children()
+        except Exception:
+            pass
+        self._quitting = False
         self.root = tk.Tk()
         # 所有窗口默认用贾维斯图标, 而不是 Tk / .py 的默认图标
         try:
@@ -1053,6 +1102,9 @@ class JarvisAppManager:
 
     # ── 界面风格切换 ──
     def _ensure_web_capsule(self):
+        # 退出流程里任何一次重建都等于制造孤儿进程，直接拒绝。
+        if getattr(self, "_quitting", False):
+            return False
         # 只判断"对象是否存在"远不够：子进程死了、连接断了的时候它仍然非空，
         # set_visible 会静默失败，于是调用方以为已经切到胶囊，屏幕上却什么都没有。
         if self.web_capsule is not None and getattr(self.web_capsule, "alive", False):
@@ -1152,6 +1204,10 @@ class JarvisAppManager:
         self.orb_win.win.lift()
 
     def quit_app(self):
+        # 第一件事：立旗。主循环和看门狗只要看到这面旗，就不再重启胶囊子进程，
+        # 否则 stop() 造成的那次"掉线"会立刻被重启逻辑接住，起来的新子进程
+        # 在 os._exit(0) 之后变成孤儿常驻（任务栏多一个 .py 图标）。
+        self._quitting = True
         # 取证：进程"自己没了"时 stderr 是空的，必须留下是谁要求退出的证据
         try:
             print("[退出] quit_app 被调用，调用栈：", flush=True)
@@ -1173,6 +1229,12 @@ class JarvisAppManager:
         try:
             if self.web_capsule:
                 self.web_capsule.stop()
+        except Exception: pass
+        # 收尾兜底：给 kill_tree 一点时间落定，再把还没死透的子进程硬清一遍。
+        # include_own=True —— 此刻自己的子进程父进程就是自己，也不能放过。
+        try:
+            time.sleep(0.35)
+            _sweep_web_children(include_own=True)
         except Exception: pass
         os._exit(0)
 
@@ -1279,7 +1341,9 @@ class JarvisAppManager:
         # 不重启的话界面会直接消失，用户眼前就是"卡死"；起不来就退回经典界面保底。
         try:
             wc = self.web_capsule
-            if self.mode == "web" and wc is not None and not getattr(wc, "alive", True):
+            if getattr(self, "_quitting", False):
+                pass          # 正在退出：不许再起新子进程
+            elif self.mode == "web" and wc is not None and not getattr(wc, "alive", True):
                 now = time.time()
                 if now - getattr(self, "_wc_restart_at", 0.0) > 8.0:
                     self._wc_restart_at = now
