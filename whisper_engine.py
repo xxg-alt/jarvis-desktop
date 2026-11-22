@@ -30,6 +30,18 @@ _MIN_SPEECH = 12            # 至少 360ms 有效语音才算一句
 _MAX_UTTER = 400            # 单句最长 12s, 到点强制切
 _MAX_READ_FAILS = 8         # 连续读失败超过这次数就重建输入流
 
+# 底噪门限与归一化上限:
+# 旧版 0.9/peak 没有上限, 极轻的底噪会被放大几十上百倍, 等于把噪声喂成"听得见的句子",
+# 这是"它识别出一些别的"的来源之一。现在: 太轻直接不送模型, 增益封顶 30 倍 (约 +30dB),
+# 小声说话仍然放得出来, 剩下的幻觉交给重复过滤和置信度闸门兜。
+_MIN_PEAK = 0.0035          # 约 -49dBFS, 再低就不值得浪费一次推理
+_MAX_GAIN = 30.0
+
+# 解码防幻觉: 短句贪心解码 + 无温度回退时, whisper 会在近静音上卡进
+# "好、好、好、好…" 的重复循环。开温度回退 + 重复惩罚, 让它重解码而不是硬吐。
+_BEAM = max(1, min(5, int(os.environ.get("JARVIS_WHISPER_BEAM", "3") or 3)))
+_SEP_CHARS = "、,，。.！!？?…;；:：'\"“”‘’()（）[]【】 \n\t"
+
 SUPPORTED_SIZES = ("base", "small", "medium")
 _MODEL = None
 _MODEL_SIZE = None
@@ -138,6 +150,9 @@ def _clean(text: str) -> str:
     for bad in _HALLUCINATION:
         if bad in low:
             return ""
+    # 重复解码幻觉: 黑名单挡不住的"好、好、好…" / 单字刷屏
+    if _repetitive(t):
+        return ""
     if not any("\u4e00" <= ch <= "\u9fff" for ch in t):
         # 没有汉字时检查是否在短词白名单中
         pure_en = low.strip(" .?!,")
@@ -150,27 +165,65 @@ def _clean(text: str) -> str:
     return t.strip(" 。，,.！!？?、\n\t")
 
 
+def _repetitive(text: str) -> bool:
+    """重复解码幻觉检测: "好、好、好、好…" 或单字刷屏。
+
+    whisper 在近静音上会卡进重复循环, 夹着顿号/逗号时固定黑名单完全挡不住;
+    重复片段连续出现 4 次以上就整句丢弃 (两连重复如"好的好的"仍然放行)。
+    """
+    s = "".join(ch for ch in text if ch not in _SEP_CHARS)
+    if not s:
+        return True
+    if len(s) >= 6 and s.count(s[0]) >= len(s) - 1:
+        return True
+    for n in (1, 2, 3, 4):
+        for i in range(len(s) - n * 4 + 1):
+            unit = s[i:i + n]
+            reps, j = 1, i + n
+            while s[j:j + n] == unit:
+                reps += 1
+                j += n
+                if reps >= 4:
+                    return True
+    return False
+
+
 def _normalize(arr):
-    """麦克风阵列出来的声音常常很小, 拉到正常音量再交给模型 (准确率明显更好)"""
+    """麦克风阵列出来的声音常常很小, 拉到正常音量再交给模型 (准确率明显更好)。
+
+    返回 None 表示这段基本是底噪: 不送模型, 也不把噪声放大成"听得见的句子"。
+    """
     import numpy as np
+    if not arr.size:
+        return None
     arr = arr - float(arr.mean())
-    peak = float(np.max(np.abs(arr))) if arr.size else 0.0
-    if 1e-4 < peak < 0.35:
-        arr = arr * (0.9 / peak)
-    return arr
+    peak = float(np.max(np.abs(arr)))
+    if peak < _MIN_PEAK:
+        return None
+    gain = 0.9 / peak
+    if gain < 1.05:
+        return arr
+    return arr * min(gain, _MAX_GAIN)
 
 
-def transcribe(audio, size: str = "small", language="zh") -> str:
-    """audio: float32 numpy (16k 单声道) 或 int16 字节; 返回识别文本"""
+def transcribe_detail(audio, size: str = "small", language="zh") -> dict:
+    """识别并带回置信度: {"text", "logprob", "no_speech", "reason"}。
+
+    logprob 是保留下来的片段平均 avg_logprob, 上层用它决定"这句要不要执行":
+    低于门槛就只提示没听清, 不许拿不确定的识别结果去动电脑。
+    """
     import numpy as np
-    model = _load(size)
     if isinstance(audio, (bytes, bytearray)):
         arr = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
     else:
         arr = np.asarray(audio, dtype=np.float32)
     if arr.size < SAMPLE_RATE // 4:      # 短于 0.25s 不识别
-        return ""
+        return {"text": "", "logprob": 0.0, "no_speech": 1.0, "reason": "太短"}
     arr = _normalize(arr)
+    if arr is None:
+        return {"text": "", "logprob": 0.0, "no_speech": 1.0, "reason": "底噪"}
+    model = _load(size)
+    lp_sum, lp_n, ns_max = 0.0, 0, 0.0
     keep = []
     # 串行化推理：ctranslate2 的 segment 是惰性生成器，真正的计算发生在迭代时，
     # 因此锁必须包住整个 transcribe + 迭代过程，而不是只包住调用。
@@ -178,7 +231,14 @@ def transcribe(audio, size: str = "small", language="zh") -> str:
         segs, _info = model.transcribe(
             arr,
             language=language,               # 默认 zh; 只有显式传 None 才自动判断中/英
-            beam_size=1,
+            beam_size=_BEAM,
+            # 温度回退: 重复/低质量结果会按更高温度重解码, 而不是硬吐一串"好好好"
+            temperature=[0.0, 0.2, 0.4, 0.6],
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.6,
+            no_speech_threshold=0.78,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.1,
             vad_filter=False,                # 上层已经切好句子, 不用再跑一遍 VAD
             condition_on_previous_text=False,
             without_timestamps=True,
@@ -187,12 +247,28 @@ def transcribe(audio, size: str = "small", language="zh") -> str:
         )
         # whisper 在噪音上会一本正经地编句子, 用模型自带的置信度把这类结果挡掉
         for s in segs:
-            if getattr(s, "no_speech_prob", 0.0) > 0.65:
+            ns = float(getattr(s, "no_speech_prob", 0.0) or 0.0)
+            lp = float(getattr(s, "avg_logprob", 0.0) or 0.0)
+            ns_max = max(ns_max, ns)
+            if ns > 0.78:
                 continue
-            if getattr(s, "avg_logprob", 0.0) < -1.2:
+            if lp < -1.6:
                 continue
             keep.append(s.text)
-    return _clean("".join(keep))
+            lp_sum += lp
+            lp_n += 1
+    text = _clean("".join(keep))
+    return {
+        "text": text,
+        "logprob": (lp_sum / lp_n) if lp_n else -2.0,
+        "no_speech": ns_max,
+        "reason": "" if text else "无有效片段",
+    }
+
+
+def transcribe(audio, size: str = "small", language="zh") -> str:
+    """audio: float32 numpy (16k 单声道) 或 int16 字节; 返回识别文本"""
+    return transcribe_detail(audio, size=size, language=language)["text"]
 
 
 class _Segmenter:
@@ -268,9 +344,11 @@ class _Segmenter:
 
 def listen_continuous(on_text, stop_event=None, hotwords=None, ignore_while=None,
                       on_ready=None, size="small", on_level=None, language="zh",
-                      on_error=None):
+                      on_error=None, send_meta=False):
     """后台线程持续听; 每识别出一句调用 on_text(text)
 
+    send_meta=True 时 on_text 收到 (text, meta) 二元组, meta 带 logprob/no_speech,
+    上层据此决定"这句要不要执行"(低置信度只提示没听清, 不动电脑)。
     ignore_while: 返回 True 时丢弃这句 (跳过贾维斯自己说话的回声)
     on_ready:     真正开始监听后回调一次
     on_error:     输入流无法恢复时回调一次 (上层应把界面从 LISTENING 切走)
@@ -383,15 +461,17 @@ def listen_continuous(on_text, stop_event=None, hotwords=None, ignore_while=None
                 continue
             ignore_current = False
             try:
-                text = transcribe(data, size=size, language=language)
+                info = transcribe_detail(data, size=size, language=language)
             except Exception as e:
                 print(f"[语音] 识别失败: {type(e).__name__}: {e}")
                 continue
+            text = info.get("text") or ""
             if text:
-                on_text(text)
+                on_text((text, info) if send_meta else text)
             elif len(data) / 2 / SAMPLE_RATE >= 0.5:
                 # 只记录“确实听到一段声音但没识别出字”的情况, 方便区分麦克风/VAD/模型三类问题
-                print(f"[语音] 切出一段 {len(data) / 2 / SAMPLE_RATE:.1f}s 音频, 但没识别出文字")
+                print(f"[语音] 切出一段 {len(data) / 2 / SAMPLE_RATE:.1f}s 音频, "
+                      f"但没识别出文字 ({info.get('reason') or '-'})")
     finally:
         _beat(state="stopped")
         audio_device.release_stream(stream)

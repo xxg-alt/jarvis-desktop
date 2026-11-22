@@ -1367,6 +1367,38 @@ def _agent_repair_wrapper(task, step, error_text):
     return _agent_repair_step(task, step, error_text)
 
 
+# ---------- 语音识别置信度闸门 ----------
+# 识别结果不确定时宁可问一遍, 不许拿鬼话去动电脑:
+#   13:00 那句 "好的、好、好、好…" 就是低置信度的重复幻觉, 却真去读了文件。
+_ASR_MIN_LOGPROB = float(os.environ.get("JARVIS_ASR_MIN_LOGPROB", "-0.9") or -0.9)
+_ASR_HINT_GAP = 6.0
+_last_asr_hint = 0.0
+
+
+def _asr_uncertain(meta) -> bool:
+    """这句识别的置信度低到不该执行吗 (meta 缺失时按"可执行"处理, 保持旧行为)。"""
+    try:
+        lp = float((meta or {}).get("logprob", 0.0))
+    except Exception:
+        return False
+    return lp < _ASR_MIN_LOGPROB
+
+
+def _asr_uncertain_hint(text: str):
+    """低置信度识别: 只上字幕, 冷却期内提醒一次, 不执行任何动作。"""
+    global _last_asr_hint
+    print(f"[语音] 低置信度不执行: {text}")
+    if ui_bridge is not None:
+        try:
+            ui_bridge.emit_subtitle(f"没听清：{text}", False)
+        except Exception:
+            pass
+    now = time.time()
+    if now - _last_asr_hint >= _ASR_HINT_GAP:
+        _last_asr_hint = now
+        speak("没听清，再说一遍吧")
+
+
 def _agent_ui_state(state):
     if ui_bridge is not None:
         try:
@@ -3026,6 +3058,8 @@ def _wake_loop_whisper(hotkey_event):
                 # ("Hello"/"Uh-uh" 这类碎片), 英文单词仍会被中文模型尽量音译识别。
                 language=str(CONFIG.get("whisper_language", "zh")),
                 on_error=_on_mic_error,
+                # 要置信度: 低置信度的识别只提示"没听清", 不拿去执行
+                send_meta=True,
             )
         except Exception as e:
             failure["error"] = e
@@ -3074,10 +3108,19 @@ def _wake_loop_whisper(hotkey_event):
             follow_until = time.time() + 12
             continue
         try:
-            text = pending.get(timeout=0.2).replace(" ", "")
+            item = pending.get(timeout=0.2)
         except _queue.Empty:
             continue
+        if isinstance(item, tuple):
+            text, meta = str(item[0] or "").replace(" ", ""), (item[1] or {})
+        else:
+            text, meta = str(item or "").replace(" ", ""), {}
         if not text:
+            continue
+        # 识别不确定、又没喊唤醒词: 只提示"没听清", 不打断播报、不执行任何动作
+        if not _wake_hit(text) and _asr_uncertain(meta):
+            _asr_uncertain_hint(text)
+            _ui_listening()
             continue
         # 用户打断（Barge-in）：如果贾维斯此时正在说话，用户开口说了有效指令，立刻掐断旧播报
         if is_speaking():
