@@ -1,0 +1,85 @@
+{
+  "cases": [
+    {
+      "id": "S1",
+      "name": "两步全成功",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf"}, "scope": "free", "say": "找PDF"},
+        {"action": "write_file", "args": {"name": "清单.md", "content": "占位"}, "scope": "free", "say": "写清单"}
+      ],
+      "expect": {"state": "done", "statuses": ["done", "done"], "calls": 2, "pre_write": 1}
+    },
+    {
+      "id": "S2",
+      "name": "含高危步骤应挂起等待",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "read", "name": "笔记.txt"}, "scope": "free", "say": "读笔记"},
+        {"action": "shutdown", "args": {}, "scope": "ask", "say": "关机"},
+        {"action": "write_file", "args": {"name": "结果.md", "content": "x"}, "scope": "free", "say": "写结果"}
+      ],
+      "expect": {"state": "waiting_user", "statuses": ["done", "waiting", "pending"], "calls": 1}
+    },
+    {
+      "id": "S3",
+      "name": "执行中被停止",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.png"}, "scope": "free", "say": "第一步"},
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.jpg"}, "scope": "free", "say": "第二步"},
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.gif"}, "scope": "free", "say": "第三步"}
+      ],
+      "stop_after": 0.12,
+      "step_delay": 0.3,
+      "expect": {"state": "cancelled", "max_calls": 1}
+    },
+    {
+      "id": "S4",
+      "name": "跳过剩余步骤",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf"}, "scope": "free", "say": "第一步"},
+        {"action": "file_manage", "args": {"action": "list", "folder": "下载"}, "scope": "free", "say": "第二步"},
+        {"action": "write_file", "args": {"name": "a.md", "content": "x"}, "scope": "free", "say": "第三步"}
+      ],
+      "skip_after": 0.12,
+      "step_delay": 0.3,
+      "expect": {"state": "done", "statuses": ["done", "skipped", "skipped"], "max_calls": 1}
+    },
+    {
+      "id": "S5",
+      "name": "一步失败其余成功 -> done",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf"}, "scope": "free", "say": "第一步"},
+        {"action": "file_manage", "args": {"action": "read", "name": "坏文件.txt"}, "scope": "free", "say": "第二步", "_fail": true},
+        {"action": "write_file", "args": {"name": "b.md", "content": "x"}, "scope": "free", "say": "第三步"}
+      ],
+      "expect": {"state": "done", "statuses": ["done", "failed", "done"], "calls": 3}
+    },
+    {
+      "id": "S6",
+      "name": "全部失败 -> failed",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "read", "name": "a.txt"}, "scope": "free", "_fail": true},
+        {"action": "file_manage", "args": {"action": "read", "name": "b.txt"}, "scope": "free", "_fail": true}
+      ],
+      "expect": {"state": "failed", "statuses": ["failed", "failed"], "calls": 2}
+    },
+    {
+      "id": "S7",
+      "name": "chat 步骤只标记不执行",
+      "steps": [
+        {"action": "chat", "args": {}, "scope": "free", "say": "先说明"},
+        {"action": "file_manage", "args": {"action": "list", "folder": "桌面"}, "scope": "free", "say": "列桌面"}
+      ],
+      "expect": {"state": "done", "statuses": ["done", "done"], "calls": 1}
+    },
+    {
+      "id": "S8",
+      "name": "写文件步拿到前序结果",
+      "steps": [
+        {"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf"}, "scope": "free", "say": "查PDF"},
+        {"action": "write_file", "args": {"name": "汇总.md", "content": "占位"}, "scope": "free", "say": "写汇总"}
+      ],
+      "expect": {"state": "done", "calls": 2, "pre_write": 1, "pre_write_has_data": true}
+    }
+  ]
+}
+

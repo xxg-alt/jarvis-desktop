@@ -21,6 +21,7 @@ import webbrowser
 from pathlib import Path
 
 import audio_device
+import agent_core    # 平台无关的任务状态机 (云主机评测复用同一套逻辑)
 
 BASE = Path(__file__).resolve().parent
 DRY_RUN = False
@@ -922,9 +923,10 @@ AGENT_STATES = ("draft", "approved", "running", "waiting_user", "done", "failed"
 
 # 三级权限: 越界才问, 圈内直接干。agent 连续执行时每一步套这个格子,
 # 计划审批已经放行的圈内操作不再逐条弹确认 —— 否则 agent 名存实亡。
-AGENT_SCOPE_FREE = "free"        # 只读/开东西: list, read, open_*, search, chat, ask_doc, inspect
-AGENT_SCOPE_NOTIFY = "notify"   # 落盘/系统层: write_file, move, volume, screenshot, run_powershell(只读)
-AGENT_SCOPE_ASK = "ask"          # 危险: shutdown, restart, close_app, run_powershell(非只读)
+# 值定义在 agent_core.py (平台无关), 这里只做别名, 避免两处各写一套漂移。
+AGENT_SCOPE_FREE = agent_core.SCOPE_FREE        # 只读/开东西: list, read, open_*, search, chat, ask_doc, inspect
+AGENT_SCOPE_NOTIFY = agent_core.SCOPE_NOTIFY    # 落盘/系统层: write_file, move, volume, screenshot, run_powershell(只读)
+AGENT_SCOPE_ASK = agent_core.SCOPE_ASK          # 危险: shutdown, restart, close_app, run_powershell(非只读)
 
 _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
                        "web_search", "search_file", "ask_doc", "screenshot", "lock",
@@ -1304,20 +1306,7 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
     return {"task": task, "say": text}
 
 
-# ---------- Agent 后台执行器 ----------
-# 设计要点:
-#   1. 任务跑在独立线程里, 不占 _RUN_LOCK —— 否则跑几分钟的 agent 会把语音循环锁死;
-#   2. 播报不 worker 里直接喊, 只往 _AGENT_EVENTS 塞, 由主循环统一出口 (避免和普通指令抢话筒);
-#   3. 步骤之间检查 stop/skip 标志: 正在跑的这一步无法打断 (比如一次 25 秒的接口调用),
-#      但一步结束立刻停 —— 这是"插话停得住"的现实边界。
-_AGENT_LOCK = threading.Lock()
-_AGENT_RUN = {"thread": None, "task": None, "stop": False, "skip": False, "gen": 0}
 _AGENT_EVENTS = queue.Queue()
-
-
-def _agent_busy() -> bool:
-    t = _AGENT_RUN.get("thread")
-    return bool(t and t.is_alive())
 
 
 def _agent_notify(text: str, spoken: bool = False):
@@ -1348,48 +1337,72 @@ def _agent_persist(task: dict):
     _agent_save_tasks({**data, "tasks": tasks})
 
 
+# 执行状态机本体在 agent_core.py (只依赖标准库): 云主机上可以用假执行器跑批量评测,
+# 这里只提供"动手"和"落盘/播报"的具体实现。
+def _agent_perform(step):
+    """真执行一步: 返回 (成败, 话术, 可传递的结构化文本)。"""
+    _TL.action_ok = True
+    # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
+    _TL.agent_context = True
+    _TL.agent_external_ok = bool(step.get("external_ok"))
+    try:
+        text = _perform_plan({"action": step.get("action"),
+                              "args": step.get("args", {}),
+                              "say": step.get("say", "")})
+        return bool(getattr(_TL, "action_ok", True)), text, getattr(_TL, "last_tool_text", "")
+    finally:
+        _TL.agent_context = False
+        _TL.agent_external_ok = False
+
+
+def _agent_pre_write(task, step, results_text):
+    """写文件步执行前, 用前面步骤的真实结果把 content 成稿。"""
+    composed = _agent_compose_write(task.get("goal", ""), step, results_text)
+    if composed and composed != (step.get("args", {}) or {}).get("content"):
+        step.setdefault("args", {})["content"] = composed
+
+
+def _agent_ui_state(state):
+    if ui_bridge is not None:
+        try:
+            ui_bridge.emit_state(state)
+        except Exception:
+            pass
+
+
+_RUNNER = agent_core.TaskRunner(
+    perform=_agent_perform,
+    persist=_agent_persist,
+    notify=_agent_notify,
+    on_state=_agent_ui_state,
+    pre_write=_agent_pre_write,
+)
+
+
+def _agent_busy() -> bool:
+    return _RUNNER.busy()
+
+
 def _agent_start(task: dict) -> dict:
     """把任务丢进后台执行器, 立即返回一句"开始执行"——调用方线程不阻塞。"""
-    with _AGENT_LOCK:
-        if _agent_busy():
-            return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
-        _AGENT_RUN["gen"] += 1
-        gen = _AGENT_RUN["gen"]
-        _AGENT_RUN["stop"] = False
-        _AGENT_RUN["skip"] = False
-        _AGENT_RUN["task"] = task
-        thread = threading.Thread(target=_agent_loop, args=(task, gen),
-                                  name="jarvis-agent", daemon=True)
-        _AGENT_RUN["thread"] = thread
-        thread.start()
+    started, _gen = _RUNNER.start(task)
+    if not started:
+        return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
     total = len(task.get("steps", []))
     return {"say": f"开始执行任务「{task.get('goal', '')}」, 共 {total} 步。要中止就说「停」"}
 
 
 def _agent_stop() -> bool:
     """请求停止。返回是否真的打断了一个在跑的任务。"""
-    with _AGENT_LOCK:
-        if not _agent_busy():
-            return False
-        _AGENT_RUN["stop"] = True
-        _AGENT_RUN["gen"] += 1
-        task = _AGENT_RUN.get("task") or {}
-        if task:
-            task["state"] = "cancelled"
-            _agent_persist(task)
-    return True
+    return _RUNNER.stop()
 
 
 def _agent_skip() -> bool:
-    with _AGENT_LOCK:
-        if not _agent_busy():
-            return False
-        _AGENT_RUN["skip"] = True
-    return True
+    return _RUNNER.skip()
 
 
 def _agent_generation_changed(gen: int) -> bool:
-    return _AGENT_RUN.get("gen") != gen
+    return _RUNNER._gen != gen
 
 
 def _tool_data_text(action, res):
@@ -1447,107 +1460,6 @@ def _agent_compose_write(goal, step, results_text):
     except Exception as exc:
         print(f"[Agent 成稿失败, 用原草稿] {exc}")
         return draft
-
-
-def _agent_loop(task: dict, gen: int):
-    """后台执行循环。每步之间检查 stop/skip, 遇 ask 步骤立刻挂起等确认。"""
-    steps = task.get("steps", [])
-    total = len(steps)
-    task["state"] = "running"
-    _agent_persist(task)
-    if ui_bridge is not None:
-        try: ui_bridge.emit_state("ACTING")
-        except Exception: pass
-
-    results_log = []
-    try:
-        for i, step in enumerate(steps):
-            if _agent_generation_changed(gen) or _AGENT_RUN.get("stop"):
-                task["state"] = "cancelled"
-                _agent_persist(task)
-                _agent_notify("任务已停止, Sir", spoken=True)
-                return
-            if step.get("status") != "pending":
-                continue
-
-            if step.get("scope") == AGENT_SCOPE_ASK:
-                task["state"] = "waiting_user"
-                step["status"] = "waiting"
-                _agent_persist(task)
-                _agent_notify(
-                    f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步要动系统: "
-                    f"{step.get('say') or step.get('action')}。说「继续任务」放行, 说「停」中止",
-                    spoken=True,
-                )
-                return
-
-            if step.get("action") == "chat":
-                step["status"] = "done"
-                _agent_persist(task)
-                continue
-
-            if step.get("action") == "write_file" and results_log:
-                # 传结果: 写文件步先按前面步骤的真实结果成稿, 再执行
-                composed = _agent_compose_write(task.get("goal", ""), step,
-                                                "\n".join(results_log))
-                if composed and composed != (step.get("args", {}) or {}).get("content"):
-                    step.setdefault("args", {})["content"] = composed
-
-            _agent_notify(f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
-            _TL.action_ok = True
-            # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
-            _TL.agent_context = True
-            _TL.agent_external_ok = bool(step.get("external_ok"))
-            try:
-                step["result"] = _perform_plan({"action": step.get("action"),
-                                                "args": step.get("args", {}),
-                                                "say": step.get("say", "")})
-                step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
-            except Exception as exc:
-                step["result"] = f"执行失败: {exc}"
-                step["status"] = "failed"
-            finally:
-                _TL.agent_context = False
-                _TL.agent_external_ok = False
-            if step.get("status") == "done":
-                entry = f"第{i + 1}步({step.get('say') or step.get('action')}): {step.get('result', '')}"
-                extra = getattr(_TL, "last_tool_text", "")
-                if extra:
-                    entry += f" | 数据: {extra}"
-                results_log.append(entry)
-            _agent_persist(task)
-
-            if _AGENT_RUN.get("skip"):
-                with _AGENT_LOCK:
-                    _AGENT_RUN["skip"] = False
-                for rest in steps[i + 1:]:
-                    if rest.get("status") == "pending":
-                        rest["status"] = "skipped"
-                task["state"] = "done"
-                _agent_persist(task)
-                _agent_notify("已跳过剩余步骤, 任务收尾", spoken=True)
-                return
-
-        failed = [i for i, s in enumerate(steps) if s.get("status") == "failed"]
-        done_n = sum(1 for s in steps if s.get("status") == "done")
-        task["state"] = "failed" if failed and done_n == 0 else "done"
-        _agent_persist(task)
-        if failed:
-            _agent_notify(f"任务「{task.get('goal', '')}」结束, 第 "
-                          f"{'、'.join(str(i + 1) for i in failed)} 步没有成功", spoken=True)
-        else:
-            _agent_notify(f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步", spoken=True)
-    except Exception as exc:
-        print(f"[Agent 执行异常] {exc}")
-        task["state"] = "failed"
-        _agent_persist(task)
-        _agent_notify(f"任务执行出错了: {exc}", spoken=True)
-    finally:
-        if _AGENT_RUN.get("task") is task:
-            _AGENT_RUN["task"] = None
-        if ui_bridge is not None:
-            try: ui_bridge.emit_state("IDLE")
-            except Exception: pass
 
 
 def agent_approve(index: int = -1) -> dict:
