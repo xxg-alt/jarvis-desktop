@@ -1362,6 +1362,11 @@ def _agent_pre_write(task, step, results_text):
         step.setdefault("args", {})["content"] = composed
 
 
+def _agent_repair_wrapper(task, step, error_text):
+    """状态机的失败修复钩子: 转调 _agent_repair_step (晚绑定, 测试可整体替换)。"""
+    return _agent_repair_step(task, step, error_text)
+
+
 def _agent_ui_state(state):
     if ui_bridge is not None:
         try:
@@ -1376,6 +1381,7 @@ _RUNNER = agent_core.TaskRunner(
     notify=_agent_notify,
     on_state=_agent_ui_state,
     pre_write=_agent_pre_write,
+    repair=_agent_repair_wrapper,
 )
 
 
@@ -1405,25 +1411,147 @@ def _agent_generation_changed(gen: int) -> bool:
     return _RUNNER._gen != gen
 
 
-def _tool_data_text(action, res):
-    """把工具的结构化结果压成一段可传递的文本, 供后续步骤 (尤其写文件) 使用。
+def _tool_items_text(items):
+    """把 data.items 全量列出来 (最多 50 项), 让"先查后写"能照抄真实结果。"""
+    names = []
+    for item in items[:50]:
+        if not isinstance(item, dict):
+            names.append(str(item)[:80])
+            continue
+        if item.get("path"):
+            names.append(Path(str(item["path"])).name)
+        elif item.get("name"):
+            extra = f"({item['memory_mb']}MB)" if item.get("memory_mb") else ""
+            names.append(f"{item['name']}{extra}")
+        elif item.get("pid") is not None:
+            detail = item.get("state") or item.get("local") or item.get("remote") or ""
+            names.append(f"PID {item['pid']}{f'({detail})' if detail else ''}")
+    return f"共 {len(items)} 项: " + "、".join(names) if names else ""
 
-    _perform_plan 平时只留下一句口头 summary, 具体名单/数字会丢;
-    这里把 data 里的 items 全量列出 (最多 50 项), 让"先查后写"能写对。
+
+def _tool_data_text(action, res):
+    """把工具的结构化结果压成一段可传递的文本, 供修复判断和后续步骤引用。
+
+    _perform_plan 平时只留下一句口头 summary, 具体成败/路径/条目数会丢;
+    这里按动作补齐这些结构化回读, 并保留原来的 items 全量名录。
     """
-    data = res.get("data") or {}
+    res = res if isinstance(res, dict) else {}
+    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    has_ok = "ok" in res
+    ok_val = res.get("ok")
+    if not has_ok:
+        ok_text = "无法核验"
+    elif ok_val is True or ok_val == "ok":
+        ok_text = "是"
+    elif ok_val is False or ok_val == "fail":
+        ok_text = "否"
+    elif ok_val == "unverified":
+        ok_text = "无法核验"
+    else:
+        ok_text = "无法核验" if not has_ok else ("是" if bool(ok_val) else "否")
+    head = f"{action}: 成功={ok_text}"
+    summary = str(res.get("summary") or "").strip()[:300]
+
+    if action == "open_app":
+        parts = [head]
+        if data.get("name"):
+            parts.append(f"应用={data['name']}")
+        if data.get("exe"):
+            parts.append(f"启动名={data['exe']}")
+        if data.get("path"):
+            path_label = "尝试路径" if ok_text == "无法核验" else "实际路径"
+            parts.append(f"{path_label}={data['path']}")
+        if data.get("verify_reason"):
+            parts.append(f"原因={data['verify_reason']}")
+        if summary:
+            parts.append(f"结果={summary}")
+        return "；".join(parts)
+
+    if action == "close_app":
+        parts = [head]
+        name = str(data.get("name") or "")
+        exe = str(data.get("exe") or "")
+        if name or exe:
+            target = name + (f"({exe})" if exe and exe != name else "")
+            parts.append(f"目标={target}")
+        if "remaining" in data:
+            remaining = data.get("remaining")
+            parts.append("同名进程剩余=" + ("无法核验" if remaining is None else f"{remaining} 个"))
+        if data.get("reason"):
+            parts.append(f"原因={data['reason']}")
+        if summary:
+            parts.append(f"结果={summary}")
+        return "；".join(parts)
+
     items = data.get("items") or []
-    if items:
-        names = []
-        for item in items[:50]:
-            if item.get("path"):
-                names.append(Path(str(item["path"])).name)
-            elif item.get("name"):
-                extra = f"({item['memory_mb']}MB)" if item.get("memory_mb") else ""
-                names.append(f"{item['name']}{extra}")
-        if names:
-            return f"共 {len(items)} 项: " + "、".join(names)
-    return ""
+    item_text = _tool_items_text(items) if isinstance(items, list) else ""
+
+    if action == "file_manage":
+        parts = [head]
+        if data.get("action"):
+            parts.append(f"子动作={data['action']}")
+        # 移动看 dst, 读取看 path, 列目录看 folder: 操作后的落点是否存在要回读
+        target = data.get("dst") or data.get("path") or data.get("folder")
+        if target:
+            parts.append(f"目标={target}")
+            try:
+                parts.append(f"操作后存在={'是' if Path(str(target)).exists() else '否'}")
+            except Exception:
+                pass
+        if data.get("pattern"):
+            parts.append(f"匹配={data['pattern']}")
+        if "total" in data:
+            parts.append(f"条目数={data['total']}")
+        elif items:
+            parts.append(f"条目数={len(items)}")
+        if summary:
+            parts.append(f"结果={summary}")
+        if item_text:
+            parts.append(item_text)
+        return "；".join(parts)
+
+    if action == "inspect_system":
+        parts = [head]
+        if data.get("mode"):
+            parts.append(f"模式={data['mode']}")
+        if data.get("port"):
+            parts.append(f"端口={data['port']}")
+        if items:
+            parts.append(f"条目数={len(items)}")
+        if summary:
+            parts.append(f"结果={summary}")
+        if item_text:
+            parts.append(item_text)
+        return "；".join(parts)
+
+    return item_text
+
+
+def _opened_app_path(args):
+    """回读软件实际启动路径: 先用启动器缓存, 缓存没有再按 exe 名解析一次。"""
+    name = str((args or {}).get("name") or "")
+    exe = str((args or {}).get("exe") or "")
+    try:
+        from smart_launcher import APP_PATH_CACHE, resolve_program
+        hit = APP_PATH_CACHE.get(name) or APP_PATH_CACHE.get(exe)
+        if hit:
+            return hit
+        return resolve_program(exe) or ""
+    except Exception:
+        return ""
+
+
+def _remaining_process_count(exe):
+    """尽力回读同名进程数; 读不到返回 None, 绝不假装核验过。"""
+    if not exe:
+        return None
+    try:
+        import psutil
+        name = Path(str(exe)).name.lower()
+        return sum(1 for p in psutil.process_iter(["name"])
+                   if str((p.info or {}).get("name") or "").lower() == name)
+    except Exception:
+        return None
 
 
 _AGENT_COMPOSE_SYSTEM = (
@@ -1462,6 +1590,71 @@ def _agent_compose_write(goal, step, results_text):
         return draft
 
 
+def _agent_execute_step(step, note=""):
+    """执行一步并回读结果, 返回 (是否成功, 结构化数据文本); 成败写回 step。
+
+    兼容层: 生产路径已由 agent_core.TaskRunner + _agent_perform 接管,
+    这里保留给旧测试/旧调用点; 语义与 _agent_perform + 状态机写回一致。
+    """
+    if note:
+        _agent_notify(note)
+    _TL.action_ok = True
+    _TL.last_tool_text = ""
+    # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
+    _TL.agent_context = True
+    _TL.agent_external_ok = bool(step.get("external_ok"))
+    try:
+        step["result"] = _perform_plan({"action": step.get("action"),
+                                        "args": step.get("args", {}),
+                                        "say": step.get("say", "")})
+        step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
+    except Exception as exc:
+        step["result"] = f"执行失败: {exc}"
+        step["status"] = "failed"
+    finally:
+        _TL.agent_context = False
+        _TL.agent_external_ok = False
+    return step.get("status") == "done", getattr(_TL, "last_tool_text", "")
+
+
+def _agent_repair_step(task, step, error_text):
+    """失败后请模型重出一步: 先过 sanitize/作用域校验, 返回 (修正步, 未采用原因)。
+
+    危险修正步不在这里执行, 只把 danger 标出来, 交给状态机走确认护栏。
+    """
+    from llm_brain import repair_step, sanitize_plan
+    fixed = repair_step(task.get("goal", ""), step, error_text, CONFIG)
+    if not isinstance(fixed, dict):
+        return None, "模型没给出修正步"
+    requested = str(fixed.get("action") or "chat")
+    plan = sanitize_plan(fixed)
+    action = plan.get("action", "chat")
+    if action == "chat":
+        reason = f"修正步参数不合法({requested})" if requested != "chat" else "模型只回了聊天"
+        return None, reason
+    scope = agent_scope_of(action, plan.get("args"))
+    danger = bool(fixed.get("danger")) or bool(plan.get("danger")) or scope == AGENT_SCOPE_ASK
+    return {"action": action, "args": plan.get("args", {}),
+            "say": plan.get("say", ""), "scope": scope, "danger": danger}, ""
+
+
+def _agent_loop(task: dict, gen: int):
+    """兼容层: 同步驱动一次任务执行——与后台线程共用同一份 agent_core 状态机。
+
+    旧测试直接同步调它, 并整体替换模块级回调 (_perform_plan/_agent_persist/
+    _agent_notify/_agent_repair_step); 生产路径走 _RUNNER.start() 的后台线程。
+    每次调用现场组装 runner, 保证吃到的就是最新替换过的回调。
+    """
+    runner = agent_core.TaskRunner(
+        perform=_agent_perform,
+        persist=_agent_persist,
+        notify=_agent_notify,
+        on_state=_agent_ui_state,
+        pre_write=_agent_pre_write,
+        repair=_agent_repair_wrapper,
+    )
+    runner._gen = gen   # 代号对齐, 不会被误判成"已被新任务取代"
+    runner._run(task, gen)
 def agent_approve(index: int = -1) -> dict:
     """把最新的 draft 任务交给后台执行器, 立即返回, 不阻塞指令线程。"""
     data = _agent_load_tasks()
@@ -1652,6 +1845,32 @@ def parse_command(text):
     return None
 
 # ---------- Gemini 兜底 (免费档, 只返回白名单动作 JSON) ----------
+
+# ---------- 自由对话分流 ----------
+# 只在本地规则不认识时才判: 含操作/实时信息信号的一律不许进聊天通道,
+# 免得把正经指令聊废了; 命中聊天信号才放行。
+_CMD_VETO_RE = re.compile(
+    r"打开|关掉|关闭|关机|重启|锁屏|音量|亮度|搜索|搜一下|查一下|查查|查询|"
+    r"存成|存到|保存|新建|创建|移动|复制|删除|删掉|播放|放一首|截图|截屏|"
+    r"提醒|闹钟|下载|安装|卸载|发给|发送|列出|列个|整理|检查|扫描|打不开|连不上|没反应|报错|出错了|"
+    r"天气|新闻|金价|股价|汇率|股票|热搜|快递|导航|翻译|计算|算一下"
+)
+_CHAT_SIGNAL_RE = re.compile(
+    r"你觉得|你认为|你怎么看|聊聊|聊天|讲讲|讲个|讲一下|故事|笑话|陪我|说说|谈谈|"
+    r"累|开心|难过|伤心|无聊|焦虑|压力|睡不着|失眠|饿了|好烦|郁闷|高兴|生气|"
+    r"怎么办|划不划算|值不值|建议|什么意思|什么梗|为什么|是什么|是怎么|"
+    r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少"
+)
+
+
+def _looks_conversational(command: str) -> bool:
+    """这句话更像聊天/答疑, 而不是要操作电脑的指令吗 (保守判定, 指令优先)。"""
+    text = str(command or "")
+    if _CMD_VETO_RE.search(text):
+        return False
+    return bool(_CHAT_SIGNAL_RE.search(text))
+
+
 def gemini_plan(command, memory_context=""):
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
@@ -1768,9 +1987,20 @@ def _multi_open_plans(command):
 
 
 def _multi_open_say(results):
-    """把多目标启动结果拼成人话: 成功的并列, 失败的单独说清。"""
-    ok = [name for name, good, _msg in results if good]
-    bad = [(name, msg) for name, good, msg in results if not good]
+    """把多目标启动结果拼成人话: 成功的并列, 未核实/失败的单独说清。"""
+    ok, bad = [], []
+    for item in results:
+        if len(item) == 4:
+            name, good, msg, verify = item
+        else:
+            name, good, msg = item
+            verify = "ok" if good else "fail"
+        if verify == "unverified":
+            bad.append((name, "已尝试，未核实" + (f"（{msg}）" if msg else "")))
+        elif not good or verify == "fail":
+            bad.append((name, msg))
+        else:
+            ok.append(name)
     parts = []
     if ok:
         parts.append("已为您启动" + "、".join(ok))
@@ -1778,6 +2008,11 @@ def _multi_open_say(results):
         hint = msg.split("。")[0] if msg else f"没找到{name}"
         parts.append(f"{name}没起来：{hint}")
     return "；".join(parts) if parts else "这几个我一个都没启动起来，Sir"
+
+
+def _open_app_verify_status(action_ok):
+    verify = getattr(_TL, "open_app_verify", "ok" if action_ok else "fail")
+    return "fail" if not action_ok and verify == "ok" else verify
 
 
 def _perform_plan(plan):
@@ -1791,6 +2026,9 @@ def _perform_plan(plan):
     say = plan.get("say", "好的")
     _TL.action_ok = True
     _TL.last_tool_text = ""
+    _TL.open_app_verify = "ok"
+    _TL.open_app_verify_reason = ""
+    _TL.open_app_actual_is_doc = False
 
     try:
         if action == "chat":
@@ -1799,6 +2037,9 @@ def _perform_plan(plan):
             from smart_launcher import smart_launch_app
             app_target = str(args.get("exe", "") or "")
             app_name = str(args.get("name", "") or app_target)
+            verify = "ok"
+            verify_reason = ""
+            actual_is_doc = False
             # 并列目标先拆: "微信和QQ" 必须变成两次启动, 整串丢给启动器一定找不到
             names = _split_app_targets(app_name) or _split_app_targets(app_target)
             if len(names) > 1:
@@ -1806,21 +2047,41 @@ def _perform_plan(plan):
                 for nm in names:
                     if _looks_like_document(nm):
                         good, msg = _open_document(nm)
+                        v = "ok" if good else "fail"
+                        reason = ""
                     else:
-                        good, msg = smart_launch_app(nm, nm)
-                        if not good and _document_candidates(nm):
-                            good, msg = _open_document(nm)
-                    results.append((nm, good, msg))
+                        good, msg, v = smart_launch_app(nm, nm)
+                        reason = "仅尝试启动，未核实" if v == "unverified" else ""
+                        if (not good or v == "unverified") and _document_candidates(nm):
+                            dgood, dmsg = _open_document(nm)
+                            if dgood:
+                                good, msg, v, reason = True, dmsg, "unverified", "实际打开的是同名文档"
+                    results.append((nm, good, msg, v))
                 say = _multi_open_say(results)
-                _TL.action_ok = all(good for _n, good, _m in results)
+                verify = "ok" if all(v == "ok" for _n, _g, _m, v in results) else ("fail" if any(v == "fail" for _n, _g, _m, v in results) else "unverified")
+                _TL.action_ok = (verify == "ok")
             # 模型常把"打开某某文本"塞进 open_app: 目标像文档就按文档开,
             # 否则找 exe; 找不到时再用文档兜一次, 别一上来就说"定位不到安装路径"
             elif _looks_like_document(app_target) or _looks_like_document(app_name):
                 success, say = _open_document(app_name or app_target)
+                verify = "ok" if success else "fail"
             else:
-                success, say = smart_launch_app(app_target, app_name)
-                if not success and _document_candidates(app_name or app_target):
-                    success, say = _open_document(app_name or app_target)
+                success, say, verify = smart_launch_app(app_target, app_name)
+                if verify == "unverified":
+                    verify_reason = "仅尝试启动，未核实"
+                if (not success or verify == "unverified") and _document_candidates(app_name or app_target):
+                    dgood, dmsg = _open_document(app_name or app_target)
+                    if dgood:
+                        success, say = dgood, dmsg
+                        verify = "unverified"
+                        verify_reason = "实际打开的是同名文档"
+                        actual_is_doc = True
+            if len(names) <= 1 and getattr(_TL, "agent_context", False):
+                # agent 步骤要靠成败位判断是否需要修复; 无法核验也不能当成功
+                _TL.action_ok = (verify == "ok")
+            _TL.open_app_verify = verify
+            _TL.open_app_verify_reason = verify_reason
+            _TL.open_app_actual_is_doc = actual_is_doc
         elif action == "open_file":
             success, say = _open_document(args.get("name") or args.get("exe") or "")
         elif action == "write_file":
@@ -1835,7 +2096,44 @@ def _perform_plan(plan):
             say = msg
             _TL.action_ok = bool(success)
         elif action == "close_app":
-            _run(["taskkill", "/im", args["exe"], "/f"])
+            exe = str(args.get("exe") or "").strip()
+            name = str(args.get("name") or exe).strip()
+            launch_ok = False
+            fail_reason = ""
+            if not exe:
+                fail_reason = "缺少进程名"
+            else:
+                try:
+                    proc = subprocess.run(["taskkill", "/im", exe, "/f"],
+                                          capture_output=True, text=True)
+                    rc = proc.returncode
+                    if rc == 0:
+                        launch_ok = True
+                    else:
+                        err = (proc.stderr or proc.stdout or "").strip()
+                        fail_reason = f"taskkill返回码{rc}" + (f": {err[:120]}" if err else "")
+                        print(f"[关闭程序失败] {exe}: {fail_reason}")
+                except Exception as exc:
+                    fail_reason = str(exc)
+                    print(f"[关闭程序失败] {exe}: {exc}")
+            remaining_after = _remaining_process_count(exe)
+            if remaining_after is not None and remaining_after > 0:
+                fail_reason = (fail_reason + "；" if fail_reason else "") + \
+                              f"仍有 {remaining_after} 个同名进程在运行"
+                launch_ok = False
+            elif remaining_after is None:
+                fail_reason = (fail_reason + "；" if fail_reason else "") + \
+                              "同名进程剩余数无法核验, 未核实是否关闭"
+            _TL.action_ok = bool(launch_ok)
+            summary = say if launch_ok else (fail_reason or "关闭失败")
+            close_data = {"exe": exe, "name": name, "remaining": remaining_after}
+            if fail_reason:
+                close_data["reason"] = fail_reason
+            _TL.last_tool_text = _tool_data_text("close_app", {
+                "ok": launch_ok,
+                "summary": summary,
+                "data": close_data,
+            })
         elif action == "open_url":
             url = str(args.get("url", "")).strip()
             if is_safe_url(url):
@@ -1862,6 +2160,12 @@ def _perform_plan(plan):
             except Exception as exc:
                 print(f"[系统工具不可用] {exc}")
                 say = "系统工具箱没加载上，这个动作暂时做不了。"
+                _TL.action_ok = False
+                _TL.last_tool_text = _tool_data_text(action, {
+                    "ok": False,
+                    "summary": f"系统工具不可用: {exc}",
+                    "data": {"action": action, "reason": f"系统工具不可用: {exc}"},
+                })
             else:
                 if action == "file_manage":
                     res = file_manage(
@@ -1883,6 +2187,7 @@ def _perform_plan(plan):
                 else:
                     say = str(res.get("summary") or "这个操作没有成功。")
                     _TL.action_ok = False
+                    _TL.last_tool_text = _tool_data_text(action, res)
         elif action == "ask_doc":
             # 文档问答: 本地语义检索最相关的 2~3 段, 再让大模型只依据原文回答
             query = str(args.get("query", "")).strip()
@@ -1995,6 +2300,21 @@ def _perform_plan(plan):
         say = f"执行失败了: {e}"
         _TL.action_ok = False
         print(f"[执行失败] {action}: {e}")
+    if action == "open_app":
+        action_ok = bool(getattr(_TL, "action_ok", True))
+        verify = _open_app_verify_status(action_ok)
+        reason = getattr(_TL, "open_app_verify_reason", "")
+        path = _opened_app_path(args)
+        if verify == "unverified" and not path:
+            path = str(args.get("exe") or args.get("name") or "")
+        data = {"exe": args.get("exe") or "", "name": args.get("name") or "", "path": path}
+        if reason:
+            data["verify_reason"] = reason
+        _TL.last_tool_text = _tool_data_text("open_app", {
+            "ok": verify,
+            "summary": say,
+            "data": data,
+        })
     return say
 
 
@@ -2274,7 +2594,9 @@ def _handle_command_inner(command, command_id):
                     print("[指令已被新指令取代，丢弃]")
                     return
                 msg = _perform_plan(p)
-                results.append((p["args"]["name"], bool(getattr(_TL, "action_ok", True)), msg))
+                action_ok = bool(getattr(_TL, "action_ok", True))
+                results.append((p["args"]["name"], action_ok, msg,
+                                _open_app_verify_status(action_ok)))
             say = _multi_open_say(results)
             speak(say)
             MEMORY.record_turn(command, {"action": "open_app",
@@ -2287,6 +2609,25 @@ def _handle_command_inner(command, command_id):
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
     plan = parse_command(command)
     plan_source = "local" if plan is not None else ""
+
+    # 1.5 自由对话通道: 规则不认识、又明显是聊天/答疑的话, 别塞进规划通道硬凑 JSON,
+    # 走 free_chat 正常说话 (带上下文和记忆); 聊天失败自动落回下面的规划通道。
+    if plan is None and _looks_conversational(command):
+        try:
+            from llm_brain import free_chat
+            reply = free_chat(command, CONFIG, memory_context=MEMORY.build_context(command))
+        except Exception as e:
+            print(f"[自由对话异常] {e}")
+            reply = ""
+        if reply:
+            if not _command_is_current(command_id):
+                print("[指令已被新指令取代，丢弃]")
+                return
+            speak(reply)
+            MEMORY.record_turn(command, {"action": "chat", "args": {}, "say": reply}, source="chat")
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+            return
 
     # 2. 规则不认识的指令，交给配置好的 AI 大模型 (DeepSeek / 通义千问 / Gemini 等)
     if plan is None:
@@ -2918,3 +3259,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

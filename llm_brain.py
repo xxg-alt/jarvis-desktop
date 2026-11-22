@@ -229,6 +229,7 @@ def reset_session():
     """清空对话窗口 (清空记忆、切换模型时调用), 之后第一轮缓存会冷启动。"""
     with _SESSION_LOCK:
         _SESSION.clear()
+        _CHAT_SESSION.clear()   # 自由对话历史一并清
 
 
 def _trim_session():
@@ -909,3 +910,109 @@ def query_llm_answer(question: str, doc_context: str, config: dict) -> str:
         return re.sub(r"\s+", " ", answer).strip()[:800]
     except _LlmError as e:
         return e.message
+
+
+# 失败修复的固定指令: 让模型只回一步修正后的白名单动作, 不写解释文字
+_REPAIR_STEP_SYSTEM = (
+    "你是桌面助手贾维斯的任务修复器。一个多步任务里有一步执行失败了，你要只给出修正后的那一步。\n"
+    "只输出一个完整 JSON 对象：{\"action\": \"动作名\", \"args\": {...}, \"say\": \"给用户的中文说明\"}。\n"
+    "动作只能用现有白名单：chat/open_app/open_file/open_url/web_search/file_manage/write_file/"
+    "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart。\n"
+    "参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
+    "不要一次给出多步；确实改不动就返回 action=chat 并在 say 里说明原因。"
+)
+
+
+def repair_step(goal, step, error_text, config):
+    """让模型根据失败信息重出一步，返回原始 step dict；解析或调用失败返回 None。
+
+    这里只取回模型给的一步，不过白名单和参数校验 —— 调用方仍要过 sanitize_plan，
+    权限也仍由 agent_scope_of 判定，修复通道不绕开任何一道关卡。
+    """
+    step = step if isinstance(step, dict) else {}
+    try:
+        args_text = json.dumps(step.get("args") or {}, ensure_ascii=False, default=str)[:800]
+    except Exception:
+        args_text = str(step.get("args") or "")[:800]
+    user = (
+        f"【任务目标】{str(goal or '')[:300]}\n"
+        f"【失败步骤】动作={str(step.get('action') or '')[:60]}；参数={args_text}；"
+        f"原本要说={str(step.get('say') or '')[:200]}\n"
+        f"【失败结果】{str(error_text or '')[:800]}\n"
+        "请给出修正后的这一步 JSON。"
+    )
+    messages = [
+        {"role": "system", "content": _REPAIR_STEP_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    try:
+        raw = _provider_chat(config or {}, messages, max_tokens=400, json_mode=True)
+    except Exception as exc:
+        print(f"[步骤修复] 调用失败, 放弃本次修复: {type(exc).__name__}")
+        return None
+    try:
+        plan = json.loads(_strip_json_text(raw)) if str(raw or "").strip() else None
+    except (TypeError, ValueError):
+        plan = None
+    if not isinstance(plan, dict) or not str(plan.get("action") or "").strip():
+        return None
+    out = {
+        "action": str(plan["action"]).strip(),
+        "args": plan.get("args") if isinstance(plan.get("args"), dict) else {},
+        "say": str(plan.get("say") or "")[:2000],
+    }
+    if plan.get("danger"):
+        out["danger"] = True
+    return out
+
+
+# ---------- 自由对话通道 ----------
+# 规划通道把模型关在 JSON 里, 聊天走这里: 正常说话、带上下文和主人档案。
+CHAT_SYSTEM_PROMPT = (
+    "你是贾维斯, 是主人 ljj 的桌面管家兼伙伴, 不是客服机器人。\n"
+    "现在是闲聊/答疑时间, 不是执行命令: 像朋友一样自然说话, 能接话、能商量、能给建议、能把一个问题讲清楚。\n"
+    "规矩:\n"
+    "1. 中文口语, 默认简短 (1 到 3 句, 因为要朗读), 主人追问或明确要详细时再展开;\n"
+    "2. 记得前文, 主人提到「上次那个」要能对上; 给出的主人档案和记忆自然地用, 别生硬复述;\n"
+    "3. 诚实: 不懂就说不懂, 不编造事实和数据; 实时信息 (天气、价格、新闻) 你手边没有, 直说要用搜索指令去查;\n"
+    "4. 主人要是其实想让你操作电脑 (开软件、找文件、关机之类), 别假装做了, 提醒他换成一句指令你就能办;\n"
+    "5. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话。"
+)
+
+_CHAT_SESSION = []          # 自由对话历史 [{role, content}...], 与规划窗口分开
+_CHAT_MAX_MSGS = 12         # 最多留最近 6 轮
+
+
+def _clean_chat_reply(text) -> str:
+    text = re.sub(r"```[a-zA-Z]*", "", str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:600]
+
+
+def free_chat(command: str, config: dict, memory_context: str = "") -> str:
+    """自由对话: 返回可直接朗读的纯文本; 失败返回空串, 由调用方回退规划通道。"""
+    raw_command = str(command or "").strip()
+    if not raw_command:
+        return ""
+    send_content = raw_command
+    if memory_context:
+        send_content = str(memory_context).strip() + "\n\n" + raw_command
+    with _SESSION_LOCK:
+        history = list(_CHAT_SESSION)
+    messages = ([{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+                + history
+                + [{"role": "user", "content": send_content}])
+    try:
+        raw = _provider_chat(config, messages, max_tokens=800)
+    except _LlmError as e:
+        print(f"[自由对话] 调用失败, 回退规划通道: {e.message}")
+        return ""
+    reply = _clean_chat_reply(raw)
+    if not reply:
+        return ""
+    with _SESSION_LOCK:
+        _CHAT_SESSION.append({"role": "user", "content": raw_command})
+        _CHAT_SESSION.append({"role": "assistant", "content": reply})
+        del _CHAT_SESSION[:-_CHAT_MAX_MSGS]
+    return reply
+

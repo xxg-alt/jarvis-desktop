@@ -23,6 +23,12 @@
         这一步属于哪级权限；默认读 step["scope"]。
     on_state(state)            可选：ACTING / IDLE 给界面用。
     pre_write(task, step, results_text)  可选：写文件前的成稿钩子。
+    repair(task, step, error_text) -> (fixed_step | None, reason)  可选：失败修复钩子。
+        fixed_step 为 {action, args, say, scope, danger}；
+        danger=True 时状态机只挂起等确认（scope 强制 ask + waiting），
+        绝不直接执行；返回 None 表示修复未采用，reason 写进步骤结果。
+        每步最多修一次：置 repair_attempted 并立即 persist 后才调 repair，
+        修复调用前崩溃也不会丢标记。
 """
 
 import threading
@@ -86,13 +92,14 @@ class TaskRunner:
     """单任务后台执行器：启线程跑步骤，支持停止/跳过/挂起等确认。"""
 
     def __init__(self, perform, persist, notify, scope_of=None,
-                 on_state=None, pre_write=None):
+                 on_state=None, pre_write=None, repair=None):
         self._perform = perform
         self._persist = persist
         self._notify = notify
         self._scope_of = scope_of or (lambda step: step.get("scope") or SCOPE_FREE)
         self._on_state = on_state
         self._pre_write = pre_write
+        self._repair = repair
         self._lock = threading.Lock()
         self._thread = None
         self._task = None
@@ -184,6 +191,7 @@ class TaskRunner:
         self._safe_persist(task)
         self._emit("ACTING")
         results_log = []
+        repaired_nums = []
         try:
             for i, step in enumerate(steps):
                 if self._generation_changed(gen):
@@ -226,11 +234,61 @@ class TaskRunner:
                     ok, text, tool_text = False, f"执行失败: {exc}", ""
                 step["result"] = text
                 step["status"] = STATE_DONE if bool(ok) else STATE_FAILED
-                if ok:
-                    entry = (f"第{i + 1}步({step.get('say') or step.get('action')}): {text}")
+
+                # 失败修复: 每步只给一次机会; 危险修正步只挂起等确认, 绝不直接执行
+                if (not ok and self._repair is not None
+                        and not step.get("repair_attempted")):
+                    step["repair_attempted"] = True
+                    self._safe_persist(task)   # 标记先落盘, 修复调用前崩溃也不丢
+                    error_text = str(step.get("result") or "")
+                    if tool_text:
+                        error_text += f" | 数据: {tool_text}"
+                    try:
+                        fixed, reason = self._repair(task, step, error_text)
+                    except Exception as exc:
+                        fixed, reason = None, f"修复调用异常: {exc}"
+                    if fixed and fixed.get("danger"):
+                        step.update({"action": fixed.get("action"),
+                                     "args": fixed.get("args") or {},
+                                     "say": fixed.get("say") or "",
+                                     "scope": SCOPE_ASK,
+                                     "status": "waiting",
+                                     "result": (step.get("result") or "") + "；修正方案待确认"})
+                        task["state"] = STATE_WAITING
+                        self._safe_persist(task)
+                        self._safe_notify(
+                            f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步失败, "
+                            f"修正方案要动系统: {fixed.get('say') or fixed.get('action')}。"
+                            "说「继续任务」放行, 说「停」中止",
+                            spoken=True,
+                        )
+                        return
+                    if fixed:
+                        step.update({"action": fixed.get("action"),
+                                     "args": fixed.get("args") or {},
+                                     "say": fixed.get("say") or "",
+                                     "scope": fixed.get("scope") or SCOPE_FREE})
+                        step["status"] = "pending"
+                        step["repaired"] = True
+                        try:
+                            ok, text, tool_text = self._perform(step)
+                        except Exception as exc:
+                            ok, text, tool_text = False, f"执行失败: {exc}", ""
+                        step["result"] = text
+                        step["status"] = STATE_DONE if bool(ok) else STATE_FAILED
+                        if not ok:
+                            step["result"] = f"修复后仍失败: {text}; 原错误: {error_text}"
+                    else:
+                        step["result"] = f"{step.get('result') or ''}；修复未采用: {reason}"
+
+                if step.get("status") == STATE_DONE:
+                    label = f"第{i + 1}步" + ("经修复完成" if step.get("repaired") else "")
+                    entry = f"{label}({step.get('say') or step.get('action')}): {step.get('result', '')}"
                     if tool_text:
                         entry += f" | 数据: {tool_text}"
                     results_log.append(entry)
+                    if step.get("repaired"):
+                        repaired_nums.append(i + 1)
                 self._safe_persist(task)
 
                 if self._skip:
@@ -248,13 +306,15 @@ class TaskRunner:
             done_n = sum(1 for s in steps if s.get("status") == STATE_DONE)
             task["state"] = STATE_FAILED if failed and done_n == 0 else STATE_DONE
             self._safe_persist(task)
+            fix_note = (("；" + "；".join(f"第{n}步经修复完成" for n in repaired_nums))
+                        if repaired_nums else "")
             if failed:
                 self._safe_notify(
                     f"任务「{task.get('goal', '')}」结束, 第 "
-                    f"{'、'.join(str(i + 1) for i in failed)} 步没有成功", spoken=True)
+                    f"{'、'.join(str(i + 1) for i in failed)} 步没有成功{fix_note}", spoken=True)
             else:
                 self._safe_notify(
-                    f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步", spoken=True)
+                    f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步{fix_note}", spoken=True)
         except Exception as exc:
             print(f"[Agent 执行异常] {exc}")
             task["state"] = STATE_FAILED

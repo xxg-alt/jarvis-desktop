@@ -152,37 +152,38 @@ def resolve_program(target: str) -> str:
     return find_app_paths_exe(exe)
 
 
-def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str]:
+def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str, str]:
     """
     智能启动应用
-    返回: (是否成功, 语音回复文字)
+    返回: (是否成功, 语音回复文字, 核验状态)
+    核验状态: "ok" 已确认启动, "unverified" 仅尝试启动/回退打开同名文档(未核实), "fail" 未启动
     """
     # 1. 优先查缓存
     if app_name in APP_PATH_CACHE and os.path.exists(APP_PATH_CACHE[app_name]):
         real_exe = APP_PATH_CACHE[app_name]
         os.startfile(real_exe)
-        return True, f"已为您启动{app_name}"
+        return True, f"已为您启动{app_name}", "ok"
 
     # 2. 如果传入的已经是存在的绝对路径 (只接受 .exe / .lnk, 避免 startfile 执行任意脚本)
     if os.path.isabs(app_target) and os.path.exists(app_target):
         if Path(app_target).suffix.lower() in (".exe", ".lnk"):
             APP_PATH_CACHE[app_name] = app_target
             os.startfile(app_target)
-            return True, f"已为您打开{app_name}"
+            return True, f"已为您打开{app_name}", "ok"
 
     # 3. 在快捷方式与开始菜单嗅探
     found_path = scan_start_menu_and_desktop(app_name)
     if found_path and os.path.exists(found_path):
         APP_PATH_CACHE[app_name] = found_path
         os.startfile(found_path)
-        return True, f"已找到并为您启动{app_name}"
+        return True, f"已找到并为您启动{app_name}", "ok"
 
     # 4. 在常见磁盘探查
     drive_path = scan_common_drives(app_name)
     if drive_path and os.path.exists(drive_path):
         APP_PATH_CACHE[app_name] = drive_path
         os.startfile(drive_path)
-        return True, f"已在磁盘中找到并为您启动{app_name}"
+        return True, f"已在磁盘中找到并为您启动{app_name}", "ok"
 
     # 4b. 按中文名/别名匹配桌面与开始菜单 (config 里没写、但机器上确实装了的软件)
     try:
@@ -193,7 +194,7 @@ def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str]:
     if hit:
         APP_PATH_CACHE[app_name] = hit["path"]
         os.startfile(hit["path"])
-        return True, f"已为您启动{hit['name']}"
+        return True, f"已为您启动{hit['name']}", "ok"
 
     # 5. 交给 Windows 按程序名查找 (PATH / 注册表 App Paths)
     #    安全: 用列表形式启动, 且目标必须是解析出来的真实 .exe 路径。
@@ -203,7 +204,7 @@ def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str]:
         try:
             subprocess.Popen([resolved])
             APP_PATH_CACHE[app_name] = resolved
-            return True, f"已为您启动{app_name}"
+            return True, f"已为您启动{app_name}", "ok"
         except Exception:
             pass
 
@@ -215,8 +216,8 @@ def smart_launch_app(app_target: str, app_name: str) -> tuple[bool, str]:
     if _PROGRAM_NAME_RE.match(bare):
         try:
             os.startfile(bare)
-            return True, f"已尝试为您启动{app_name}"
+            return True, f"已尝试为您启动{app_name}", "unverified"
         except OSError:
             pass
 
-    return False, f"抱歉Sir，系统未能在您的电脑中定位到{app_name}的安装路径。您可以告诉我它的安装目录，我来为您配置。"
+    return False, f"抱歉Sir，系统未能在您的电脑中定位到{app_name}的安装路径。您可以告诉我它的安装目录，我来为您配置。", "fail"
