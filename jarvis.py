@@ -1735,8 +1735,12 @@ def agent_cancel() -> dict:
     return {"say": "任务已全部作废, Sir" if changed else "没有进行中的任务"}
 
 
-def parse_command(text):
-    """返回 plan dict 或 None (None = 规则不认识, 交给 Gemini)"""
+def _parse_rules(text):
+    """关键词规则层: 返回 plan dict 或 None。
+
+    注意: 这里只回答"句子里有没有这个词", 回答不了"这是在命令我、还是在问我、
+    还是在告诉我别做"。所以它不做最终判决, 由下面的 parse_command 过仲裁闸。
+    """
     t = text.strip().lower().replace(" ", "")
     raw = text.strip()
 
@@ -1756,8 +1760,8 @@ def parse_command(text):
     if "锁屏" in t or "锁定屏幕" in t:
         return {"action": "lock", "say": "已锁屏"}
 
-    # 截图
-    if "截图" in t or "截屏" in t:
+    # 截图 (含口语"截个图")
+    if "截图" in t or "截屏" in t or "截个图" in t:
         return {"action": "screenshot", "say": "已截图, 保存在图片文件夹的贾维斯截图里"}
 
     # 静音/音量
@@ -1893,6 +1897,159 @@ _CHAT_SIGNAL_RE = re.compile(
     r"怎么办|划不划算|值不值|建议|什么意思|什么梗|为什么|是什么|是怎么|"
     r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少"
 )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 规则仲裁层: 关键词命中 ≠ 可以动手
+# ═══════════════════════════════════════════════════════════════
+# 关键词规则只判断"句子里有没有这个词"。它看不见两种最要命的情形:
+#   ① 否定: "别截图了" —— 现在 if "截图" in t 会反着执行, 这是真会误伤电脑的
+#   ② 问句: "你截图的文件放到哪个文件夹里?" —— 会又截一张图, 而不是回答问题
+# 判定一律保守: "拿不准"就放过规则(保留原有的零延迟), 只有明确命中才拦。
+# 拦下来以后, 问句交给大模型答, 否定句只回一句"好, 不做", 不产生任何副作用。
+
+_NEG_RE = re.compile(
+    r"(?:不要|不用|不必|不许|不准|不需要|无需|别再|先别|暂别|甭|不想|别|不)"
+    r"(?:给我|帮我|再|把|去|要|用|用再)?$"
+)
+
+# 有副作用的动作: 这类才需要仲裁; 纯说话(chat)不拦
+_STATE_ACTIONS = {
+    "screenshot", "shutdown", "restart", "lock", "volume", "brightness",
+    "open_app", "open_file", "open_url", "close_app", "file_manage",
+    "file_delete", "write_file", "run_powershell", "web_search", "play_music",
+    "search_file",
+}
+
+# 动作 → 触发它的关键词, 用于回溯"这句话是不是在否定这个动作"
+_ACTION_WORDS = {
+    "screenshot": ("截图", "截屏", "截个图"),
+    "shutdown": ("关机",),
+    "restart": ("重启", "重新启动"),
+    "lock": ("锁屏", "锁定屏幕"),
+    "volume": ("静音", "音量"),
+    "brightness": ("亮度",),
+    "open_app": ("打开", "启动", "运行"),
+    "open_file": ("打开", "看一看", "看一下"),
+    "open_url": ("打开", "访问"),
+    "close_app": ("关闭", "关掉", "结束"),
+    "file_manage": ("移动", "复制", "删除", "删掉", "新建", "创建", "改名", "重命名"),
+    "file_delete": ("删除", "删掉"),
+    "write_file": ("写", "保存", "存成", "存到"),
+    "run_powershell": ("执行", "运行命令"),
+    "web_search": ("搜索", "百度", "搜一下"),
+    "play_music": ("播放", "放一首"),
+    "search_file": ("找", "搜索", "查", "文件"),
+}
+
+_NEG_ACK = {
+    "screenshot": "好，不截图",
+    "shutdown": "好，不关机",
+    "restart": "好，不重启",
+    "lock": "好，不锁屏",
+    "volume": "好，不动音量",
+    "brightness": "好，不动亮度",
+    "close_app": "好，不关",
+    "open_app": "好，不打开",
+    "open_file": "好，不打开",
+    "open_url": "好，不打开",
+    "file_manage": "好，不动文件",
+    "file_delete": "好，不删",
+    "write_file": "好，不写",
+    "run_powershell": "好，不执行",
+    "web_search": "好，不搜",
+    "play_music": "好，不放",
+    "search_file": "好，不找了",
+}
+
+# 强问句标志: 命中即判定在问事, 哪怕句子以动词开头("查一下截图在哪")
+_Q_STRONG = ("在哪", "在哪儿", "哪个文件夹", "什么文件夹", "叫什么", "是多少",
+             "多少钱", "几点了", "几号", "几点", "在哪个")
+# 一般疑问词
+_Q_WORDS = ("哪", "什么", "为什么", "为啥", "怎么", "怎样", "如何", "是不是",
+            "有没有", "能不能", "可不可以", "会不会", "要不要", "是否",
+            "多少", "多久", "几号", "什么时候", "谁", "干什么", "干嘛", "呢")
+# 以这些动词开头 = 明确的命令, 不再按问句处理（"搜索明天天气怎么样"是在让我搜）
+_CMD_STARTS = ("搜索", "搜一下", "搜搜", "查一下", "查查", "查询", "百度", "谷歌",
+               "打开", "启动", "运行", "播放", "放一首", "调", "设置", "清理",
+               "删除", "删掉", "移动", "复制", "新建", "创建", "保存", "写", "念",
+               "朗读", "截图", "截屏", "关机", "重启", "静音", "锁屏",
+               "帮我搜", "帮我查", "帮我把")
+
+
+def _is_negated(low: str, tokens) -> bool:
+    """关键词前面紧邻着否定词吗。窗口式匹配, 只认紧贴词尾的否定。"""
+    if not tokens:
+        return False
+    for tok in tokens:
+        i = low.find(tok)
+        while i != -1:
+            pre = low[max(0, i - 8):i]
+            if _NEG_RE.search(pre):
+                return True
+            i = low.find(tok, i + 1)
+    return False
+
+
+def _is_question(text: str) -> bool:
+    """这句话是在问事, 还是在命令我。"""
+    low = str(text or "").strip().lower().replace(" ", "")
+    if not low:
+        return False
+    if any(w in low for w in _Q_STRONG):
+        return True
+    if low.endswith(("?", "？", "吗", "呢")):
+        return True
+    if any(low.startswith(v) for v in _CMD_STARTS):
+        return False
+    return any(w in low for w in _Q_WORDS)
+
+
+def _screenshot_dir_text() -> str:
+    """截图实际落在哪个目录 (Windows 的"图片"可能被 OneDrive 接管)。"""
+    for p in (Path.home() / "Pictures" / "贾维斯截图",
+              Path.home() / "OneDrive" / "图片" / "贾维斯截图",
+              Path.home() / "OneDrive" / "Pictures" / "贾维斯截图"):
+        if p.exists():
+            return str(p)
+    return str(Path.home() / "Pictures" / "贾维斯截图")
+
+
+# 已知事实: 这类问句不用绕模型, 直接照实答
+_FACT_ANSWERS = {
+    "screenshot": lambda: f"截图都存在 {_screenshot_dir_text()} 里，Sir",
+}
+
+
+def parse_command(text):
+    """规则分流入口: 先跑关键词规则, 再对命中结果做否定/问句仲裁。"""
+    plan = _parse_rules(text)
+    if not plan:
+        return None
+    action = str(plan.get("action") or "")
+    if action not in _STATE_ACTIONS:
+        return plan                     # 纯说话, 没有副作用, 直接放行
+    low = str(text or "").strip().lower().replace(" ", "")
+
+    # ① 否定优先: "别关机" / "不要截图" 只回话, 绝不动手
+    if _is_negated(low, _ACTION_WORDS.get(action, ())):
+        ack = _NEG_ACK.get(action, "好，不动手")
+        name = str((plan.get("args") or {}).get("name") or "").strip()
+        if action.startswith("open_") and name:
+            ack = f"好，不打开{name}"
+        print(f"[仲裁] 否定句 → 不执行 {action}", flush=True)
+        return {"action": "chat", "say": ack}
+
+    # ② 问句: 不是在命令我, 而是在问事 → 有事实就直接答, 否则让位给模型
+    if _is_question(text):
+        fact = _FACT_ANSWERS.get(action)
+        if fact:
+            print(f"[仲裁] 问句 → 事实答复 {action}", flush=True)
+            return {"action": "chat", "say": fact()}
+        print(f"[仲裁] 问句 → 让位给模型 {action}", flush=True)
+        return None
+
+    return plan
 
 
 def _looks_conversational(command: str) -> bool:
