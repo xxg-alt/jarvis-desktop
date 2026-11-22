@@ -84,15 +84,28 @@ def apply_icon(hwnd) -> bool:
 
 
 def hide_from_taskbar(hwnd) -> bool:
-    """摘掉任务栏按钮 (保留窗口本身; 也会从 Alt+Tab 里消失)。"""
+    """摘掉任务栏按钮 (保留窗口本身; 也会从 Alt+Tab 里消失)。已经摘掉则空转。"""
     if os.name != "nt" or not hwnd:
         return False
     try:
         u = ctypes.windll.user32
         style = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        u.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                         (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW)
+        target = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+        if style == target:
+            return True
+        u.SetWindowLongW(hwnd, GWL_EXSTYLE, target)
         return True
+    except Exception:
+        return False
+
+
+def is_hidden(hwnd) -> bool:
+    """当前是否已经不在任务栏。"""
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        return bool(style & WS_EX_TOOLWINDOW) and not (style & WS_EX_APPWINDOW)
     except Exception:
         return False
 
@@ -118,25 +131,53 @@ def _find_windows(title: str):
 
 
 def setup_window(title: str, hide: bool = False, icon: bool = True,
-                 timeout: float = 8.0, poll: float = 0.2) -> bool:
-    """轮询等窗口出现, 然后设图标 / 摘任务栏按钮。阻塞到成功或超时。"""
+                 timeout: float = 8.0, poll: float = 0.5) -> bool:
+    """等窗口出现, 然后持续守护它的图标/任务栏状态, 直到窗口销毁。
+
+    为什么要"持续": 实测 pywebview(winforms) 在窗口显示之后会自己再补一次
+    WS_EX_APPWINDOW, 一次性设置会被它盖回去, 于是任务栏照样多个按钮。
+    这个线程很轻 (每 0.5s 读一次窗口样式, 已经对了就不写), 窗口一销毁就退出。
+    """
     if os.name != "nt":
         return False
-    deadline = time.time() + timeout
-    handled = set()
-    while time.time() < deadline:
-        for hwnd in _find_windows(title):
-            if hwnd in handled:
+    u = ctypes.windll.user32
+    found, deadline = [], time.time() + timeout
+    while time.time() < deadline and not found:
+        found = _find_windows(title)
+        if not found:
+            time.sleep(poll)
+
+    state = {}          # hwnd -> [icon_done, hide_done]
+    empty_since = None
+    while True:
+        live = []
+        for hwnd in found:
+            try:
+                if not u.IsWindow(hwnd):
+                    continue
+            except Exception:
                 continue
-            handled.add(hwnd)
-            if icon:
-                apply_icon(hwnd)
-            if hide:
+            st = state.setdefault(hwnd, [False, False])
+            if icon and not st[0]:
+                st[0] = apply_icon(hwnd)
+            if hide and not st[1]:
+                st[1] = hide_from_taskbar(hwnd)
+            # 被盖回去就再摘一次 (只在真的被盖回去时写)
+            if hide and not is_hidden(hwnd):
                 hide_from_taskbar(hwnd)
-        if handled and (not hide or len(handled) >= 1):
-            return True
+            live.append(hwnd)
+        found = live
+        for hwnd in _find_windows(title):
+            if hwnd not in found:
+                found.append(hwnd)
+        if not found:
+            if empty_since is None:
+                empty_since = time.time()
+            elif time.time() - empty_since > 4.0:
+                return False
+        else:
+            empty_since = None
         time.sleep(poll)
-    return bool(handled)
 
 
 def setup_window_async(title: str, hide: bool = False, icon: bool = True):
