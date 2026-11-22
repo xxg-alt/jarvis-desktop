@@ -207,6 +207,14 @@ def search_and_answer(query, config):
     query = str(query or "").strip()
     if not query:
         return ""
+    if "天气" in query:
+        try:
+            from weather_tools import answer_weather
+            weather_answer = answer_weather(query)
+            if weather_answer:
+                return weather_answer
+        except Exception:
+            pass
     results = web_search(query)
     if not results:
         return ""
