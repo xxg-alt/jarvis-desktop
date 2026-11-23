@@ -2243,7 +2243,14 @@ _PEEK_FOLLOW = {"armed": False, "ts": 0.0}
 # 点击意图: 必须说出"点击/点一下/点开/按一下 + 目标"的明确命令。
 # 否定("不要点/别点")、引用/假设("我说点击发送会怎样"、"如果点了删除会")、
 # 疑问句都不能触发; 规则层和执行前复查共用同一个解析器, 不留纯子串后门。
-_CLICK_COMMAND_RE = re.compile(r"(?:点击|点一下|点开|按一下)\s*(.+)", re.S)
+_CLICK_COMMAND_RE = re.compile(r"(?:点击|点一下|点开|点进|点下|按一下)\s*(.+)", re.S)
+# 动词在句尾的情况: "…那个进入微信的按钮在哪里然后帮我点击" —— 上面那条会抽出空 target,
+# 于是整句被当成"不明确"拒掉, 用户会觉得明明说清楚了。这里补一条"目标在前"的解析。
+_CLICK_VERB_ANY_RE = re.compile(r"(?:点击|点一下|点开|点进|点下|按一下)")
+_CLICK_TARGET_HINT_RE = re.compile(r"(按钮|按纽|按键|图标|选项|标签|菜单|开关|搜索框|输入框|链接)")
+# 语音识别最常见的同音错字: 不改就会把"酷狗"当"库狗"去找/去点。
+_ASR_WORD_FIX = (("库狗", "酷狗"), ("酷狗音乐", "酷狗音乐"), ("点几波", "点一下"),
+                 ("点进录", "点进入"), ("按纽", "按钮"))
 _CLICK_NEG_TAIL_RE = re.compile(
     r"(?:不要|不用|不必|不许|不准|不需要|无需|别|甭|先别|暂别|没|不)"
     r"(?:给我|帮我|再|去|要|用|把|着)?$"
@@ -2257,25 +2264,78 @@ _CLICK_NONCOMMAND_WORDS = (
 _CLICK_TARGET_NONCOMMAND_RE = re.compile(r"^(?:会|的话|之后|以后|了|了会|能|可以|将会|可能会)")
 
 
+def _click_target_from_head(head):
+    """从动词前的那半句里捞 target: '…那个进入微信的按钮在哪里然后帮我' → '进入微信的按钮'。
+
+    只在含"按钮/图标/选项"这类载体词时才认, 捞不出来返回空串 —— 宁可不点也不猜。
+    """
+    h = str(head or "").strip()
+    if not h:
+        return ""
+    h = re.sub(r"(?:然后|接着|再|之后|顺便|请|帮我|帮忙|给我|你|您|就行|一下)+$", "", h).strip()
+    h = re.sub(r"(?:在哪里|在哪儿|在哪|哪个位置|位置|是什么|长什么样|怎么点|在哪里呢)+$", "", h).strip()
+    parts = re.split(r"[，,。；;！!？?]|然后|接着|帮我|给我|帮忙", h)
+    for p in reversed(parts):
+        p = p.strip()
+        # 去掉"截图看一下那个""屏幕上这个"这类前缀, 只留载体本身
+        p = re.sub(r"^.*?(?:看一下|看看|看下|瞧一眼|找一下|找到|截图|截個圖|截屏|屏幕|页面上|界面里)",
+                   "", p).strip()
+        p = re.sub(r"^(?:那个|这个|就是|那|这)", "", p).strip()
+        if _CLICK_TARGET_HINT_RE.search(p) and 1 < len(p) <= 24:
+            return p
+    return ""
+
+
+def _asr_fix(text) -> str:
+    """纠正语音识别里高频的同音错字 (酷狗/按钮/点击家族)。"""
+    s = str(text or "")
+    for wrong, right in _ASR_WORD_FIX:
+        s = s.replace(wrong, right)
+    return s
+
+
+def _click_target_close(a, b) -> bool:
+    """两个 target 是否指同一个东西: 互相包含或字面相似度过关即可。
+
+    闸门的目的只是"用户是不是明确点名了要点的东西", 不该因为 ASR 把"进入"听成"进录"
+    就整句拒掉; 真正按钮对不对由点前读文字 (_click_label_matches_target) 兜底。
+    """
+    import difflib
+    x, y = _tight(a), _tight(b)
+    if not x or not y:
+        return False
+    if x in y or y in x:
+        return True
+    return difflib.SequenceMatcher(None, x, y).ratio() >= 0.55
+
+
 def _click_intent(text):
     """返回 (target, state)。state: command 明确命令 / negated 明确否定 / unclear 不确定。"""
-    raw = str(text or "").strip()
+    raw = _asr_fix(text).strip()
     if not raw:
         return "", "unclear"
     low = _tight(raw)
     if any(w in low for w in _CLICK_NONCOMMAND_WORDS):
         return "", "unclear"
     m = _CLICK_COMMAND_RE.search(raw)
-    if not m:
-        return "", "unclear"
-    prefix = _tight(raw[:m.start()])
-    if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
-        return "", "negated"
-    target = m.group(1).strip().rstrip("。！？!?，,、；; ")
-    target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
-    if not target or _CLICK_TARGET_NONCOMMAND_RE.match(target):
-        return "", "unclear"
-    return target, "command"
+    if m:
+        prefix = _tight(raw[:m.start()])
+        if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+            return "", "negated"
+        target = m.group(1).strip().rstrip("。！？!?，,、；; ")
+        target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
+        if target and not _CLICK_TARGET_NONCOMMAND_RE.match(target):
+            return target, "command"
+    # 动词在句尾 / 动词后为空: 回头从"动词前"那半句里找载体
+    v = _CLICK_VERB_ANY_RE.search(raw)
+    if v:
+        prefix = _tight(raw[:v.start()])
+        if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+            return "", "negated"
+        head_target = _click_target_from_head(raw[:v.start()])
+        if head_target:
+            return head_target, "command"
+    return "", "unclear"
 
 
 _SELF_EXIT_WORDS = ("退下", "关闭自己", "关掉自己", "退出自己", "你可以退出了", "没你的事了可以退",
@@ -3696,10 +3756,11 @@ def execute_plan(plan, command_id=None, source=""):
     if action == "click_screen":
         user_text = str(getattr(_TL, "user_text", "") or "")
         ordered, state = _click_intent(user_text)
-        planned = _tight(args.get("target") or "")
-        mismatch = bool(planned) and not (planned in _tight(ordered) or _tight(ordered) in planned)
+        planned = str(args.get("target") or "")
+        mismatch = bool(planned) and bool(ordered) and not _click_target_close(planned, ordered)
         if state != "command" or not ordered or mismatch:
-            print("[看屏点击] 原话没有明确点击命令或目标对不上, 拒绝执行并反问", flush=True)
+            print(f"[看屏点击] 原话没有明确点击命令或目标对不上, 拒绝执行并反问: "
+                  f"state={state} ordered={ordered!r} planned={planned!r}", flush=True)
             speak("您明确说要点哪个按钮，我才会在屏幕上点，Sir；要我点哪一个？")
             return False
 

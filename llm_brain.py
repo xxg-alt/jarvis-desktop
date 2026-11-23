@@ -151,6 +151,10 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 写文档/写内容存成文件（如“帮我写个周报”“把刚才的方案写成一个文档”“生成一份会议纪要”）：action="write_file"，args={"name": "文件名", "content": "完整的文件正文", "folder": "目标目录，可省略"}。content 里写完整内容，结构用 Markdown 标题和列表；不要把正文截短，也不要说“内容太长写不下”。name 用 .md 或 .txt 结尾；写 Word 文档用 .docx。不要用 write_file 执行代码或改配置。
   folder 只能填四类：工作区、桌面、文档、下载，可以带子目录（如 "下载\\报告"）。用户没说存哪就别写 folder（默认进工作区）；用户明确说存哪（“写到桌面的项目文档里”“存到下载里”），就按他的说法填，别自己改地方。用户给出别处的完整路径（如 "D:\\项目\\资料"）时原样填入，系统会单独向他确认。
 - 打开网址：action="open_url"，args={"url": "http(s)://..."}
+- 播放歌曲/音乐（“播《我怀念的》”“放首歌”“在我酷狗里播X”）：先认用户点名的客户端（酷狗/QQ音乐/网易云/酷我）。
+  点了名就 action="open_app"，args={"exe": "KuGou.exe", "name": "酷狗音乐"}（QQ音乐用 QQMusic.exe，其余按软件原名）；
+  没点名默认酷狗。播放在客户端里由用户接着指挥（“点击搜索框”“输入歌名”），所以 say 写“打开酷狗了，说歌名我在里面帮你搜”。
+  **绝不用 open_url 打开网易云/QQ音乐网页来顶替本机客户端**：用户要的是在他自己那个软件里放，不是开个网页；只有他明确说“用浏览器/网页听”才走 open_url。
 - 搜索：action="web_search"，args={"query": "搜索关键词"}。系统会真联网检索并把带出处的答案直接朗读给用户，所以 say 只写垫话（如“我查一下”），不要在 say 里自己编答案；需要实时信息（天气、价格、新闻、最新版本）的问题一律走 web_search，不要凭记忆回答。
 - 音量：action="volume"，args={"mode": "up|down|mute"}
 - 看屏幕内容（如"看看屏幕上这个是什么""屏幕上的报错什么意思""这个页面在干嘛"）：action="peek_screen"，args={"question": "把用户的问题原样带上"}。系统会截当前屏幕交给视觉模型，say 只写垫话（如"我看看屏幕"），绝不要在 say 里自己编屏幕上的内容；也不要用 screenshot 顶替（截图的图会存盘且不回答内容）。
@@ -745,7 +749,14 @@ def _vision_chat(system, question, image_b64, config, detail="high",
     elif provider_name == "DeepSeek":
         cfg["ai_model"] = "deepseek-flash"
     try:
-        return _provider_chat(cfg, messages, max_tokens=max_tokens)
+        text = _provider_chat(cfg, messages, max_tokens=max_tokens)
+        if str(text or "").strip():
+            return text
+        # 实测 (2026-11-23 日志): 预算给太紧时 deepseek-flash 把 token 烧在思考上,
+        # finish_reason=length 但 content 是空的 —— 定位因此拿不到坐标, 用户听到"没找到"。
+        # 空返回就放大预算重发一次, 还空才交给调用方当失败处理。
+        print("[视觉] 返回空白内容, 放大 token 预算重试一次", flush=True)
+        return _provider_chat(cfg, messages, max_tokens=max(int(max_tokens) * 4, 600))
     except _LlmError as exc:
         text = str(exc)
         if "HTTP 4" in text:
@@ -770,9 +781,10 @@ def query_vision_locate(question: str, image_b64: str, config: dict,
     """在全屏图上定位用户所问的对象, 返回模型原文 (应为一行坐标 JSON)。
 
     提示词强制只输出 JSON; 解析与越界校验由调用方负责, 失败就放弃二次看屏。
+    max_tokens 留 600: 只给 120 时模型常在思考里把预算烧光, 正文返回空 (见 2026-11-23 日志)。
     """
     return _vision_chat(_VISION_LOCATE_SYSTEM, question, image_b64, config,
-                        detail=detail, mime=mime, max_tokens=120)
+                        detail=detail, mime=mime, max_tokens=600)
 
 
 def _provider_chat(config: dict, messages,
