@@ -672,6 +672,16 @@ _RUN_LOCK = threading.RLock()
 _TL = threading.local()
 
 
+def _source_label(source):
+    """来源口径: 空值按 local, 其余保留调用方标识 (remote/voice/text...)。"""
+    return str(source or "").strip() or "local"
+
+
+def _input_source(source=None):
+    """确认状态的登记/消费共用: 显式来源优先, 否则沿用当前指令的来源。"""
+    return _source_label(source or getattr(_TL, "command_source", ""))
+
+
 def _new_command_id():
     global _COMMAND_ID
     with _COMMAND_ID_LOCK:
@@ -732,9 +742,11 @@ def _run(cmd, **kw):
 #      最后超时按取消处理, 用户只看到"确认什么"。
 # 新做法: 守卫把"待确认"登记成模块级状态; 指令入口在拿 _RUN_LOCK 之前先问一句
 # "这是不是在回答守卫", 是就消费掉; 界面点击照旧生效, 两边谁先到算谁。
+# 待确认带来源: 只有发起这次危险动作的来源能在 TTL 内回答, 别的来源碰它不得消费/取消。
 GUARD_TTL = 60.0
 _GUARD_LOCK = threading.Lock()
-_GUARD = {"token": 0, "desc": "", "event": None, "answer": "", "ts": 0.0, "active": False}
+_GUARD = {"token": 0, "desc": "", "event": None, "answer": "", "ts": 0.0,
+          "active": False, "source": "local"}
 _GUARD_YES = ("确认", "确定", "确认执行", "确定执行", "好的", "好", "可以", "是的", "是",
               "对", "嗯", "同意", "执行", "关吧", "继续", "没问题", "行", "y", "yes")
 _GUARD_NO = ("取消", "算了", "不用", "不要", "别", "不关", "停下", "停", "不做", "免了",
@@ -742,11 +754,11 @@ _GUARD_NO = ("取消", "算了", "不用", "不要", "别", "不关", "停下", 
 _GUARD_PUNCT = re.compile(r"[。！？!?，,.、\s]")
 
 
-def _guard_begin(desc):
+def _guard_begin(desc, source=""):
     with _GUARD_LOCK:
         _GUARD["token"] += 1
         _GUARD.update(desc=str(desc or ""), event=threading.Event(),
-                      answer="", ts=time.time(), active=True)
+                      answer="", ts=time.time(), active=True, source=_input_source(source))
         return _GUARD["token"]
 
 
@@ -757,8 +769,12 @@ def _guard_end(token):
             _GUARD["event"] = None
 
 
-def _guard_answer(text) -> bool:
-    """指令入口的守卫拦截: 这句话若是在回答"待确认", 消费掉并返回 True。"""
+def _guard_answer(text, source="") -> bool:
+    """指令入口的守卫拦截: 这句话若是在回答本来源的"待确认", 消费掉并返回 True。
+
+    来源不一致时原样放行 (不消费、不取消): 这句话走正常指令流程,
+    待确认留给发起方在自己的 TTL 内回答或自然过期。
+    """
     low = _GUARD_PUNCT.sub("", str(text or "")).lower()
     if not low:
         return False
@@ -771,10 +787,13 @@ def _guard_answer(text) -> bool:
                 return True
         return False
 
+    src = _input_source(source)
     with _GUARD_LOCK:
         if not _GUARD.get("active"):
             return False
         if time.time() - float(_GUARD.get("ts") or 0) > GUARD_TTL:
+            return False
+        if _source_label(_GUARD.get("source")) != src:
             return False
         if _hit(_GUARD_NO):
             _GUARD["answer"] = "no"
@@ -801,9 +820,9 @@ def _guard_answer(text) -> bool:
     return handled
 
 
-def _guard_confirm(desc, timeout=GUARD_TTL) -> bool:
-    """等一个确认: 界面点击 / 语音或文字回答, 谁先到算谁。"""
-    token = _guard_begin(desc)
+def _guard_confirm(desc, timeout=GUARD_TTL, source="") -> bool:
+    """等一个确认: 界面点击 / 本来源的语音或文字回答, 谁先到算谁。"""
+    token = _guard_begin(desc, source=source)
     speak(f"即将{desc}。确认就说「确认」，取消就说「取消」，Sir")
     ui_box = {"v": None}
     ui_thread = None
@@ -2305,7 +2324,8 @@ _SENSITIVE_KEYWORDS = ("密码", "登录", "支付", "银行", "钱包", "验证
 _SENSITIVE_PROMPT = "当前窗口可能含敏感内容，确定要看吗？"
 _PEEK_CONFIRM_TTL = 60.0
 _PEEK_CONFIRM_LOCK = threading.Lock()
-_PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0, "window": ()}
+_PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0, "window": (),
+                 "source": "local"}
 _PEEK_YES = ("确定", "要看", "继续", "可以", "好的", "行", "是", "对", "嗯", "yes", "y")
 _PEEK_NO = ("取消", "不要", "不看", "算了", "不用", "不", "no", "n")
 _PEEK_PUNCT = re.compile(r"[。！？!?，,、\.；;：:“”\"‘’'（）()\[\]【】…·～~\s]")
@@ -2539,7 +2559,8 @@ def _peek_second_pass(question, full_img, full_b64, first_answer):
             pass
 
 
-def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False, confirmed_window=None) -> str:
+def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
+                 confirmed_window=None, source="") -> str:
     """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。
 
     sensitive_confirmed 只代表用户点过头, 不能绕过发图前的窗口/敏感性复检:
@@ -2563,7 +2584,8 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False, con
             if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
                 with _PEEK_CONFIRM_LOCK:
                     _PEEK_CONFIRM.update(pending=True, question=str(question or ""),
-                                         ts=time.time(), window=_foreground_window_identity())
+                                         ts=time.time(), window=_foreground_window_identity(),
+                                         source=_input_source(source))
                 print("[看屏] 敏感画面, 等用户确认", flush=True)
                 return _SENSITIVE_PROMPT
             print("[看屏] 敏感画面跳过", flush=True)
@@ -2614,22 +2636,28 @@ def _peek_answer_verdict(text):
     return None
 
 
-def _peek_confirm_answer(text) -> bool:
-    """消费敏感看屏确认: 只有明确答复才算消费; 其它清掉待确认并放行原指令。"""
+def _peek_confirm_answer(text, source="") -> bool:
+    """消费敏感看屏确认: 只有本来源的明确答复才算消费; 其它放行原指令。
+
+    来源不一致时不消费也不取消: 待确认留给发起方在 TTL 内回答或自然过期。
+    """
+    src = _input_source(source)
     with _PEEK_CONFIRM_LOCK:
         if not _PEEK_CONFIRM.get("pending"):
             return False
         if time.time() - float(_PEEK_CONFIRM.get("ts") or 0) > _PEEK_CONFIRM_TTL:
-            _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=())
+            _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local")
+            return False
+        if _source_label(_PEEK_CONFIRM.get("source")) != src:
             return False
         question = str(_PEEK_CONFIRM.get("question") or "")
         window = _PEEK_CONFIRM.get("window") or ()
-        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=())
+        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local")
     verdict = _peek_answer_verdict(text)
     if verdict is None:
         return False
     if verdict == "yes":
-        speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window))
+        speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window, source=src))
     else:
         speak("好，那就不看屏了，Sir")
     return True
@@ -2911,7 +2939,7 @@ def _open_app_verify_status(action_ok):
     return "fail" if not action_ok and verify == "ok" else verify
 
 
-def _perform_plan(plan):
+def _perform_plan(plan, source=""):
     """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。
 
     同时把"这一步到底成没成"记到线程本地 _TL.action_ok:
@@ -3153,7 +3181,7 @@ def _perform_plan(plan):
                     ui_bridge.emit_state("PERCEIVING")
                 except Exception:
                     pass
-            say = _peek_screen(str(args.get("question") or ""))
+            say = _peek_screen(str(args.get("question") or ""), source=source)
             if ui_bridge is not None:
                 try:
                     ui_bridge.emit_state("IDLE")
@@ -3253,9 +3281,9 @@ def _perform_plan(plan):
     return say
 
 
-def _async_worker(plan, command_id, status_done):
+def _async_worker(plan, command_id, status_done, source=""):
     """后台只执行工具；等垫话结束后，把结果交给主循环，不直接播报或操作 UI。"""
-    say = _perform_plan(plan)
+    say = _perform_plan(plan, source=source)
     status_done.wait()
     if _command_is_current(command_id):
         _ASYNC_RESULTS.put((command_id, say))
@@ -3316,7 +3344,7 @@ def _dispatch_loop():
             print(f"[结果回播异常] {e}")
 
 
-def execute_plan(plan, command_id=None):
+def execute_plan(plan, command_id=None, source=""):
     """执行动作；返回 True 表示系统工具已转入后台，最终结果稍后回播。"""
     if not plan:
         speak("这条指令我还没学会, 可以换个说法, 比如打开记事本、搜索天气、音量调大")
@@ -3332,7 +3360,7 @@ def execute_plan(plan, command_id=None):
             return False
         desc = plan.get("guard_desc") or f"执行操作：{action}"
         # 语音/文字回答与界面点击并行等, 谁先到算谁 (详见 _guard_confirm 注释)
-        verdict = _guard_confirm(desc)
+        verdict = _guard_confirm(desc, source=source)
         if not verdict:
             speak("好的，已取消操作，Sir。")
             return False
@@ -3351,7 +3379,7 @@ def execute_plan(plan, command_id=None):
         _ensure_result_dispatcher()
         threading.Thread(
             target=_async_worker,
-            args=(plan, command_id, status_done),
+            args=(plan, command_id, status_done, source),
             name=f"jarvis-tool-{action}",
             daemon=True,
         ).start()
@@ -3362,7 +3390,7 @@ def execute_plan(plan, command_id=None):
             status_done.set()
         return True
 
-    speak(_perform_plan(plan))
+    speak(_perform_plan(plan, source=source))
     return False
 
 
@@ -3372,9 +3400,10 @@ def handle_command(command, source=""):
         return
     command = correct_asr_text(command.strip())
     command_id = _new_command_id()
+    src = _source_label(source)
     # 原话留在 thread-local: 模型漏填 folder 时, 写文档要用它兜底解析存放位置
     _TL.user_text = command
-    _TL.command_source = source or "local"
+    _TL.command_source = src
     if source:
         print(f"[指令·{source}] {command[:80]}", flush=True)
     # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
@@ -3385,14 +3414,14 @@ def handle_command(command, source=""):
         return
     # 高危动作在等确认时, "确认/取消"必须先在这里被消费;
     # 否则它会排到 _RUN_LOCK 后面, 表现就是"我确认了, 它却问我确认什么"。
-    if _guard_answer(command):
+    if _guard_answer(command, src):
         return
-    if _peek_confirm_answer(command):
+    if _peek_confirm_answer(command, src):
         return
     with _RUN_LOCK:
         _TL.command_id = command_id
         try:
-            _handle_command_inner(command, command_id)
+            _handle_command_inner(command, command_id, src)
         finally:
             _TL.command_id = None
 
@@ -3442,7 +3471,7 @@ def _agent_control_command(command: str):
     return None
 
 
-def _handle_command_inner(command, command_id):
+def _handle_command_inner(command, command_id, source=""):
     print(f"你: {command}")
     if not memory_store.SELECT_RE.match(_tight(command)):
         _clear_memory_candidates()
@@ -3662,7 +3691,7 @@ def _handle_command_inner(command, command_id):
         ui_bridge.emit_state("ACTING")
     async_started = False
     try:
-        async_started = execute_plan(plan, command_id=command_id)
+        async_started = execute_plan(plan, command_id=command_id, source=source)
     finally:
         MEMORY.record_turn(command, plan,
                            source=getattr(_TL, "command_source", None) or plan_source or "unresolved")
@@ -3835,7 +3864,7 @@ def _wake_loop_vosk(hotkey_event):
         if not text:
             return
         try:
-            handle_command(text)
+            handle_command(text, source="voice")
         except SystemExit:
             raise
         finally:
@@ -3953,7 +3982,7 @@ def _wake_loop_winrt(hotkey_event):
     def _run(text):
         nonlocal follow_until
         try:
-            handle_command(text)
+            handle_command(text, source="voice")
         except SystemExit:
             raise
         finally:
@@ -4051,7 +4080,7 @@ def _wake_loop_whisper(hotkey_event):
     def _run(text):
         nonlocal follow_until
         try:
-            handle_command(text)
+            handle_command(text, source="voice")
         except SystemExit:
             raise
         finally:
@@ -4186,7 +4215,7 @@ def wake_loop():
         if hotkey_event.is_set():
             hotkey_event.clear()
             speak("我在")
-            try: handle_command(listen_once())
+            try: handle_command(listen_once(), source="voice")
             except SystemExit: raise
             except Exception: speak("没听清, 再说一次吧")
             continue
@@ -4204,11 +4233,11 @@ def wake_loop():
                 rest = heard.split(w, 1)[1].strip(" ,，。")
                 print(f"[唤醒] 听到: {heard}")
                 if rest:
-                    try: handle_command(rest)
+                    try: handle_command(rest, source="voice")
                     except SystemExit: raise
                 else:
                     speak("我在")
-                    try: handle_command(listen_once())
+                    try: handle_command(listen_once(), source="voice")
                     except SystemExit: raise
                     except Exception: speak("没听清")
                 break
@@ -4245,7 +4274,7 @@ def text_loop():
         if not cmd:
             continue
         try:
-            handle_command(cmd)
+            handle_command(cmd, source="text")
         except SystemExit:
             break
 

@@ -44,7 +44,7 @@ def capture(text):
     spoken.append(text)
 
 
-def fake_exec(plan, command_id=None):
+def fake_exec(plan, command_id=None, source=""):
     plans.append(plan)
     return False
 

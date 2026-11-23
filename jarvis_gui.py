@@ -475,7 +475,7 @@ class TkFullscreenHUDWindow:
             b = tk.Button(parent, text=text,
                           bg=BG_CARD, fg=WHITE, activebackground=CYAN_MID, activeforeground=WHITE,
                           relief="flat", font=("Microsoft YaHei UI", 9), padx=10, pady=6,
-                          command=lambda: threading.Thread(target=jarvis.handle_command, args=(cmd_text,), daemon=True).start())
+                          command=lambda: threading.Thread(target=jarvis.handle_command, args=(cmd_text, "text"), daemon=True).start())
             b.pack(side="left", fill="x", expand=True, padx=3)
             return b
 
@@ -697,7 +697,7 @@ class TkFullscreenHUDWindow:
         cmd = self.entry.get().strip()
         if not cmd: return
         self.entry.delete(0, "end")
-        threading.Thread(target=jarvis.handle_command, args=(cmd,), daemon=True).start()
+        threading.Thread(target=jarvis.handle_command, args=(cmd, "text"), daemon=True).start()
 
     def render(self, t, level):
         now = time.time()

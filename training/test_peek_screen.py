@@ -103,7 +103,7 @@ def main():
 
     # ── 四、动作执行走通(外观层桩掉 _peek_screen, 验证接线) ──
     real_peek = jarvis._peek_screen
-    jarvis._peek_screen = lambda q="": f"桩回答: {q}"
+    jarvis._peek_screen = lambda q="", **kwargs: f"桩回答: {q}"
     try:
         say = jarvis._perform_plan({"action": "peek_screen", "args": {"question": "这是什么"}})
     finally:

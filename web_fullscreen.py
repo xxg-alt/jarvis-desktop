@@ -819,7 +819,7 @@ class FullscreenHUDWindow:
     def _run_command(self, text):
         import jarvis
         try:
-            jarvis.handle_command(text)
+            jarvis.handle_command(text, source="text")
         except Exception as exc:
             print(f"[全屏HUD] 指令处理异常: {exc}", flush=True)
             try:
