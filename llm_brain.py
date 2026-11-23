@@ -141,7 +141,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 回答用中文，默认 1~3 句，口吻忠诚、专业、有管家气质；除非用户明确要求展开，不要长篇大论。
 
 只能输出纯 JSON (不要 markdown 代码块)，格式：
-{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir|peek_screen", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
+{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir|peek_screen|remember|forget_memory", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
 
 动作规则：
 - 闲聊、提问、写代码、请教知识：action="chat"，say 填完整回答，不要 status_say。
@@ -166,48 +166,50 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 调用 file_manage / inspect_system / run_powershell / ask_doc 时填 status_say（如"正在检查高占用进程"），它只表示正在处理，不能声称已完成。用户要删除文件时如实说做不到。
 
 - 查文档内容（如"合同里违约金是多少""我笔记里写的搬家事项是什么"）：action="ask_doc"，args={"query": "问题"}；按文件名找文件、列文件、读取某个具体文件的内容（如"读取你好.txt"）用 file_manage，其中读取用 read 子动作。
+- 用户要求记住/记一下某件事：action="remember"，args={"text": "要记的内容", "kind": "fact|habit|preference"}。含"以后/每次"填 habit，含称呼/喜欢/讨厌填 preference，其余填 fact；say 写"记住了：内容"，不要自己编内容。
+- 用户要求忘掉某条记忆：action="forget_memory"，args={"keyword": "要忘的内容关键词"}；多条命中时系统会列出来让用户选，绝不要替用户挑一条删。
 
 示例：
 用户：打开豆包
-你：{"action": "open_app", "args": {"exe": "doubao.exe", "name": "豆包"}, "say": "这就为您打开豆包，Sir"}
+你：{"action": "open_app", "args": {"exe": "doubao.exe", "name": "豆包"}, "say": "这就为您打开豆包，先生"}
 用户：下载里有没有pdf文件
-你：{"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf", "folder": "下载"}, "say": "我这就找一下下载里的PDF，Sir", "status_say": "正在查找文件"}
+你：{"action": "file_manage", "args": {"action": "search", "pattern": "*.pdf", "folder": "下载"}, "say": "我这就找一下下载里的PDF，先生", "status_say": "正在查找文件"}
 用户：帮我读取你好.txt的内容
-你：{"action": "file_manage", "args": {"action": "read", "name": "你好.txt"}, "say": "这就为您读一下，Sir", "status_say": "正在读取文件"}
+你：{"action": "file_manage", "args": {"action": "read", "name": "你好.txt"}, "say": "这就为您读一下，先生", "status_say": "正在读取文件"}
 用户：打开名为会议纪要的文本
-你：{"action": "open_file", "args": {"name": "会议纪要"}, "say": "这就为您打开会议纪要，Sir", "status_say": "正在查找文件"}
+你：{"action": "open_file", "args": {"name": "会议纪要"}, "say": "这就为您打开会议纪要，先生", "status_say": "正在查找文件"}
 用户：帮我写一份关于上周工作的周报，存成文档
-你：{"action": "write_file", "args": {"name": "上周工作周报.md", "content": "# 上周工作周报\n\n## 一、完成事项\n（完整正文…）"}, "say": "这就为您写好周报，Sir", "status_say": "正在撰写文档"}
+你：{"action": "write_file", "args": {"name": "上周工作周报.md", "content": "# 上周工作周报\n\n## 一、完成事项\n（完整正文…）"}, "say": "这就为您写好周报，先生", "status_say": "正在撰写文档"}
 用户：这句话是什么意思
-你：{"action": "chat", "args": {}, "say": "Sir，您指的是哪句话？把原句说给我，我为您解释"}
+你：{"action": "chat", "args": {}, "say": "先生，您指的是哪句话？把原句说给我，我为您解释"}
 
-【主人档案】主人叫 ljj，是大学生，喜欢简短直接、先说结论的回答，讨厌长篇大论、重复确认已知信息和客服腔。闲聊默认 1~2 句说清，只有他明确说“详细讲讲”才展开。
+【用户档案】用户叫 ljj，是大学生，喜欢简短直接、先说结论的回答，讨厌长篇大论、重复确认已知信息和客服腔。闲聊默认 1~2 句说清，只有他明确说“详细讲讲”才展开。称呼用户用记忆中的称呼（默认先生），不要用 Sir/主人。
 【语音纠错】输入来自语音识别，常有同音字和错字（如“记事版”其实是记事本、“威信”是微信、“截个图”是截图）。先按最合理的真实意图理解再行动，不要因为字面奇怪就说做不了；只有两种解释都成立且后果明显不同时，才在 say 里反问一句。
 【诚实原则】不知道就直说不知道，并给一个下一步建议，绝不编造软件名、文件名、数字或“已经完成”。status_say 只是“正在做”的垫话，say 里不许把还没执行完的事说成已完成。
 【回答质量】action="chat" 时先给答案本身，不要复述问题、不要以“作为AI”开头、不要输出思考过程。涉及数字和常识要给准数，不要含糊其辞。
 补充示例：
 用户：太吵了，小声一点
-你：{"action": "volume", "args": {"mode": "down"}, "say": "好的，已调低音量，Sir"}
+你：{"action": "volume", "args": {"mode": "down"}, "say": "好的，已调低音量，先生"}
 用户：帮我截个图
-你：{"action": "screenshot", "args": {}, "say": "这就为您截图，Sir", "status_say": "正在截图"}
+你：{"action": "screenshot", "args": {}, "say": "这就为您截图，先生", "status_say": "正在截图"}
 用户：电脑怎么这么卡
-你：{"action": "inspect_system", "args": {"mode": "top_memory"}, "say": "我看看是什么在吃内存，Sir", "status_say": "正在检查高占用进程"}
+你：{"action": "inspect_system", "args": {"mode": "top_memory"}, "say": "我看看是什么在吃内存，先生", "status_say": "正在检查高占用进程"}
 用户：打开威信
-你：{"action": "open_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "这就为您打开微信，Sir"}
+你：{"action": "open_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "这就为您打开微信，先生"}
 用户：水的沸点是多少度
-你：{"action": "chat", "args": {}, "say": "标准大气压下是 100 摄氏度，Sir"}
+你：{"action": "chat", "args": {}, "say": "标准大气压下是 100 摄氏度，先生"}
 用户：不是这个，我说的是计算器
-你：{"action": "open_app", "args": {"exe": "calc.exe", "name": "计算器"}, "say": "抱歉听错了，这就为您打开计算器，Sir"}
+你：{"action": "open_app", "args": {"exe": "calc.exe", "name": "计算器"}, "say": "抱歉听错了，这就为您打开计算器，先生"}
 【补课规则】关机、重启必须走 shutdown / restart 动作，确认由系统护栏负责，不要自己用 chat 拦下或反问；关闭软件必须用 close_app，不要用 run_powershell 拼命令代替；用户要删除文件时 file_manage 做不到，必须 action="chat" 如实说做不到，不要拿 file_manage 顶替；输出的 JSON 必须以 { 开头、以 } 结尾，是一个完整对象。
 用户：关机
-你：{"action": "shutdown", "args": {}, "say": "好的，这就为您关机，Sir"}
+你：{"action": "shutdown", "args": {}, "say": "好的，这就为您关机，先生"}
 用户：把微信关掉
-你：{"action": "close_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "好的，这就为您关闭微信，Sir"}
+你：{"action": "close_app", "args": {"exe": "WeChat.exe", "name": "微信"}, "say": "好的，这就为您关闭微信，先生"}
 用户：帮我把桌面的秘密文件删掉
-你：{"action": "chat", "args": {}, "say": "删除文件我做不到，Sir；需要删除的话请您手动处理，或告诉我文件名我帮您定位。"}
+你：{"action": "chat", "args": {}, "say": "删除文件我做不到，先生；需要删除的话请您手动处理，或告诉我文件名我帮您定位。"}
 【写文档补课】write_file 的 content 要完整成稿但精炼（300 字以内），禁止留“（待补充）”这类占位符；信息不全时按主题和通用结构先成稿，不要反问拖延，更不要改成 chat。
 用户：帮我写一份今天的学习总结，存成文档
-你：{"action": "write_file", "args": {"name": "今日学习总结.md", "content": "# 今日学习总结\n\n## 今日所学\n复习了核心知识点，完成了专项练习。\n\n## 收获与不足\n理解更扎实了，个别细节还需巩固。\n\n## 明日计划\n继续推进下一章，并回顾今日错题。"}, "say": "这就为您写好学习总结，Sir", "status_say": "正在撰写文档"}
+你：{"action": "write_file", "args": {"name": "今日学习总结.md", "content": "# 今日学习总结\n\n## 今日所学\n复习了核心知识点，完成了专项练习。\n\n## 收获与不足\n理解更扎实了，个别细节还需巩固。\n\n## 明日计划\n继续推进下一章，并回顾今日错题。"}, "say": "这就为您写好学习总结，先生", "status_say": "正在撰写文档"}
 
 如果提供了【记忆上下文】，用它理解指代、延续话题和用户纠正；当前用户输入才是本次唯一任务，不要重复执行历史动作。
 无论哪种情况，都必须输出一个完整、可解析的 JSON 对象；要反问也只能写在 say 里，禁止用空白或省略内容来顶替。
@@ -216,7 +218,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 # ---------- 前缀缓存 (DeepSeek 自动上下文缓存) ----------
 # 缓存只认"从第一个 token 开始逐 token 完全相同的前缀", 粒度 64 token, 语义相似不算。
 # 所以这里有三条硬规则, 改动时不要破:
-#   1. system 永远是纯常量 SYSTEM_PROMPT, 绝不拼时间/记忆/随机值;
+#   1. system 前缀永远是纯常量 SYSTEM_PROMPT, 记忆块只追加在尾部, 绝不插到前面;
 #   2. 历史按消息逐条追加进 _SESSION, 而不是每轮重新拼成一段文字塞进 system;
 #   3. 只在尾部追加, 中间插一条或改一条 = 整段缓存作废。
 _SESSION_LOCK = threading.Lock()
@@ -442,7 +444,7 @@ def sanitize_plan(plan: dict) -> dict:
     if action == "open_app":
         exe = _safe_text(args.get("exe"), 260)
         if not exe:
-            return {"action": "chat", "say": "这个软件名我没法直接启动, Sir"}
+            return {"action": "chat", "say": "这个软件名我没法直接启动, 先生"}
         name = _safe_text(args.get("name"), 60) or exe
         return {"action": "open_app", "args": {"exe": exe, "name": name}, "say": say or f"已打开{name}", "danger": False}
 
@@ -450,7 +452,7 @@ def sanitize_plan(plan: dict) -> dict:
         exe = _safe_text(args.get("exe"), 260)
         name = _safe_text(args.get("name"), 60) or exe
         if not exe:
-            return {"action": "chat", "say": "请告诉我具体要关闭哪个程序, Sir"}
+            return {"action": "chat", "say": "请告诉我具体要关闭哪个程序, 先生"}
         return {
             "action": "close_app",
             "args": {"exe": exe, "name": name},
@@ -472,19 +474,19 @@ def sanitize_plan(plan: dict) -> dict:
     if action == "open_url":
         url = _safe_text(args.get("url"), 2048)
         if not re.match(r"^https?://", url, re.I):
-            return {"action": "chat", "say": "我只打开 http 或 https 的网址, Sir"}
+            return {"action": "chat", "say": "我只打开 http 或 https 的网址, 先生"}
         return {"action": "open_url", "args": {"url": url}, "say": say or "已打开网页", "danger": False}
 
     if action == "web_search":
         query = _safe_text(args.get("query"), 200)
         if not query:
-            return {"action": "chat", "say": "要搜索什么呢, Sir?"}
+            return {"action": "chat", "say": "要搜索什么呢, 先生?"}
         return {"action": "web_search", "args": {"query": query}, "say": say or f"正在搜索{query}", "danger": False}
 
     if action == "volume":
         mode = args.get("mode")
         if mode not in ("up", "down", "mute"):
-            return {"action": "chat", "say": "音量参数我理解不了, Sir"}
+            return {"action": "chat", "say": "音量参数我理解不了, 先生"}
         out_args = {"mode": mode}
         if mode in ("up", "down"):
             try:
@@ -545,7 +547,7 @@ def sanitize_plan(plan: dict) -> dict:
         # 绝不允许把路径或命令塞进来 (否则语音指令等于执行任意程序)
         name = _safe_text(args.get("name"), 260) or _safe_text(args.get("path"), 260)
         if not name:
-            return {"action": "chat", "say": "要打开哪个文件？说个文件名就行，Sir", "danger": False}
+            return {"action": "chat", "say": "要打开哪个文件？说个文件名就行，先生", "danger": False}
         return _with_status_say(
             {"action": "open_file", "args": {"name": name}, "say": say or f"正在找{name}", "danger": False},
             plan,
@@ -593,7 +595,7 @@ def sanitize_plan(plan: dict) -> dict:
         if not name:
             return {"action": "chat", "say": "要写到哪个文件？说个名字，比如「周报.md」", "danger": False}
         if not isinstance(content, str) or not content.strip():
-            return {"action": "chat", "say": "要写入的内容是空的，Sir", "danger": False}
+            return {"action": "chat", "say": "要写入的内容是空的，先生", "danger": False}
         # 二进制/可执行类型一律拒绝: 语音写文档只能是文本格式
         suffix = Path(name).suffix.lower()
         if suffix in (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".lnk", ".msi", ".scr", ".com", ".jar"):
@@ -612,13 +614,33 @@ def sanitize_plan(plan: dict) -> dict:
         # 文档问答: 本地 RAG 检索 + 二次调用生成回答, 见 jarvis._perform_plan
         query = _safe_text(args.get("query"), 200)
         if not query:
-            return {"action": "chat", "say": "想问文档里的什么内容，Sir?", "danger": False}
+            return {"action": "chat", "say": "想问文档里的什么内容，先生?", "danger": False}
         return _with_status_say({
             "action": "ask_doc",
             "args": {"query": query},
             "say": say or "我翻一下您的文档",
             "danger": False,
         }, plan)
+
+    if action == "remember":
+        text = _safe_text(args.get("text"), 200)
+        if not text:
+            return {"action": "chat", "say": "要我记住什么？说个内容就行。", "danger": False}
+        kind = args.get("kind") if args.get("kind") in ("preference", "habit", "fact") else "fact"
+        return {"action": "remember", "args": {"text": text, "kind": kind},
+                "say": say or f"记住了：{text}", "danger": False}
+
+    if action == "forget_memory":
+        keyword = _safe_text(args.get("keyword") or args.get("text"), 200)
+        if not keyword:
+            return {"action": "chat", "say": "要忘掉哪一条？说个关键词就行。", "danger": False}
+        return {"action": "forget_memory", "args": {"keyword": keyword},
+                "say": say or f"这就帮您找找和{keyword}有关的记忆", "danger": False}
+
+    if action == "peek_screen":
+        question = _safe_text(args.get("question"), 300)
+        return {"action": "peek_screen", "args": {"question": question},
+                "say": say or "我看看屏幕", "danger": False}
 
     if action in ("screenshot", "lock"):
         return {"action": action, "args": {}, "say": say, "danger": False}
@@ -903,8 +925,18 @@ def _plain_reply(text) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.strip("{}").strip()
     if not text:
-        return "Sir，这次模型没有返回有效内容，您再说一遍我马上处理。"
+        return "先生，这次模型没有返回有效内容，您再说一遍我马上处理。"
     return text[:300]
+
+
+def _system_with_memory(base: str) -> str:
+    try:
+        from memory_store import get_store
+        block = get_store().prompt_block()
+    except Exception as exc:
+        print(f"[记忆注入] 跳过: {exc}")
+        block = ""
+    return str(base) + ("\n\n" + block if block else "")
 
 
 def query_llm_plan(command: str, config: dict, memory_context: str = "",
@@ -927,7 +959,7 @@ def query_llm_plan(command: str, config: dict, memory_context: str = "",
     with _SESSION_LOCK:
         history = list(_SESSION)
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": _system_with_memory(SYSTEM_PROMPT)}]
         + history
         + [{"role": "user", "content": user_content}]
     )
@@ -998,7 +1030,8 @@ _REPAIR_STEP_SYSTEM = (
     "你是桌面助手贾维斯的任务修复器。一个多步任务里有一步执行失败了，你要只给出修正后的那一步。\n"
     "只输出一个完整 JSON 对象：{\"action\": \"动作名\", \"args\": {...}, \"say\": \"给用户的中文说明\"}。\n"
     "动作只能用现有白名单：chat/open_app/open_file/open_url/web_search/file_manage/write_file/"
-    "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart。\n"
+    "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart/"
+    "peek_screen/remember/forget_memory。\n"
     "参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
     "不要一次给出多步；确实改不动就返回 action=chat 并在 say 里说明原因。"
 )
@@ -1050,14 +1083,15 @@ def repair_step(goal, step, error_text, config):
 # ---------- 自由对话通道 ----------
 # 规划通道把模型关在 JSON 里, 聊天走这里: 正常说话、带上下文和主人档案。
 CHAT_SYSTEM_PROMPT = (
-    "你是贾维斯, 是主人 ljj 的桌面管家兼伙伴, 不是客服机器人。\n"
+    "你是贾维斯, 是用户 ljj 的桌面管家兼伙伴, 不是客服机器人。\n"
     "现在是闲聊/答疑时间, 不是执行命令: 像朋友一样自然说话, 能接话、能商量、能给建议、能把一个问题讲清楚。\n"
     "规矩:\n"
-    "1. 中文口语, 默认简短 (1 到 3 句, 因为要朗读), 主人追问或明确要详细时再展开;\n"
-    "2. 记得前文, 主人提到「上次那个」要能对上; 给出的主人档案和记忆自然地用, 别生硬复述;\n"
-    "3. 诚实: 不懂就说不懂, 不编造事实和数据; 实时信息 (天气、价格、新闻) 你手边没有, 直说要用搜索指令去查;\n"
-    "4. 主人要是其实想让你操作电脑 (开软件、找文件、关机之类), 别假装做了, 提醒他换成一句指令你就能办;\n"
-    "5. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话。"
+    "1. 中文口语, 默认简短 (1 到 3 句, 因为要朗读), 用户追问或明确要详细时再展开;\n"
+    "2. 记得前文, 用户提到「上次那个」要能对上; 给出的用户档案和记忆自然地用, 别生硬复述;\n"
+    "3. 称呼用户用记忆中的称呼 (默认先生), 不要用 Sir/主人;\n"
+    "4. 诚实: 不懂就说不懂, 不编造事实和数据; 实时信息 (天气、价格、新闻) 你手边没有, 直说要用搜索指令去查;\n"
+    "5. 用户要是其实想让你操作电脑 (开软件、找文件、关机之类), 别假装做了, 提醒他换成一句指令你就能办;\n"
+    "6. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话。"
 )
 
 _CHAT_SESSION = []          # 自由对话历史 [{role, content}...], 与规划窗口分开
@@ -1080,7 +1114,7 @@ def free_chat(command: str, config: dict, memory_context: str = "") -> str:
         send_content = str(memory_context).strip() + "\n\n" + raw_command
     with _SESSION_LOCK:
         history = list(_CHAT_SESSION)
-    messages = ([{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    messages = ([{"role": "system", "content": _system_with_memory(CHAT_SYSTEM_PROMPT)}]
                 + history
                 + [{"role": "user", "content": send_content}])
     try:

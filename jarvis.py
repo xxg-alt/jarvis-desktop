@@ -22,6 +22,8 @@ from pathlib import Path
 
 import audio_device
 import agent_core    # 平台无关的任务状态机 (云主机评测复用同一套逻辑)
+import memory_store
+from asr_corrections import correct_asr_text
 
 BASE = Path(__file__).resolve().parent
 DRY_RUN = False
@@ -31,6 +33,19 @@ ON_HEAR = None
 ON_SPEAK_END = None
 ON_AUDIO_LEVEL = None
 ON_EXIT = None
+QUIT_REQUESTED = threading.Event()
+_LAST_MEMORY_CANDIDATES = []
+
+
+def _request_self_exit():
+    QUIT_REQUESTED.set()
+    if ON_EXIT is not None:
+        try:
+            ON_EXIT()
+        except Exception as exc:
+            print(f"[退出回调失败] {exc}")
+        return
+    raise SystemExit
 
 # UI 状态总线 (胶囊/穿透层那套界面用; 终端模式没有也不影响)
 try:
@@ -162,7 +177,7 @@ MEMORY = JarvisMemory()
 # Agent 任务拆解提示词: 只管"把目标拆成步骤", 不执行。
 # 步骤格式沿用现有动作白名单, 由 sanitize_plan 出口统一校验。
 AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
-只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot。
+只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, remember, forget_memory。
 写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文", "folder": "目标目录，可省略"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
 folder 只能填四类：工作区、桌面、文档、下载，可带子目录（如 "下载\\报告"）。用户没说存哪就省略 folder，默认写进工作区。用户要求存到别处（如 D 盘某个目录）时，folder 填那个完整路径原样，别改写。
 各动作的参数必须齐全，缺参数的一律不要写进计划：
@@ -555,9 +570,37 @@ def _speak(text):
                 pass
 
 
+_JSON_SPEAK_FALLBACK = "先生，刚才那句我没处理好，您再说一遍。"
+
+
+def sanitize_speak_text(text):
+    value = str(text or "")
+    if "}{" in value or ('"action"' in value and ("{" in value or "}" in value
+                                                   or re.search(r'"action"\s*:', value))):
+        print(f"[朗读兜底] JSON 泄漏 → 整句替换: {value[:80]}", flush=True)
+        return _JSON_SPEAK_FALLBACK
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict) and "action" in parsed:
+                print(f"[朗读兜底] JSON 动作泄漏 → 整句替换: {value[:80]}", flush=True)
+                return _JSON_SPEAK_FALLBACK
+        except Exception:
+            pass
+    try:
+        title = memory_store.current_title()
+    except Exception:
+        title = memory_store.DEFAULT_TITLE
+    if str(title).strip().lower() != "sir" and title:
+        value = re.sub(r"\bSir\b", lambda _m: str(title), value, flags=re.I)
+    return value
+
+
 def speak(text):
     """统一在真实播放结束后通知 GUI，能量球会随之停止回答动画。"""
     global _SPEAKING_UNTIL
+    text = sanitize_speak_text(text)
     if not str(text).strip():
         return
     # 已经被更新指令顶掉的旧任务，哪怕算完了也不许出声。
@@ -959,7 +1002,7 @@ AGENT_SCOPE_ASK = agent_core.SCOPE_ASK          # 危险: shutdown, restart, clo
 
 _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
                        "web_search", "search_file", "ask_doc", "screenshot", "lock",
-                       "set_screenshot_dir", "peek_screen",
+                       "set_screenshot_dir", "peek_screen", "remember", "forget_memory",
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
 _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
@@ -1341,7 +1384,7 @@ _AGENT_EVENTS = queue.Queue()
 
 def _agent_notify(text: str, spoken: bool = False):
     """进度只上 HUD 字幕 (不吵人); 要打断用户的提问/结论才进播报队列。"""
-    text = str(text or "").strip()
+    text = sanitize_speak_text(text).strip()
     if not text:
         return
     if ui_bridge is not None:
@@ -1828,7 +1871,8 @@ def _parse_rules(text):
     # 看屏: "看看屏幕上这个是什么" / "识别一下屏幕" / "屏幕上写了什么"
     if any(w in t for w in ("看看屏幕", "看一下屏幕", "识别屏幕", "看懂屏幕", "看看这个页面",
                              "这个页面是什么", "屏幕上是", "屏幕上写", "屏幕里", "看下屏幕",
-                             "屏幕上", "看屏")):
+                             "屏幕上", "看屏", "屏幕中显示的是什么", "屏幕上显示什么",
+                             "屏幕里是什么", "我屏幕上是什么", "屏幕中显示", "屏幕上显示")):
         m_q = re.search(r"(?:看看|看一下|看下|识别|看懂)(?:这个)?(?:屏幕|页面)(.+)", raw)
         q = m_q.group(1).strip() if m_q else raw
         return {"action": "peek_screen", "args": {"question": q}, "say": "我看看屏幕"}
@@ -1866,6 +1910,11 @@ def _parse_rules(text):
         q = re.sub(r"^搜(索|一下)", "", raw).strip()
         if q:
             return {"action": "web_search", "args": {"query": q}, "say": f"正在搜索{q}"}
+
+    if ("天气" in t or "下雨" in t or "温度" in t) and len(t) <= 40 and any(
+            w in t for w in ("今天", "明天", "后天", "怎么样", "多少度", "下雨", "温度", "预报")):
+        query = raw.strip().rstrip("。！？!?，, ")
+        return {"action": "web_search", "args": {"query": query}, "say": "我查一下天气"}
 
     # 读取文件内容: 读取/读一下/念一下 + 带扩展名的文件名 (本地直通, 不必等大模型)
     m = re.search(r"(?:读取|读一下|读下|念一下|朗读)(.+)", raw)
@@ -2084,6 +2133,61 @@ def _is_question(text: str) -> bool:
     if any(low.startswith(v) for v in _CMD_STARTS):
         return False
     return any(w in low for w in _Q_WORDS)
+
+
+_LEADING_FILLER_RE = re.compile(r"^(?:算了|那个|那么|嗯|呃|哦)[，,]?\s*")
+_CAPABILITY_RE = re.compile(r"^你(?:还能|能不能|会不会|可不可以|可以|能)")
+_PEEK_HINT_WORDS = ("看屏", "看看屏幕", "看一下屏幕", "看下屏幕", "识别屏幕", "看懂屏幕",
+                    "屏幕上是", "屏幕上写", "屏幕上", "屏幕里", "屏幕中显示", "屏幕上显示",
+                    "屏幕里是什么", "我屏幕上是什么", "这个页面是什么", "看看这个页面")
+_SELF_EXIT_WORDS = ("退下", "关闭自己", "关掉自己", "退出自己", "你可以退出了", "没你的事了可以退",
+                    "你退出吧", "你先退下", "你退下吧", "先退下", "关闭贾维斯", "退出贾维斯",
+                    "你休息吧", "你歇着吧", "你可以下班了")
+
+
+def _tight(text) -> str:
+    return re.sub(r"[\s，,。！？!?：:；;]", "", str(text or "").strip().lower())
+
+
+def _unfill(text) -> str:
+    return _LEADING_FILLER_RE.sub("", str(text or "").strip().lower().replace(" ", ""))
+
+
+def is_capability_question(text) -> bool:
+    low = _unfill(text)
+    if not _CAPABILITY_RE.match(low):
+        return False
+    if "吗" in low or low.endswith(("?", "？", "呢")):
+        return True
+    return low.startswith("你还能")
+
+
+def _explicit_intent(text) -> bool:
+    low = _tight(text)
+    if any(w in low for w in _PEEK_HINT_WORDS):
+        return True
+    if is_self_exit(text):
+        return True
+    return bool(memory_store.parse_remember(text) or memory_store.parse_forget(text)
+                or memory_store.is_list_request(text))
+
+
+def is_self_exit(text) -> bool:
+    low = _unfill(text)
+    if not low:
+        return False
+    if any(w in low for w in ("软件", "应用", "程序", "进程", "窗口")):
+        return False
+    for name in list(CONFIG.get("app_exe_for_close", {})) + list(CONFIG.get("apps", {})):
+        if name and name.lower() in low:
+            return False
+    if any(w in low for w in _SELF_EXIT_WORDS):
+        return True
+    if low in ("退出", "再见", "休息吧", "别听了", "退下", "退出吧", "你退出", "你退下"):
+        return True
+    if re.fullmatch(r"(?:你|贾维斯)?(?:可以)?(?:退出|退下)(?:一下|吧|了|好了)?", low):
+        return True
+    return bool(re.search(r"没你的事了.{0,8}退", low))
 
 
 def screenshot_dir() -> Path:
@@ -2581,6 +2685,9 @@ _FACT_ANSWERS = {
 
 def parse_command(text):
     """规则分流入口: 先跑关键词规则, 再对命中结果做否定/问句仲裁。"""
+    if is_capability_question(text) and not _explicit_intent(text):
+        print(f"[护栏] 能力询问 → 跳过本地规则: {text}", flush=True)
+        return None
     plan = _parse_rules(text)
     if not plan:
         return None
@@ -2614,7 +2721,8 @@ def parse_command(text):
             return {"action": "chat",
                     "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
 
-    if _is_question(text) and action not in _REQUEST_ACTIONS:
+    weather_request = action == "web_search" and ("天气" in low or "温度" in low or "下雨" in low)
+    if _is_question(text) and action not in _REQUEST_ACTIONS and not weather_request:
         fact = _FACT_ANSWERS.get(action)
         if fact:
             print(f"[仲裁] 问句 → 事实答复 {action}", flush=True)
@@ -2795,6 +2903,17 @@ def _perform_plan(plan):
     try:
         if action == "chat":
             pass
+        elif action == "remember":
+            text = str(args.get("text") or "")
+            res = memory_store.get_store().add(text, kind=args.get("kind") or "fact",
+                                               source="explicit")
+            say = res["say"]
+            _TL.action_ok = bool(res.get("ok"))
+        elif action == "forget_memory":
+            keyword = str(args.get("keyword") or args.get("text") or "")
+            res = memory_store.get_store().forget(keyword)
+            say = res["say"]
+            _TL.action_ok = bool(res.get("ok"))
         elif action == "open_app":
             from smart_launcher import smart_launch_app
             app_target = str(args.get("exe", "") or "")
@@ -3224,7 +3343,7 @@ def handle_command(command):
     """指令入口：语音和文字共用，串行执行，后来的指令直接顶掉前一条。"""
     if not command or not command.strip():
         return
-    command = command.strip()
+    command = correct_asr_text(command.strip())
     command_id = _new_command_id()
     # 原话留在 thread-local: 模型漏填 folder 时, 写文档要用它兜底解析存放位置
     _TL.user_text = command
@@ -3294,6 +3413,7 @@ def _agent_control_command(command: str):
 
 
 def _handle_command_inner(command, command_id):
+    global _LAST_MEMORY_CANDIDATES
     print(f"你: {command}")
     if ON_HEAR is not None:
         try: ON_HEAR(command)
@@ -3320,6 +3440,63 @@ def _handle_command_inner(command, command_id):
         if ui_bridge is not None:
             ui_bridge.emit_state("IDLE")
         return
+
+    answer = memory_store.SUGGESTION.answer(command)
+    if answer:
+        if answer == "yes":
+            pending = memory_store.SUGGESTION.pending
+            memory_store.SUGGESTION.pending = ""
+            res = memory_store.get_store().add(pending, kind="habit", source="suggested")
+            speak(res["say"])
+        else:
+            speak("好，那就不记了")
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
+    title_fix = memory_store.parse_title_correction(command)
+    if title_fix:
+        res = memory_store.get_store().set_title(title_fix[1])
+        speak(res["say"])
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
+    remember_text = memory_store.parse_remember(command)
+    if remember_text:
+        kind = memory_store.guess_kind(remember_text)
+        res = memory_store.get_store().add(remember_text, kind=kind, source="explicit")
+        speak(res["say"])
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
+    if memory_store.is_list_request(command):
+        speak(memory_store.get_store().stats_text())
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
+    choose = memory_store.SELECT_RE.match(_tight(command))
+    if choose and _LAST_MEMORY_CANDIDATES:
+        index = int(choose.group(1)) - 1
+        if 0 <= index < len(_LAST_MEMORY_CANDIDATES):
+            res = memory_store.get_store().forget("", choose_id=_LAST_MEMORY_CANDIDATES[index]["id"])
+            _LAST_MEMORY_CANDIDATES = []
+            speak(res["say"])
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+            return
+
+    forget_text = memory_store.parse_forget(command)
+    if forget_text:
+        res = memory_store.get_store().forget(forget_text)
+        _LAST_MEMORY_CANDIDATES = list(res.get("entries") or []) if res.get("ambiguous") else []
+        speak(res["say"])
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+
     if memory_control == "status":
         text = MEMORY.stats_text()
         try:
@@ -3361,16 +3538,12 @@ def _handle_command_inner(command, command_id):
             ui_bridge.emit_state("IDLE")
         return
 
-    # 退出词：GUI 模式关闭整个应用；终端模式仍通过 SystemExit 退出主循环。
-    if command in ["退出", "再见", "休息吧", "别听了"]:
+    if is_self_exit(command):
         speak("好的, 我先休息了, 随时喊我")
-        if ON_EXIT is not None:
-            try:
-                ON_EXIT()
-            except Exception as e:
-                print(f"[退出回调失败] {e}")
-            return
-        raise SystemExit
+        _request_self_exit()
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
 
     # 并列打开: "同时打开微信和QQ"。本地规则只认第一个, 模型又会把整串当软件名,
     # 所以这里先按目标拆分, 逐个启动, 最后一句汇总(哪个没起来要点名)。
@@ -3396,6 +3569,12 @@ def _handle_command_inner(command, command_id):
             if ui_bridge is not None:
                 ui_bridge.emit_state("IDLE")
         return
+
+    dialogue = [str(item.get("text") or "") for item in MEMORY.data.get("conversations", [])
+                if item.get("role") == "user"]
+    habit_question = memory_store.SUGGESTION.maybe(command, dialogue)
+    if habit_question:
+        speak(habit_question)
 
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
     plan = parse_command(command)
