@@ -22,6 +22,9 @@
     scope_of(step) -> "free" | "notify" | "ask"
         这一步属于哪级权限；默认读 step["scope"]。
     on_state(state)            可选：ACTING / IDLE 给界面用。
+    verify(task, step, ok, text, tool_text) -> (ok, text, tool_text)
+        可选：单步执行完、修复决策之前的回读钩子。只读核实, 不改状态机流程；
+        抛异常时忽略, 保持原回读结论。
     pre_write(task, step, results_text)  可选：写文件前的成稿钩子。
     repair(task, step, error_text) -> (fixed_step | None, reason)  可选：失败修复钩子。
         fixed_step 为 {action, args, say, scope, danger}；
@@ -92,7 +95,7 @@ class TaskRunner:
     """单任务后台执行器：启线程跑步骤，支持停止/跳过/挂起等确认。"""
 
     def __init__(self, perform, persist, notify, scope_of=None,
-                 on_state=None, pre_write=None, repair=None):
+                 on_state=None, pre_write=None, repair=None, verify=None):
         self._perform = perform
         self._persist = persist
         self._notify = notify
@@ -100,6 +103,7 @@ class TaskRunner:
         self._on_state = on_state
         self._pre_write = pre_write
         self._repair = repair
+        self._verify = verify
         self._lock = threading.Lock()
         self._thread = None
         self._task = None
@@ -230,6 +234,12 @@ class TaskRunner:
 
                 try:
                     ok, text, tool_text = self._perform(step)
+                    if self._verify is not None:
+                        try:
+                            ok, text, tool_text = self._verify(
+                                task, step, ok, text, tool_text)
+                        except Exception as exc:
+                            print(f"[Agent 回读钩子失败] {exc}")
                 except Exception as exc:
                     ok, text, tool_text = False, f"执行失败: {exc}", ""
                 step["result"] = text
