@@ -70,7 +70,7 @@ a = Analysis(
                    "web_capsule", "web_fullscreen", "lyric_subtitle",
                    "audio_device", "diagnostics", "system_tools", "proc_tree",
                    "rag_engine", "web_tools", "agent_core", "chat_log", "pyzipper", "pycryptodomex",
-                   "win_taskbar", "onnxruntime", "pypdf", "docx"] + winrt_hidden + fw_hidden + wv_hidden,
+                   "pypinyin", "win_taskbar", "onnxruntime", "pypdf", "docx"] + winrt_hidden + fw_hidden + wv_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

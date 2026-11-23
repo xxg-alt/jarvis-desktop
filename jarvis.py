@@ -142,6 +142,8 @@ def load_config():
         "whisper_model": "small",
         # 截图落盘目录; 空 = 用默认 图片\贾维斯截图 (可由"以后截图放到工作区"这类指令改)
         "screenshot_dir": "",
+        # 默认音乐客户端: "播首歌"没点名时打开它 (可写 酷狗音乐/QQ音乐/网易云音乐 等任何已装客户端)
+        "music_app": "酷狗音乐",
         "gemini_model": "gemini-flash-latest",
         "apps": {
             "记事本": "notepad.exe", "计算器": "calc.exe", "画图": "mspaint.exe",
@@ -2285,7 +2287,55 @@ _PEEK_FOLLOW = {"armed": False, "ts": 0.0}
 # 点击意图: 必须说出"点击/点一下/点开/按一下 + 目标"的明确命令。
 # 否定("不要点/别点")、引用/假设("我说点击发送会怎样"、"如果点了删除会")、
 # 疑问句都不能触发; 规则层和执行前复查共用同一个解析器, 不留纯子串后门。
-_CLICK_COMMAND_RE = re.compile(r"(?:点击|点一下|点开|按一下)\s*(.+)", re.S)
+_CLICK_COMMAND_RE = re.compile(r"(?:点击|点一下|点开|点进|点下|按一下)\s*(.+)", re.S)
+# 动词在句尾的情况: "…那个进入微信的按钮在哪里然后帮我点击" —— 上面那条会抽出空 target,
+# 于是整句被当成"不明确"拒掉, 用户会觉得明明说清楚了。这里补一条"目标在前"的解析。
+_CLICK_VERB_ANY_RE = re.compile(r"(?:点击|点一下|点开|点进|点下|按一下)")
+_CLICK_TARGET_HINT_RE = re.compile(r"(按钮|按纽|按键|图标|选项|标签|菜单|开关|搜索框|输入框|链接)")
+# ASR 错字不再逐词打补丁 —— 那是在按个别应用思考。统一走拼音相似度:
+# "库狗/酷狗"、"进录/进入"、"点几波/点击播" 在拼音层面是同一个词, 用一层比对全部覆盖。
+# 字表里只留与具体应用无关的纯错字。
+_ASR_WORD_FIX = (("按纽", "按钮"),)
+# 已知点击动词的拼音 (无调): 拼音层面模糊命中即算"明确说了点击"
+_CLICK_VERB_PY = ("dianji", "diankai", "dianjin", "dianxia", "dianyixia", "anyixia")
+
+
+def _pinyin(text) -> str:
+    """整段转无调拼音; pypinyin 不可用时退回原文 (相似度自动退化为字面比对)。"""
+    s = str(text or "")
+    if not s:
+        return ""
+    try:
+        from pypinyin import lazy_pinyin
+        return "".join(lazy_pinyin(s))
+    except Exception:
+        return s
+
+
+def _fuzzy_click_verb(raw):
+    """拼音层面的点击动词识别: "点几波"≈点击播 这类 ASR 错字动词。
+
+    从每个 点/按 开头的 3~2 字窗口里找拼音接近已知动词的 (先长后短, 长窗命中目标更准);
+    返回 (start, end) 或 None。只在精确动词没命中的时候兜底。
+    """
+    try:
+        from pypinyin import lazy_pinyin
+    except Exception:
+        return None
+    import difflib
+    for i, ch in enumerate(raw):
+        if ch not in "点按":
+            continue
+        for ln in (3, 2):
+            win = raw[i:i + ln]
+            if len(win) < ln or not re.fullmatch(r"[\u4e00-\u9fa5]{%d}" % ln, win):
+                continue
+            py = "".join(lazy_pinyin(win))
+            if max(difflib.SequenceMatcher(None, py, v).ratio()
+                   for v in _CLICK_VERB_PY) >= 0.82:
+                return i, i + ln
+    return None
+
 _CLICK_NEG_TAIL_RE = re.compile(
     r"(?:不要|不用|不必|不许|不准|不需要|无需|别|甭|先别|暂别|没|不)"
     r"(?:给我|帮我|再|去|要|用|把|着)?$"
@@ -2299,9 +2349,65 @@ _CLICK_NONCOMMAND_WORDS = (
 _CLICK_TARGET_NONCOMMAND_RE = re.compile(r"^(?:会|的话|之后|以后|了|了会|能|可以|将会|可能会)")
 
 
+def _click_target_from_head(head):
+    """从动词前的那半句里捞 target: '…那个进入微信的按钮在哪里然后帮我' → '进入微信的按钮'。
+
+    只在含"按钮/图标/选项"这类载体词时才认, 捞不出来返回空串 —— 宁可不点也不猜。
+    """
+    h = str(head or "").strip()
+    if not h:
+        return ""
+    h = re.sub(r"(?:然后|接着|再|之后|顺便|请|帮我|帮忙|给我|你|您|就行|一下)+$", "", h).strip()
+    h = re.sub(r"(?:在哪里|在哪儿|在哪|哪个位置|位置|是什么|长什么样|怎么点|在哪里呢)+$", "", h).strip()
+    parts = re.split(r"[，,。；;！!？?]|然后|接着|帮我|给我|帮忙", h)
+    for p in reversed(parts):
+        p = p.strip()
+        # 去掉"截图看一下那个""屏幕上这个"这类前缀, 只留载体本身
+        p = re.sub(r"^.*?(?:看一下|看看|看下|瞧一眼|找一下|找到|截图|截個圖|截屏|屏幕|页面上|界面里)",
+                   "", p).strip()
+        p = re.sub(r"^(?:那个|这个|就是|那|这)", "", p).strip()
+        if _CLICK_TARGET_HINT_RE.search(p) and 1 < len(p) <= 24:
+            return p
+    return ""
+
+
+def _asr_fix(text) -> str:
+    """纠正语音识别里高频的同音错字 (酷狗/按钮/点击家族)。"""
+    s = str(text or "")
+    for wrong, right in _ASR_WORD_FIX:
+        s = s.replace(wrong, right)
+    return s
+
+
+def _click_target_close(a, b) -> bool:
+    """两个 target 是否指同一个东西: 字面或拼音任一层面相似即可。
+
+    闸门的目的只是"用户是不是明确点名了要点的东西", 不该因为 ASR 错一个字
+    ("进录/进入"、"库狗/酷狗") 就整句拒掉; 真正按钮对不对由点前读文字兜底。
+    """
+    import difflib
+    x, y = _tight(a), _tight(b)
+    if not x or not y:
+        return False
+    if x in y or y in x:
+        return True
+    if difflib.SequenceMatcher(None, x, y).ratio() >= 0.55:
+        return True
+    px, py_ = _pinyin(x), _pinyin(y)
+    if px == x or py_ == y:          # pypinyin 不可用, 已在字面层比对过
+        return False
+    if px in py_ or py_ in px:
+        return True
+    return difflib.SequenceMatcher(None, px, py_).ratio() >= 0.6
+
+
 def _click_intent(text):
-    """返回 (target, state)。state: command 明确命令 / negated 明确否定 / unclear 不确定。"""
-    raw = str(text or "").strip()
+    """返回 (target, state)。state: command 明确命令 / negated 明确否定 / unclear 不确定。
+
+    识别顺序: 精确动词 → 动词在句尾(找前半句载体) → 拼音模糊动词。
+    与任何具体应用无关: 载体词(按钮/图标/搜索框…)是通用 UI 词汇, 错字靠拼音层兜住。
+    """
+    raw = _asr_fix(text).strip()
     if not raw:
         return "", "unclear"
     low = _tight(raw)
@@ -2309,17 +2415,40 @@ def _click_intent(text):
     if any(w in low for w in _CLICK_NONCOMMAND_WORDS) and not polite_request:
         return "", "unclear"
     m = _CLICK_COMMAND_RE.search(raw)
-    if not m:
-        return "", "unclear"
-    prefix = _tight(raw[:m.start()])
-    if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
-        return "", "negated"
-    target = m.group(1).strip().rstrip("。！？!?，,、；; ")
-    target = re.sub(r"(?:吗|呢|可以吗|行吗)$", "", target).strip()
-    target = re.sub(r"^(?:那个|这个|帮我|给我|我的)", "", target).strip()
-    if not target or _CLICK_TARGET_NONCOMMAND_RE.match(target):
-        return "", "unclear"
-    return target, "command"
+    if m:
+        prefix = _tight(raw[:m.start()])
+        if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+            return "", "negated"
+        target = m.group(1).strip().rstrip("。！？!?，,、；; ")
+        target = re.sub(r"(?:吗|呢|可以吗|行吗)$", "", target).strip()
+        target = re.sub(r"^(?:那个|这个|帮我|给我|我的)", "", target).strip()
+        if target and not _CLICK_TARGET_NONCOMMAND_RE.match(target):
+            return target, "command"
+    # 动词在句尾 / 动词后为空: 回头从"动词前"那半句里找载体
+    v = _CLICK_VERB_ANY_RE.search(raw)
+    if v:
+        prefix = _tight(raw[:v.start()])
+        if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+            return "", "negated"
+        head_target = _click_target_from_head(raw[:v.start()])
+        if head_target:
+            return head_target, "command"
+    # 拼音兜底: "点几波放音乐的按钮" —— 错字动词精确正则抓不到
+    fv = _fuzzy_click_verb(raw)
+    if fv:
+        i, j = fv
+        prefix = _tight(raw[:i])
+        if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+            return "", "negated"
+        after = raw[j:].strip().rstrip("。！？!?，,、；; ")
+        after = re.sub(r"(?:吗|呢|可以吗|行吗)$", "", after).strip()
+        after = re.sub(r"^(?:那个|这个|帮我|给我|我的)", "", after).strip()
+        if after and not _CLICK_TARGET_NONCOMMAND_RE.match(after):
+            return after, "command"
+        head_target = _click_target_from_head(raw[:i])
+        if head_target:
+            return head_target, "command"
+    return "", "unclear"
 
 
 _SELF_EXIT_WORDS = ("退下", "关闭自己", "关掉自己", "退出自己", "你可以退出了", "没你的事了可以退",
@@ -2707,7 +2836,11 @@ def _parse_click_label(answer):
 
 
 def _click_label_matches_target(label, target):
-    """读出的按钮原文与用户目标是否对得上; 只认去口语后的包含关系, 不猜。"""
+    """读出的按钮原文与用户目标是否对得上; 包含关系为主, 拼音同音兜底, 不猜。
+
+    拼音阈值偏严 (0.8) —— 这是点击前最后一道闸, 宁可拒也不点错的。
+    """
+    import difflib
     actual = _tight(label)
     wanted = _tight(target)
     if not actual or not wanted:
@@ -2715,7 +2848,14 @@ def _click_label_matches_target(label, target):
     if actual in wanted or wanted in actual:
         return True
     core = re.sub(r"(按钮|按键|图标|这个|那个|帮我|给我|一下|点击|点开|按一下|点一下|屏幕上)", "", wanted)
-    return bool(core) and (core in actual or actual in core)
+    if core and (core in actual or actual in core):
+        return True
+    pa, pw = _pinyin(actual), _pinyin(core or wanted)
+    if pa == actual or pw == (core or wanted):   # pypinyin 不可用, 不再降级放行
+        return False
+    if len(pa) > 2 and len(pw) > 2:
+        return difflib.SequenceMatcher(None, pa, pw).ratio() >= 0.8
+    return False
 
 
 def _parse_click_verdict(answer):
@@ -3743,11 +3883,39 @@ def _dispatch_loop():
             print(f"[结果回播异常] {e}")
 
 
+# 音乐网站的通用特征域: 命中且用户没点名"网页/浏览器"时, 拦回本机音乐客户端。
+# 列表是"音乐网站"这个类目, 不是某一家软件 —— 换客户端改 config 的 music_app 即可。
+_MUSIC_WEB_DOMAINS = ("music.163.com", "y.qq.com", "kugou.com", "kuwo.cn",
+                      "music.migu.cn", "music.taihe.com", "qianqian.com")
+_MUSIC_WEB_PASS_WORDS = ("网页", "浏览器", "网页版", "web版", "网站版")
+
+
+def _music_web_guard(plan):
+    """播放类指令误开音乐网页时, 改道本机音乐客户端 (config: music_app, 默认酷狗)。
+
+    与具体厂商无关: 任何音乐站点命中都拦; 用户明确说"用网页听"就放行。
+    返回改写后的 plan (不是音乐网页则原样返回)。
+    """
+    if (plan or {}).get("action") != "open_url":
+        return plan
+    url = str((plan.get("args") or {}).get("url") or "")
+    if not any(d in url.lower() for d in _MUSIC_WEB_DOMAINS):
+        return plan
+    user_text = str(getattr(_TL, "user_text", "") or "")
+    if any(w in user_text for w in _MUSIC_WEB_PASS_WORDS):
+        return plan
+    music_name = str(CONFIG.get("music_app") or "酷狗音乐").strip() or "酷狗音乐"
+    print(f"[音乐守门] 音乐网页 {url} → 打开本机 {music_name}", flush=True)
+    return {"action": "open_app", "args": {"exe": "", "name": music_name},
+            "say": f"用{music_name}放，我先把软件打开"}
+
+
 def execute_plan(plan, command_id=None, source=""):
     """执行动作；返回 True 表示系统工具已转入后台，最终结果稍后回播。"""
     if not plan:
         speak("这条指令我还没学会, 可以换个说法, 比如打开记事本、搜索天气、音量调大")
         return False
+    plan = _music_web_guard(plan)
     action = plan.get("action")
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
@@ -3756,10 +3924,11 @@ def execute_plan(plan, command_id=None, source=""):
     if action == "click_screen":
         user_text = str(getattr(_TL, "user_text", "") or "")
         ordered, state = _click_intent(user_text)
-        planned = _tight(args.get("target") or "")
-        mismatch = bool(planned) and not (planned in _tight(ordered) or _tight(ordered) in planned)
+        planned = str(args.get("target") or "")
+        mismatch = bool(planned) and bool(ordered) and not _click_target_close(planned, ordered)
         if state != "command" or not ordered or mismatch:
-            print("[看屏点击] 原话没有明确点击命令或目标对不上, 拒绝执行并反问", flush=True)
+            print(f"[看屏点击] 原话没有明确点击命令或目标对不上, 拒绝执行并反问: "
+                  f"state={state} ordered={ordered!r} planned={planned!r}", flush=True)
             speak("您明确说要点哪个按钮，我才会在屏幕上点，Sir；要我点哪一个？")
             return False
 
