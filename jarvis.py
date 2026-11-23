@@ -1372,6 +1372,7 @@ def _agent_persist(task: dict):
 def _agent_perform(step):
     """真执行一步: 返回 (成败, 话术, 可传递的结构化文本)。"""
     _TL.action_ok = True
+    _TL.last_tool_text = ""      # 不把上一步的回读带到这一步, 免得误触发视觉核实
     # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
     _TL.agent_context = True
     _TL.agent_external_ok = bool(step.get("external_ok"))
@@ -1395,6 +1396,11 @@ def _agent_pre_write(task, step, results_text):
 def _agent_repair_wrapper(task, step, error_text):
     """状态机的失败修复钩子: 转调 _agent_repair_step (晚绑定, 测试可整体替换)。"""
     return _agent_repair_step(task, step, error_text)
+
+
+def _agent_visual_verify_hook(task, step, ok, text, tool_text):
+    """状态机的回读钩子: 晚绑定到视觉核实实现 (实现在看屏段落, 测试可整体替换)。"""
+    return _agent_visual_verify(task, step, ok, text, tool_text)
 
 
 # ---------- 语音识别置信度闸门 ----------
@@ -1444,6 +1450,7 @@ _RUNNER = agent_core.TaskRunner(
     on_state=_agent_ui_state,
     pre_write=_agent_pre_write,
     repair=_agent_repair_wrapper,
+    verify=_agent_visual_verify_hook,
 )
 
 
@@ -1714,6 +1721,7 @@ def _agent_loop(task: dict, gen: int):
         on_state=_agent_ui_state,
         pre_write=_agent_pre_write,
         repair=_agent_repair_wrapper,
+        verify=_agent_visual_verify_hook,
     )
     runner._gen = gen   # 代号对齐, 不会被误判成"已被新任务取代"
     runner._run(task, gen)
@@ -2151,51 +2159,350 @@ def _resolve_screenshot_target(raw: str):
 _PEEK_LONG_EDGE = 1600     # 长边上限: 再大只是烧 token, 字并不会更清楚
 _PEEK_QUALITY = 80
 
+# 两段式看屏: 第一遍看全屏, 问到具体对象/第一遍说看不清时再局部放大一遍。
+_PEEK_FINE_WORDS = ("报错", "错误码", "错误", "文字", "写了什么", "按钮", "多少钱",
+                    "价格", "金额", "数字", "数值", "哪个", "什么意思", "读出来",
+                    "抄下来", "第几行")
+_PEEK_VAGUE_WORDS = ("看不清", "看不清楚", "无法确认", "无法确定", "看不到", "辨认不清")
+_PEEK_QUOTE_RE = re.compile(r"[“\"「'‘]([^”\"」'’]{1,80})[”\"」'’]")
+_PEEK_CROP_PAD = 0.20        # 定位框四边各外扩框宽/高的 20%, 再夹紧到图像边界
+_PEEK_MIN_CROP_AREA = 0.0005 # 裁剪面积小于全屏 0.05% 视为定位不可信
+_PEEK_MAX_CROP_AREA = 0.90   # 快等于整屏就不叫"局部放大"了, 放弃
 
-def _screen_jpeg_b64(long_edge=None, quality=None):
-    """把当前屏幕压成 base64 JPEG（内存直出）。返回 (base64, 尺寸说明)。"""
+# 敏感画面护栏: 所有发图路径共用同一份关键词与前台窗口探测。
+_SENSITIVE_KEYWORDS = ("密码", "登录", "支付", "银行", "钱包", "验证码", "微信", "QQ",
+                       "password", "login", "pay", "bank", "wallet")
+_SENSITIVE_PROMPT = "当前窗口可能含敏感内容，确定要看吗？"
+_PEEK_CONFIRM_TTL = 60.0
+_PEEK_CONFIRM_LOCK = threading.Lock()
+_PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0}
+_PEEK_YES = ("确定", "要看", "继续", "可以", "好的", "行", "是", "对", "嗯", "yes", "y")
+_PEEK_NO = ("取消", "不要", "不看", "算了", "不用", "不", "no", "n")
+_PEEK_PUNCT = re.compile(r"[。！？!?，,.、\s]")
+
+# 视觉核实: 每任务最多 2 次, 只读拍屏, 危险步/敏感画面直接跳过。
+_VISION_VERIFY_MAX = 2
+_VISION_VERIFY_Q = "屏幕上现在显示什么？预期效果是：{expect}。它出现了吗？只答：已出现/未出现/看不清"
+
+
+def _foreground_window_info():
+    """返回 (前台窗口标题, 进程名); 取不到就留空字符串。
+
+    可用性优先: 非 Windows / 没权限 / 进程已退出时都可能取不到标题或进程名,
+    这时按"不敏感"放行并写日志 —— 否则一旦拿不到信息, 整套看屏在部分机器上会彻底废掉。
+    """
+    title, proc = "", ""
+    if os.name != "nt":
+        print("[敏感护栏] 非 Windows, 取不到前台窗口信息, 按不敏感处理", flush=True)
+        return title, proc
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            print("[敏感护栏] 没有前台窗口, 按不敏感处理", flush=True)
+            return title, proc
+        buf = ctypes.create_unicode_buffer(512)
+        u.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value or ""
+        pid = ctypes.c_ulong()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value:
+            try:
+                import psutil
+                proc = psutil.Process(pid.value).name() or ""
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[敏感护栏] 前台窗口信息读取失败({exc}), 按不敏感处理", flush=True)
+    if not title and not proc:
+        print("[敏感护栏] 标题/进程名都拿不到, 按不敏感处理", flush=True)
+    return title, proc
+
+
+def _sensitive_window_hit():
+    """前台窗口标题/进程名是否命中敏感词; 日志只记命中的来源, 不记标题原文。"""
+    title, proc = _foreground_window_info()
+    for keyword in _SENSITIVE_KEYWORDS:
+        k = keyword.lower()
+        if k in str(title).lower():
+            print("[敏感护栏] 标题命中敏感词, 不发图", flush=True)
+            return True
+        if k in str(proc).lower():
+            print("[敏感护栏] 进程名命中敏感词, 不发图", flush=True)
+            return True
+    return False
+
+
+def _capture_screen_image():
+    """截一张原始全分辨率屏幕图 (PIL 对象, 仍在内存里)。"""
+    import pyautogui
+    return pyautogui.screenshot()
+
+
+def _encode_jpeg_b64(img, long_edge=None, quality=None, label=""):
+    """把 PIL 图压成 base64 JPEG（内存直出）。返回 (base64, 尺寸说明)。"""
     import base64
     import io
 
-    import pyautogui
     from PIL import Image
 
     long_edge = int(long_edge or _PEEK_LONG_EDGE)
     quality = int(quality or _PEEK_QUALITY)
-    img = pyautogui.screenshot()
     ow, oh = img.size
+    resized = False
     if max(ow, oh) > long_edge:
         scale = long_edge / float(max(ow, oh))
         img = img.resize((max(1, int(ow * scale)), max(1, int(oh * scale))), Image.LANCZOS)
+        resized = True
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)      # 内存缓冲, 不是文件
     raw = buf.getvalue()
     w, h = img.size
+    if resized:                                        # 别关掉调用方还要用的原图
+        try:
+            img.close()
+        except Exception:
+            pass
     try:
-        img.close()
         buf.close()
     except Exception:
         pass
-    return base64.b64encode(raw).decode("ascii"), f"{ow}x{oh}→{w}x{h}, {len(raw)//1024}KB"
+    size = f"{ow}x{oh}→{w}x{h}, {len(raw)//1024}KB"
+    return base64.b64encode(raw).decode("ascii"), (f"{label} {size}" if label else size)
 
 
-def _peek_screen(question="") -> str:
+def _screen_jpeg_b64(long_edge=None, quality=None):
+    """把当前屏幕压成 base64 JPEG（内存直出）。返回 (base64, 尺寸说明)。"""
+    return _encode_jpeg_b64(_capture_screen_image(), long_edge, quality)
+
+
+def _peek_needs_second_pass(question, first_answer):
+    """细粒度问句/带引号/第一遍说看不清 → 值得再放大看一遍。"""
+    q = str(question or "")
+    if any(w in q for w in _PEEK_FINE_WORDS) or _PEEK_QUOTE_RE.search(q):
+        return True
+    return any(w in str(first_answer or "") for w in _PEEK_VAGUE_WORDS)
+
+
+def _parse_locate_box(raw):
+    """模型定位输出 → 坐标 dict; 容忍 Markdown 代码围栏和周边废话。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{[^{}]*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _peek_crop_box(coords, width, height):
+    """归一化 0~1000 坐标 → 原始分辨率像素框 (left, top, right, bottom)。
+
+    坐标缺失/非数/越界、长宽倒置、裁剪面积过小或过大都返回 None。
+    """
+    keys = ("x_min", "y_min", "x_max", "y_max")
+    if not isinstance(coords, dict) or any(k not in coords for k in keys):
+        return None
+    try:
+        vals = {k: float(coords[k]) for k in keys}
+    except (TypeError, ValueError):
+        return None
+    if any(not (0.0 <= vals[k] <= 1000.0) for k in keys):
+        return None
+    if vals["x_max"] <= vals["x_min"] or vals["y_max"] <= vals["y_min"]:
+        return None
+    ow, oh = int(width), int(height)
+    if ow <= 0 or oh <= 0:
+        return None
+    l = vals["x_min"] / 1000.0 * ow
+    t = vals["y_min"] / 1000.0 * oh
+    r = vals["x_max"] / 1000.0 * ow
+    b = vals["y_max"] / 1000.0 * oh
+    area_ratio = ((r - l) * (b - t)) / float(ow * oh)
+    if not (_PEEK_MIN_CROP_AREA <= area_ratio <= _PEEK_MAX_CROP_AREA):
+        return None
+    import math
+    pad_x, pad_y = (r - l) * _PEEK_CROP_PAD, (b - t) * _PEEK_CROP_PAD
+    left, top = max(0, int(l - pad_x)), max(0, int(t - pad_y))
+    right = min(ow, int(math.ceil(r + pad_x)))
+    bottom = min(oh, int(math.ceil(b + pad_y)))
+    if right - left < 24 or bottom - top < 24:
+        return None
+    return left, top, right, bottom
+
+
+def _peek_second_pass(question, full_img, full_b64, first_answer):
+    """定位→从原始全分辨率截图裁剪→再问一次。防御失败返回 None, 用第一遍答案。"""
+    if _sensitive_window_hit():
+        print("[看屏定位] 敏感画面跳过第二遍", flush=True)
+        return None
+    from llm_brain import query_vision_locate
+    coords = _parse_locate_box(query_vision_locate(question, full_b64, CONFIG))
+    ow, oh = full_img.size
+    box = _peek_crop_box(coords, ow, oh)
+    if box is None:
+        print(f"[看屏定位] 坐标无效, 放弃第二遍: 全屏={ow}x{oh}", flush=True)
+        return None
+    crop = full_img.crop(box)
+    try:
+        crop_b64, size = _encode_jpeg_b64(crop, label="局部")
+        print(f"[看屏定位] 框={box} → {size} (图像未落盘)", flush=True)
+        from llm_brain import query_vision
+        return str(query_vision(question, crop_b64, CONFIG) or "").strip()
+    finally:
+        try:
+            crop.close()
+        except Exception:
+            pass
+
+
+def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False) -> str:
     """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。"""
     try:
         from llm_brain import query_vision
     except Exception as exc:
         return f"看屏功能没加载起来: {exc}"
+    if not sensitive_confirmed and _sensitive_window_hit():
+        if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
+            with _PEEK_CONFIRM_LOCK:
+                _PEEK_CONFIRM.update(pending=True, question=str(question or ""), ts=time.time())
+            print("[看屏] 敏感画面, 等用户确认", flush=True)
+            return _SENSITIVE_PROMPT
+        print("[看屏] 敏感画面跳过", flush=True)
+        return "当前窗口可能含敏感内容，这次看屏跳过，Sir。"
     try:
-        b64, size = _screen_jpeg_b64()
-        answer = query_vision(question, b64, CONFIG)
+        img = _capture_screen_image()
+        b64, size = _encode_jpeg_b64(img)
+        first = str(query_vision(question, b64, CONFIG) or "").strip()
+        if _peek_needs_second_pass(question, first):
+            try:
+                second = _peek_second_pass(question, img, b64, first)
+            except Exception as exc:
+                print(f"[看屏定位失败] {exc}; 用第一遍答案", flush=True)
+                second = None
+            if second:
+                print(f"[看屏] {size} → 第二遍 {len(second)} 字 (图像未落盘)", flush=True)
+                return second
+        answer = first or "屏幕我看清了, 但没想出该怎么答, Sir。"
         print(f"[看屏] {size} → {len(answer)} 字 (图像未落盘)", flush=True)
-        return str(answer or "").strip() or "屏幕我看清了, 但没想出该怎么答, Sir。"
+        return answer
     except Exception as exc:
         msg = str(exc)
         print(f"[看屏失败] {msg}", flush=True)
         if "图片" in msg or "HTTP 4" in msg or "视觉" in msg:
             return ("看屏失败：当前模型可能不支持图片输入，把模型名换成 deepseek-flash 再试，Sir。")
         return f"看屏失败：{msg}"
+
+
+def _peek_answer_verdict(text):
+    """敏感看屏的下一句: 肯定/否定; 无关回答按取消处理。"""
+    low = _PEEK_PUNCT.sub("", str(text or "")).lower()
+    if not low:
+        return "no"
+    for words in (_PEEK_NO, _PEEK_YES):
+        for w in words:
+            if low == w or (len(low) <= 6 and low.startswith(w)):
+                return "no" if words is _PEEK_NO else "yes"
+    return "no"
+
+
+def _peek_confirm_answer(text) -> bool:
+    """消费敏感看屏的确认回答: 肯定才发图, 否定/无关直接取消。"""
+    with _PEEK_CONFIRM_LOCK:
+        if not _PEEK_CONFIRM.get("pending"):
+            return False
+        if time.time() - float(_PEEK_CONFIRM.get("ts") or 0) > _PEEK_CONFIRM_TTL:
+            _PEEK_CONFIRM.update(pending=False, question="", ts=0.0)
+            return False
+        question = str(_PEEK_CONFIRM.get("question") or "")
+        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0)
+    if _peek_answer_verdict(text) == "yes":
+        speak(_peek_screen(question, sensitive_confirmed=True))
+    else:
+        speak("好，那就不看屏了，Sir")
+    return True
+
+
+def _readback_says_unverified(ok, text, tool_text):
+    """判断这一步的回读结论是不是"未核实" (只看成功位, 不看附带的可选回读)。"""
+    t = str(tool_text or "")
+    if "成功=无法核验" in t or "结论=未核实" in t:
+        return True
+    if "未核实" in t and "成功=是" not in t:
+        return True
+    return (not t) and ("未核实" in str(text or ""))
+
+
+def _step_is_dangerous(step):
+    """危险步压根不走视觉核实, 二次确认护栏语义不变。"""
+    return (bool(step.get("danger"))
+            or str(step.get("scope") or "") == AGENT_SCOPE_ASK
+            or agent_scope_of(str(step.get("action") or ""), step.get("args") or {})
+            == AGENT_SCOPE_ASK)
+
+
+def _agent_visual_verify(task, step, ok, text, tool_text):
+    """未核实步的只读核实: 拍一张屏问固定问题, 只改回读成败, 不产生任何动作。"""
+    if bool(ok) or not _readback_says_unverified(ok, text, tool_text):
+        return ok, text, tool_text
+    t = str(tool_text or "")
+
+    def _merge(conclusion, extra=""):
+        seg = "视觉核实=" + conclusion + "(来源=视觉核实"
+        if extra:
+            seg += "，" + extra
+        return (t + "；" if t else "") + seg + ")"
+
+    if _step_is_dangerous(step):
+        print("[视觉核实] 危险步不核实", flush=True)
+        return ok, text, _merge("跳过", "危险步")
+
+    used = int(task.get("_vision_verify_count") or 0)
+    if used >= _VISION_VERIFY_MAX:
+        print(f"[视觉核实] 单任务已达 {used} 次上限, 跳过", flush=True)
+        step["vision_verify"] = {"source": "视觉核实", "conclusion": "跳过", "reason": "超次数上限"}
+        return ok, text, _merge("跳过", "超次数上限")
+
+    if _sensitive_window_hit():
+        print("[视觉核实] 敏感画面跳过", flush=True)
+        step["vision_verify"] = {"source": "视觉核实", "conclusion": "跳过", "reason": "敏感画面跳过"}
+        return ok, text, _merge("跳过", "敏感画面跳过")
+
+    expect = str(step.get("say") or step.get("result") or text
+                 or step.get("action") or "")[:200]
+    question = _VISION_VERIFY_Q.format(expect=expect)
+    task["_vision_verify_count"] = used + 1   # 调用前先记, 失败也占一次额度
+    conclusion = "看不清"
+    try:
+        from llm_brain import query_vision
+        b64, size = _screen_jpeg_b64()
+        answer = str(query_vision(question, b64, CONFIG) or "").replace(" ", "")
+        print(f"[视觉核实] {size} → {len(answer)} 字", flush=True)
+        if "未出现" in answer:
+            conclusion = "未出现"
+        elif "已出现" in answer:
+            conclusion = "已出现"
+        elif "看不清" in answer:
+            conclusion = "看不清"
+    except Exception as exc:
+        conclusion = "调用失败"
+        print(f"[视觉核实] 调用失败: {exc}", flush=True)
+    step["vision_verify"] = {"source": "视觉核实", "conclusion": conclusion,
+                             "expect": expect, "question": question}
+    if conclusion == "已出现":
+        return True, text, _merge(conclusion)
+    if conclusion == "未出现":
+        return False, text, _merge(conclusion)
+    return ok, text, _merge(conclusion)
 
 
 # 已知事实: 这类问句不用绕模型, 直接照实答
@@ -2862,6 +3169,8 @@ def handle_command(command):
     # 高危动作在等确认时, "确认/取消"必须先在这里被消费;
     # 否则它会排到 _RUN_LOCK 后面, 表现就是"我确认了, 它却问我确认什么"。
     if _guard_answer(command):
+        return
+    if _peek_confirm_answer(command):
         return
     with _RUN_LOCK:
         _TL.command_id = command_id

@@ -664,14 +664,19 @@ _VISION_SYSTEM = (
     "4. 需要给操作建议时只给一句，不要列步骤。"
 )
 
+_VISION_LOCATE_SYSTEM = (
+    "你在看用户 Windows 电脑的屏幕截图。用户想问清楚图里的某个具体对象。\n"
+    "你的唯一任务是在图上定位那个对象, 不要回答用户的问题, 不要描述画面。\n"
+    "只输出一行 JSON, 不要任何解释、前后缀或 Markdown 代码块:\n"
+    '{"x_min":0,"y_min":0,"x_max":1000,"y_max":1000}\n'
+    "四个值都是 0~1000 的整数, 是区域相对整张图的归一化坐标, 左上角为 (0,0)。\n"
+    "区域要尽量紧凑地框住目标 (报错文字/按钮/数值), 不要框整屏; 找不到就只输出 null。"
+)
 
-def query_vision(question: str, image_b64: str, config: dict,
-                 detail: str = "high", mime: str = "image/jpeg") -> str:
-    """看一张图并回答 (base64 直接进请求体, 图片全程不落盘)。
 
-    只适用于 OpenAI 兼容协议的视觉模型 (如 DeepSeek-V4.1-Flash / deepseek-flash)。
-    失败一律抛 _LlmError, 文案可直接朗读。
-    """
+def _vision_chat(system, question, image_b64, config, detail="high",
+                 mime="image/jpeg", max_tokens=320):
+    """视觉请求共用底座: 组装图像消息 + 挑支持看图的模型 + 发请求。"""
     q = str(question or "").strip() or \
         "看清这个屏幕，用一两句话说明这是什么界面、有什么值得注意的信息。"
     b64 = str(image_b64 or "").strip()
@@ -684,7 +689,7 @@ def query_vision(question: str, image_b64: str, config: dict,
         raise _LlmError("当前这家服务商的接口不吃图片，换一家支持视觉的模型再试。")
 
     messages = [
-        {"role": "system", "content": _VISION_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content": [
             {"type": "text", "text": q},
             {"type": "image_url",
@@ -700,13 +705,34 @@ def query_vision(question: str, image_b64: str, config: dict,
     elif provider_name == "DeepSeek":
         cfg["ai_model"] = "deepseek-flash"
     try:
-        return _provider_chat(cfg, messages, max_tokens=320)
+        return _provider_chat(cfg, messages, max_tokens=max_tokens)
     except _LlmError as exc:
         text = str(exc)
         if "HTTP 4" in text:
             raise _LlmError(
                 f"{text}（看屏需要支持图片输入的模型，比如 DeepSeek 的 deepseek-flash）")
         raise
+
+
+def query_vision(question: str, image_b64: str, config: dict,
+                 detail: str = "high", mime: str = "image/jpeg") -> str:
+    """看一张图并回答 (base64 直接进请求体, 图片全程不落盘)。
+
+    只适用于 OpenAI 兼容协议的视觉模型 (如 DeepSeek-V4.1-Flash / deepseek-flash)。
+    失败一律抛 _LlmError, 文案可直接朗读。
+    """
+    return _vision_chat(_VISION_SYSTEM, question, image_b64, config,
+                        detail=detail, mime=mime, max_tokens=320)
+
+
+def query_vision_locate(question: str, image_b64: str, config: dict,
+                        detail: str = "high", mime: str = "image/jpeg") -> str:
+    """在全屏图上定位用户所问的对象, 返回模型原文 (应为一行坐标 JSON)。
+
+    提示词强制只输出 JSON; 解析与越界校验由调用方负责, 失败就放弃二次看屏。
+    """
+    return _vision_chat(_VISION_LOCATE_SYSTEM, question, image_b64, config,
+                        detail=detail, mime=mime, max_tokens=120)
 
 
 def _provider_chat(config: dict, messages,
