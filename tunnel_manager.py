@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 
-URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
+URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com(?![a-z0-9.-])", re.I)
 RESTART_DELAYS = (2.0, 4.0)
 MISSING_MESSAGE = (
     "未找到 cloudflared：请到 Cloudflare 官网下载 cloudflared.exe 放进 PATH，"
