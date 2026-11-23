@@ -224,7 +224,7 @@ MEMORY = JarvisMemory()
 
 # Agent 任务拆解提示词: 只管"把目标拆成步骤", 不执行。
 # 步骤格式沿用现有动作白名单, 由 sanitize_plan 出口统一校验。
-AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
+AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。语音转写中的疑似人名（尤其拉丁字母名）视为噪声，不采纳、不复述、不沿用；称呼只按记忆中保存的称呼。
 只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, click_screen, remember, forget_memory。
 click_screen 只用于用户明确要求点击屏幕上某个按钮: args={"target":"按钮描述"}；它不是 open_app 的替代品，「点击进入微信」要点已打开界面上的按钮，不能用 open_app 重开软件。每条指令最多一步 click_screen，点完系统会核验播报，不许连续点。
 【留档认知】本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）；用户问「聊天记录保存了没有」时如实答有，直接返回一个 chat 步骤即可，不要当成文件或搜索任务。
@@ -764,6 +764,51 @@ _GUARD_NO = ("取消", "算了", "不用", "不要", "别", "不关", "停下", 
              "不", "n", "no")
 _GUARD_PUNCT = re.compile(r"[。！？!?，,.、\s]")
 
+_CONFIRM_ASR = {"确订": "确定", "缺定": "确定", "确d": "确定", "却定": "确定"}
+_CONFIRM_YES = ("没问题", "确定", "确认", "好的", "是的", "看吧", "点吧", "继续",
+                "同意", "执行", "可以", "好", "行", "是", "对", "嗯", "yes", "y")
+_CONFIRM_NO = ("不用", "不要", "不行", "别", "算了", "取消", "停下", "不关", "停", "不", "no", "n")
+_CONFIRM_FILLERS = frozenset("了啊吧呐呀哦噢喔呢嘛哈啦呗喽咯")
+_CONFIRM_SELF_LEAD = re.compile(
+    r"^我(?:就|是|才)?(?:说|讲|选|答应|答|回|道|想|觉得|认为)(?:的是|了|过)?[：:，,、]?")
+
+
+def classify_confirmation_answer(text):
+    """语义确认判定: confirm / deny / none。只在已有待确认上下文调用。
+
+    先剥句首自述引导词 ("我说/我讲/我选" 等), 剩余部分再按纯答复判定。
+    肯定核心允许重复、标点分隔和纯语气词尾巴 ("确定。"/"嗯嗯"/"好的嗯"/"确定确定哦")；
+    整句必须只由肯定核心与语气词组成, 夹带其它内容 ("嗯打开浏览器") 不算答复。
+    肯定与否定核心同现 ("好不") 是歧义句, 归 none: 既不消费也不取消。
+    """
+    raw = re.sub(r"\s+", "", str(text or "")).lower()
+    for noisy, canonical in _CONFIRM_ASR.items():
+        raw = raw.replace(noisy, canonical)
+    raw = _CONFIRM_SELF_LEAD.sub("", raw, count=1)
+    if not raw:
+        return "none"
+    compact = _GUARD_PUNCT.sub("", raw)
+    no_hit = next((word for word in _CONFIRM_NO if word in compact), None)
+    if no_hit:
+        rest = compact.replace(no_hit, "")
+        return "none" if any(word in rest for word in _CONFIRM_YES) else "deny"
+    clause = _GUARD_PUNCT.sub("", re.split(r"[，,。！？!?、；;]", raw, maxsplit=1)[0])
+    rest, seen_core = clause, False
+    while rest:
+        core = next((word for word in _CONFIRM_YES if rest.startswith(word)), None)
+        if core:
+            rest, seen_core = rest[len(core):], True
+        elif rest[0] in _CONFIRM_FILLERS:
+            rest = rest[1:]
+        else:
+            return "none"
+    return "confirm" if seen_core else "none"
+
+
+def _same_pending_action(text, action):
+    plan = _parse_rules(str(text or ""))
+    return bool(plan and plan.get("action") == action)
+
 
 def _guard_begin(desc, source=""):
     with _GUARD_LOCK:
@@ -786,17 +831,7 @@ def _guard_answer(text, source="") -> bool:
     来源不一致时原样放行 (不消费、不取消): 这句话走正常指令流程,
     待确认留给发起方在自己的 TTL 内回答或自然过期。
     """
-    low = _GUARD_PUNCT.sub("", str(text or "")).lower()
-    if not low:
-        return False
-
-    def _hit(words):
-        # 精确命中, 或短句以该词开头 ("算了不要了" / "取消吧" 这类口语);
-        # 长句不算确认 —— "确认一下微信关了吗" 是问题, 不是回答
-        for w in words:
-            if low == w or (len(low) <= 6 and low.startswith(w)):
-                return True
-        return False
+    verdict = classify_confirmation_answer(text)
 
     src = _input_source(source)
     with _GUARD_LOCK:
@@ -806,17 +841,20 @@ def _guard_answer(text, source="") -> bool:
             return False
         if _source_label(_GUARD.get("source")) != src:
             return False
-        if _hit(_GUARD_NO):
+        if verdict == "deny":
             _GUARD["answer"] = "no"
             handled = True
-        elif _hit(_GUARD_YES):
+        elif verdict == "confirm":
             _GUARD["answer"] = "yes"
             handled = True
         else:
-            # 不是回答确认, 而是另一条指令: 按"取消"收尾, 这句话继续走正常流程。
-            # 否则守卫会一直占着 _RUN_LOCK, 用户得等满 60 秒才能干别的事。
-            _GUARD["answer"] = "no"
             handled = False
+            event = None
+            # 无关指令/重复动作不消费确认，也不取消守卫。
+            if _same_pending_action(text, "peek_screen") or _same_pending_action(text, "click_screen"):
+                speak("我在等您确认。")
+                return True
+            return False
         event = _GUARD["event"]
     # 界面上的确认框也一起收掉, 免得它继续挂着等 60 秒
     if ui_bridge is not None:
@@ -894,7 +932,7 @@ def confirm(question):
         except Exception:
             pass
     if ans:
-        return any(w in ans for w in ["确认", "是的", "好", "可以", "关吧", "嗯"])
+        return classify_confirmation_answer(ans) == "confirm"
     try:
         return input("确认吗? 输入 y 回车 = 确认, 其他 = 取消: ").strip().lower() == "y"
     except Exception:
@@ -1948,6 +1986,10 @@ def _parse_rules(text, peek_followup=False):
     if any(w in t for w in _SCREENSHOT_PEEK_WORDS):
         return {"action": "peek_screen", "args": {"question": raw}, "say": "我看看屏幕"}
 
+    # 对当前界面做确认/核验也是明确的只读看屏请求。
+    if any(w in t for w in ("确认一下屏幕", "确认屏幕状态", "再确认屏幕", "核验屏幕")):
+        return {"action": "peek_screen", "args": {"question": raw}, "say": "我看看屏幕"}
+
     # 看屏: 载体词 + 明确意图词才触发; 单纯提到屏幕/乱码都不看。
     q = _peek_question_from_text(raw, peek_followup)
     if q is not None:
@@ -2250,7 +2292,7 @@ _CLICK_NEG_TAIL_RE = re.compile(
 )
 _CLICK_NONCOMMAND_WORDS = (
     "如果", "假如", "假设", "要是", "万一", "我说", "你说", "他说", "听说", "说道", "说过",
-    "指的是", "意思是", "这个词", "这几个字", "这句话", "引号", "引用", "会怎样", "会怎么样",
+    "指的是", "意思是", "是什么意思", "这个词", "这几个字", "这四个字", "这句话", "引号", "引用", "会怎样", "会怎么样",
     "会如何", "会有什么", "什么后果", "什么效果", "什么反应", "会发生", "是不是", "能不能",
     "可不可以", "会不会", "吗", "呢", "？", "?",
 )
@@ -2263,7 +2305,8 @@ def _click_intent(text):
     if not raw:
         return "", "unclear"
     low = _tight(raw)
-    if any(w in low for w in _CLICK_NONCOMMAND_WORDS):
+    polite_request = any(token in low for token in ("能帮我", "可以帮我", "帮我", "帮忙", "请帮"))
+    if any(w in low for w in _CLICK_NONCOMMAND_WORDS) and not polite_request:
         return "", "unclear"
     m = _CLICK_COMMAND_RE.search(raw)
     if not m:
@@ -2272,7 +2315,8 @@ def _click_intent(text):
     if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
         return "", "negated"
     target = m.group(1).strip().rstrip("。！？!?，,、；; ")
-    target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
+    target = re.sub(r"(?:吗|呢|可以吗|行吗)$", "", target).strip()
+    target = re.sub(r"^(?:那个|这个|帮我|给我|我的)", "", target).strip()
     if not target or _CLICK_TARGET_NONCOMMAND_RE.match(target):
         return "", "unclear"
     return target, "command"
@@ -2306,7 +2350,8 @@ def _explicit_intent(text) -> bool:
         return True
     if is_self_exit(text):
         return True
-    return bool(memory_store.parse_remember(text) or memory_store.parse_forget(text)
+    return bool(_click_intent(text)[1] == "command"
+                or memory_store.parse_remember(text) or memory_store.parse_forget(text)
                 or memory_store.is_list_request(text))
 
 
@@ -2420,6 +2465,8 @@ _PEEK_CONFIRM_LOCK = threading.Lock()
 _PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0, "window": (),
                  "source": "local", "action": "peek_screen", "target": "",
                  "click_confirmed": False}
+_SENSITIVE_APPROVALS = {}
+_SENSITIVE_APPROVAL_TTL = 300.0
 _PEEK_YES = ("确定", "要看", "继续", "可以", "好的", "行", "是", "对", "嗯", "yes", "y")
 _PEEK_NO = ("取消", "不要", "不看", "算了", "不用", "不", "no", "n")
 _PEEK_PUNCT = re.compile(r"[。！？!?，,、\.；;：:“”\"‘’'（）()\[\]【】…·～~\s]")
@@ -2522,6 +2569,56 @@ def _same_confirm_window(saved, current):
     if saved_hwnd and current_hwnd:
         return saved_hwnd == current_hwnd
     return bool(saved_title) and saved_title == current_title
+
+
+def _sensitive_approval_valid(identity):
+    """同一窗口的免问批准是否还在有效期内 (只存内存, 重启即失效)。"""
+    approved_at = float(_SENSITIVE_APPROVALS.get(repr(identity), 0.0) or 0.0)
+    return bool(approved_at) and 0 <= time.time() - approved_at <= _SENSITIVE_APPROVAL_TTL
+
+
+def _register_sensitive_pending(action, question, target, confirmed, source, window):
+    with _PEEK_CONFIRM_LOCK:
+        _PEEK_CONFIRM.update(pending=True, question=str(question or ""), ts=time.time(),
+                             window=window, source=_input_source(source), action=action,
+                             target=str(target or ""), click_confirmed=bool(confirmed))
+
+
+def _sensitive_gate(action, question, target, confirmed, source, allow_confirm,
+                    sensitive_confirmed, confirmed_window):
+    """发图/点击前的统一敏感复检; 返回 (allowed, blocked_reply, approval_window)。
+
+    免问缓存只跳过"再问一遍", 不跳过这里的当前窗口敏感复检和窗口身份比对；
+    确认后窗口换了, 或复检仍敏感且本窗口没有有效批准, 一律重走检查流程。
+    """
+    label = "看屏" if action == "peek_screen" else "看屏点击"
+    identity = _foreground_window_identity()
+    confirmed_by_user = bool(sensitive_confirmed)
+    sensitive_now = _sensitive_window_hit()
+    if sensitive_confirmed:
+        saved = confirmed_window if confirmed_window is not None else _PEEK_CONFIRM.get("window")
+        if not _same_confirm_window(saved, identity):
+            print(f"[{label}] 确认窗口已变, 重走检查流程", flush=True)
+            sensitive_confirmed = False
+        elif sensitive_now and not _sensitive_approval_valid(identity):
+            print(f"[{label}] 复检仍敏感, 重走检查流程", flush=True)
+            sensitive_confirmed = False
+    if not sensitive_confirmed:
+        if not sensitive_now:
+            return True, None, None
+        if _sensitive_approval_valid(identity):
+            print(f"[{label}] 本窗口批准仍有效, 免重复问", flush=True)
+            sensitive_confirmed = True
+        elif allow_confirm and not bool(getattr(_TL, "agent_context", False)):
+            _register_sensitive_pending(action, question, target, confirmed, source, identity)
+            print(f"[{label}] 敏感画面, 等用户确认", flush=True)
+            return False, _SENSITIVE_PROMPT, None
+        else:
+            print(f"[{label}] 敏感画面跳过", flush=True)
+            skip = ("当前窗口可能含敏感内容，这次点击跳过，Sir。" if action == "click_screen"
+                    else "当前窗口可能含敏感内容，这次看屏跳过，Sir。")
+            return False, skip, None
+    return True, None, (identity if confirmed_by_user else None)
 
 
 def _parse_vision_verdict(answer):
@@ -2752,7 +2849,7 @@ def _peek_second_pass(question, full_img, full_b64, first_answer):
 
 
 def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
-                 confirmed_window=None, source="") -> str:
+                 confirmed_window=None, source="", approved_by_user=False) -> str:
     """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。
 
     sensitive_confirmed 只代表用户点过头, 不能绕过发图前的窗口/敏感性复检:
@@ -2762,30 +2859,17 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
         from llm_brain import query_vision
     except Exception as exc:
         return f"看屏功能没加载起来: {exc}"
-    sensitive_now = None
-    if sensitive_confirmed:
-        saved = confirmed_window if confirmed_window is not None else _PEEK_CONFIRM.get("window")
-        sensitive_now = _sensitive_window_hit()
-        if not _same_confirm_window(saved, _foreground_window_identity()) or sensitive_now:
-            print("[看屏] 确认窗口已变或复检敏感, 重走检查流程", flush=True)
-            sensitive_confirmed = False
-    if not sensitive_confirmed:
-        if sensitive_now is None:
-            sensitive_now = _sensitive_window_hit()
-        if sensitive_now:
-            if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
-                with _PEEK_CONFIRM_LOCK:
-                    _PEEK_CONFIRM.update(pending=True, question=str(question or ""),
-                                         ts=time.time(), window=_foreground_window_identity(),
-                                         source=_input_source(source))
-                print("[看屏] 敏感画面, 等用户确认", flush=True)
-                return _SENSITIVE_PROMPT
-            print("[看屏] 敏感画面跳过", flush=True)
-            return "当前窗口可能含敏感内容，这次看屏跳过，Sir。"
+    allowed, blocked, approval_window = _sensitive_gate(
+        "peek_screen", question, "", False, source, allow_confirm,
+        sensitive_confirmed, confirmed_window)
+    if not allowed:
+        return blocked
     try:
         img = _capture_screen_image()
         b64, size = _encode_jpeg_b64(img)
         first = str(query_vision(question, b64, CONFIG) or "").strip()
+        if approval_window and approved_by_user:
+            _SENSITIVE_APPROVALS[repr(approval_window)] = time.time()
         if _peek_needs_second_pass(question, first):
             try:
                 second = _peek_second_pass(question, img, b64, first)
@@ -2807,7 +2891,7 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
 
 
 def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
-                  confirmed_window=None, source="", confirmed=False):
+                  confirmed_window=None, source="", confirmed=False, approved_by_user=False):
     """看屏点击: 敏感检查 → 截图 → 视觉定位 → 框中心点一次点击 → 再截图核验播报。
 
     confirmed 表示危险目标已在执行前走过二次确认; 未确认绝不点。每次调用最多点一下。
@@ -2817,28 +2901,12 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
     if not target:
         return _CLICK_NOT_FOUND
 
-    # ① 敏感画面: 与 peek 同一套关键词、同一套确认/跳过政策。
-    sensitive_now = None
-    if sensitive_confirmed:
-        saved = confirmed_window if confirmed_window is not None else _PEEK_CONFIRM.get("window")
-        sensitive_now = _sensitive_window_hit()
-        if not _same_confirm_window(saved, _foreground_window_identity()) or sensitive_now:
-            print("[看屏点击] 确认窗口已变或复检敏感, 重走检查流程", flush=True)
-            sensitive_confirmed = False
-    if not sensitive_confirmed:
-        if sensitive_now is None:
-            sensitive_now = _sensitive_window_hit()
-        if sensitive_now:
-            if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
-                with _PEEK_CONFIRM_LOCK:
-                    _PEEK_CONFIRM.update(pending=True, question=target, ts=time.time(),
-                                         window=_foreground_window_identity(),
-                                         source=_input_source(source), action="click_screen",
-                                         target=target, click_confirmed=bool(confirmed))
-                print("[看屏点击] 敏感画面, 等用户确认", flush=True)
-                return _SENSITIVE_PROMPT
-            print("[看屏点击] 敏感画面跳过", flush=True)
-            return "当前窗口可能含敏感内容，这次点击跳过，Sir。"
+    # ① 敏感画面: 与 peek 同一套关键词、同一套确认/跳过/复检政策。
+    allowed, blocked, approval_window = _sensitive_gate(
+        "click_screen", target, target, confirmed, source, allow_confirm,
+        sensitive_confirmed, confirmed_window)
+    if not allowed:
+        return blocked
 
     try:
         from llm_brain import query_vision, query_vision_locate
@@ -2899,6 +2967,8 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
         after_b64, after_size = _encode_jpeg_b64(after)
         question = _CLICK_VERIFY_Q.format(target=target)
         answer = str(query_vision(question, after_b64, CONFIG) or "").strip()
+        if approval_window and approved_by_user:
+            _SENSITIVE_APPROVALS[repr(approval_window)] = time.time()
         verdict = _parse_click_verdict(answer)
         print(f"[看屏点击] 点后 {after_size} → 裁决={verdict}", flush=True)
         if verdict == _CLICK_DONE:
@@ -2912,33 +2982,14 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
 
 
 def _peek_answer_verdict(text):
-    """敏感看屏的下一句: 只认整句肯定/否定; 其它返回 None, 不当答复。"""
-    low = _PEEK_PUNCT.sub("", str(text or "")).lower()
-    if not low:
-        return None
-    for words, verdict in ((_PEEK_NO, "no"), (_PEEK_YES, "yes")):
-        if any(low == word for word in words):
-            return verdict
-    # 纯确认短语拼成且总长不超过 4 字 (如 嗯嗯 / 好的嗯 / 确定确定) 才算答复。
-    if len(low) <= 4:
-        for words, verdict in ((_PEEK_NO, "no"), (_PEEK_YES, "yes")):
-            rest = low
-            while rest:
-                hit = next((word for word in words if rest.startswith(word)), None)
-                if hit is None:
-                    break
-                rest = rest[len(hit):]
-            if not rest:
-                return verdict
-    return None
+    verdict = classify_confirmation_answer(text)
+    return {"confirm": "yes", "deny": "no", "none": None}[verdict]
 
 
 def _peek_confirm_answer(text, source="") -> bool:
-    """消费敏感看屏确认: 只有本来源的明确答复才算消费; 其它放行原指令。
-
-    来源不一致时不消费也不取消: 待确认留给发起方在 TTL 内回答或自然过期。
-    """
+    """消费本来源的敏感看屏/点击确认; 非明确答复清状态、放行后续指令。"""
     src = _input_source(source)
+    verdict = _peek_answer_verdict(text)
     with _PEEK_CONFIRM_LOCK:
         if not _PEEK_CONFIRM.get("pending"):
             return False
@@ -2947,22 +2998,30 @@ def _peek_confirm_answer(text, source="") -> bool:
             return False
         if _source_label(_PEEK_CONFIRM.get("source")) != src:
             return False
+        pending_action = str(_PEEK_CONFIRM.get("action") or "peek_screen")
         question = str(_PEEK_CONFIRM.get("question") or "")
         window = _PEEK_CONFIRM.get("window") or ()
-        pending_action = str(_PEEK_CONFIRM.get("action") or "peek_screen")
         pending_target = str(_PEEK_CONFIRM.get("target") or "")
         click_confirmed = bool(_PEEK_CONFIRM.get("click_confirmed"))
         _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local",
                              action="peek_screen", target="", click_confirmed=False)
-    verdict = _peek_answer_verdict(text)
     if verdict is None:
         return False
     if verdict == "yes":
         if pending_action == "click_screen":
-            speak(_click_screen(pending_target, sensitive_confirmed=True,
-                                confirmed_window=window, source=src, confirmed=click_confirmed))
+            result = _click_screen(pending_target, sensitive_confirmed=True,
+                                   confirmed_window=window, source=src, confirmed=click_confirmed,
+                                   approved_by_user=True)
+            action = "click_screen"
+            args = {"target": pending_target}
         else:
-            speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window, source=src))
+            result = _peek_screen(question, sensitive_confirmed=True,
+                                  confirmed_window=window, source=src, approved_by_user=True)
+            action = "peek_screen"
+            args = {"question": question}
+        speak(result)
+        MEMORY.record_turn(question or pending_target or "确认后执行屏幕动作",
+                           {"action": action, "args": args, "say": result}, source=src)
     elif pending_action == "click_screen":
         speak("好，那就不点了，Sir。")
     else:
@@ -3101,7 +3160,8 @@ def parse_command(text):
                     "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
 
     weather_request = action == "web_search" and ("天气" in low or "温度" in low or "下雨" in low)
-    if _is_question(text) and action not in _REQUEST_ACTIONS and not weather_request:
+    polite_click_request = (action == "click_screen" and bool(re.match(r"^(?:你)?(?:能帮我|可以帮我|帮我|帮忙|请帮)", low)))
+    if _is_question(text) and action not in _REQUEST_ACTIONS and not weather_request and not polite_click_request:
         fact = _FACT_ANSWERS.get(action)
         if fact:
             print(f"[仲裁] 问句 → 事实答复 {action}", flush=True)
@@ -3740,7 +3800,9 @@ def execute_plan(plan, command_id=None, source=""):
             status_done.set()
         return True
 
-    speak(_perform_plan(plan, source=source))
+    result = _perform_plan(plan, source=source)
+    plan["say"] = result
+    speak(result)
     return False
 
 

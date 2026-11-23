@@ -239,6 +239,7 @@ def main():
                                     window=("hwnd-1", "微信"), source="local",
                                     action="click_screen", target="进入微信按钮",
                                     click_confirmed=False)
+        jarvis._sensitive_window_hit = lambda: False  # 确认后复检: 窗口已不敏感才发图
         consumed = jarvis._peek_confirm_answer("确定", "local")
         check(consumed and len(seen["clicks"]) == 1, "敏感确认后恢复点击, 仍只点一次")
     finally:

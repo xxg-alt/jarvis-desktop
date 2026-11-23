@@ -53,6 +53,7 @@ def decode(b64):
 
 def reset_confirm():
     jarvis._PEEK_CONFIRM.update(pending=False, question="", ts=0.0)
+    jarvis._SENSITIVE_APPROVALS.clear()
 
 
 def main():
@@ -306,10 +307,11 @@ def main():
     if not ok:
         fails.append(("F1/同窗口放行", rc, len(seen["qv"])))
 
-    # 3e. F3: 只消费整句肯定/否定 (或 ≤4 字的纯确认短语)
+    # 3e. F3: 共用语义判定器 —— 标点/重复/语气词的肯定算答复；夹带指令或肯否同现不算。
+    # 裁定(1): "确定确定哦" 是重复肯定核心+语气词, 旧期望 None 与"语气词肯定都要认"冲突, 改 yes。
     verdict_cases = (
         ("确定", "yes"), ("确定。！", "yes"), ("确定.", "yes"), ("嗯", "yes"), ("嗯嗯", "yes"),
-        ("好的嗯", "yes"), ("确定确定", "yes"), ("确定确定哦", None),
+        ("好的嗯", "yes"), ("确定确定", "yes"), ("确定确定哦", "yes"),
         ("嗯打开浏览器", None), ("打开浏览器", None), ("不用", "no"),
         ("no", "no"), ("不", "no"), ("好不", None), ("", None),
     )
@@ -341,14 +343,16 @@ def main():
     if not ok:
         fails.append(("F3/明确否定", rc, seen["spoken"]))
 
+    # 裁定(4): "不用了" 是共用判定器认可的明确否定 (带语气词), 旧期望"非整句否定不消费"
+    # 与"明确否定要取消看屏并给一句口头回应"冲突, 按裁定改为消费并回应。
     ans = jarvis._peek_screen("屏幕上写了什么")
     seen["spoken"] = []
     rc = jarvis._peek_confirm_answer("不用了")
-    ok = (rc is False and not seen["qv"] and not seen["spoken"]
-          and not jarvis._PEEK_CONFIRM["pending"])
-    print(f"{'PASS' if ok else 'FAIL'}  F3 非整句否定 → 不消费 → rc={rc}")
+    ok = (rc is True and not seen["qv"] and not jarvis._PEEK_CONFIRM["pending"]
+          and seen["spoken"] == ["好，那就不看屏了，Sir"])
+    print(f"{'PASS' if ok else 'FAIL'}  F3 带语气词明确否定 → 取消看屏并回应 → rc={rc}")
     if not ok:
-        fails.append(("F3/非整句否定", rc, seen["spoken"]))
+        fails.append(("F3/带语气词否定", rc, seen["spoken"]))
 
     jarvis._peek_screen("屏幕上写了什么")
     with jarvis._PEEK_CONFIRM_LOCK:
