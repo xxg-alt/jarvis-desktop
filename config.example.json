@@ -12,6 +12,8 @@
   ],
   "robot_voice": 0.7,
   "always_listen": true,
+  "remote_enabled": true,
+  "remote_port": 8765,
   "tts_engine": "edge",
   "tts_voice": "云扬",
   "ai_provider": "Kaggle 免费 35B",

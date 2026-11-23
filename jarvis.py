@@ -29,10 +29,25 @@ BASE = Path(__file__).resolve().parent
 DRY_RUN = False
 # GUI 外壳回调（终端版保持 None）：文字、语音播放结束、麦克风音量和退出。
 ON_SPEAK = None
+ON_SPEAK_FEED = None
 ON_HEAR = None
 ON_SPEAK_END = None
 ON_AUDIO_LEVEL = None
 ON_EXIT = None
+
+
+def _notify_speak(text):
+    if ON_SPEAK is not None:
+        try:
+            ON_SPEAK(text)
+        except Exception:
+            pass
+    if ON_SPEAK_FEED is not None:
+        try:
+            ON_SPEAK_FEED(text)
+        except Exception:
+            pass
+
 QUIT_REQUESTED = threading.Event()
 _LAST_MEMORY_CANDIDATES = []
 _LAST_MEMORY_CANDIDATES_AT = 0.0
@@ -109,6 +124,8 @@ def load_config():
         "robot_voice": 0.7,
         "always_listen": True,
         "vision_enabled": True,
+        "remote_enabled": True,
+        "remote_port": 8765,
         "ai_provider": "DeepSeek",
         "api_key": "",
         "ai_model": "",
@@ -488,11 +505,7 @@ def _speak(text):
                 last_stream_sentence[0] = first
                 if ui_bridge is not None:
                     ui_bridge.emit_subtitle(first, True)
-                if ON_SPEAK is not None:
-                    try:
-                        ON_SPEAK(first)
-                    except Exception:
-                        pass
+                _notify_speak(first)
 
             def stream_sentence(sentence):
                 sentence = str(sentence or "").strip()
@@ -501,11 +514,7 @@ def _speak(text):
                 last_stream_sentence[0] = sentence
                 if ui_bridge is not None:
                     ui_bridge.emit_subtitle(sentence, True)
-                if ON_SPEAK is not None:
-                    try:
-                        ON_SPEAK(sentence)
-                    except Exception:
-                        pass
+                _notify_speak(sentence)
 
             try:
                 speak_edge_streaming(
@@ -564,11 +573,7 @@ def _speak(text):
                 started = True
                 if ui_bridge is not None:
                     ui_bridge.emit_subtitle(sentence, True)
-                if ON_SPEAK is not None:
-                    try:
-                        ON_SPEAK(sentence)
-                    except Exception:
-                        pass
+                _notify_speak(sentence)
 
             # 只在这一句的“合成 + 播放”窗口内屏蔽麦克风，留足余量防止尾音回声。
             _SPEAKING_UNTIL = time.time() + max(8.0, min(60.0, len(sentence) * 0.5 + 3.0))
@@ -3361,7 +3366,7 @@ def execute_plan(plan, command_id=None):
     return False
 
 
-def handle_command(command):
+def handle_command(command, source=""):
     """指令入口：语音和文字共用，串行执行，后来的指令直接顶掉前一条。"""
     if not command or not command.strip():
         return
@@ -3369,6 +3374,9 @@ def handle_command(command):
     command_id = _new_command_id()
     # 原话留在 thread-local: 模型漏填 folder 时, 写文档要用它兜底解析存放位置
     _TL.user_text = command
+    _TL.command_source = source or "local"
+    if source:
+        print(f"[指令·{source}] {command[:80]}", flush=True)
     # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
     _cut_audio()
     # agent 任务在后台线程跑, 不占 _RUN_LOCK; 停/跳过这类插话要在这里直接吃掉,
@@ -3586,7 +3594,8 @@ def _handle_command_inner(command, command_id):
             say = _multi_open_say(results)
             speak(say)
             MEMORY.record_turn(command, {"action": "open_app",
-                                         "args": {"names": [r[0] for r in results]}}, source="local")
+                                         "args": {"names": [r[0] for r in results]}},
+                               source=getattr(_TL, "command_source", None) or "local")
         finally:
             if ui_bridge is not None:
                 ui_bridge.emit_state("IDLE")
@@ -3616,7 +3625,8 @@ def _handle_command_inner(command, command_id):
                 print("[指令已被新指令取代，丢弃]")
                 return
             speak(reply)
-            MEMORY.record_turn(command, {"action": "chat", "args": {}, "say": reply}, source="chat")
+            MEMORY.record_turn(command, {"action": "chat", "args": {}, "say": reply},
+                               source=getattr(_TL, "command_source", None) or "chat")
             if ui_bridge is not None:
                 ui_bridge.emit_state("IDLE")
             return
@@ -3654,7 +3664,8 @@ def _handle_command_inner(command, command_id):
     try:
         async_started = execute_plan(plan, command_id=command_id)
     finally:
-        MEMORY.record_turn(command, plan, source=plan_source or "unresolved")
+        MEMORY.record_turn(command, plan,
+                           source=getattr(_TL, "command_source", None) or plan_source or "unresolved")
         # 同步动作已经结束；异步工具仍由主循环等待最终结果。
         if ui_bridge is not None and not async_started:
             ui_bridge.emit_state("IDLE")

@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import messagebox, scrolledtext
 from pathlib import Path
 import psutil
 
@@ -109,6 +109,7 @@ import diagnostics
 diagnostics.enable(LOG_FILE)
 
 import jarvis
+import remote_server
 from edge_speech import PRESET_VOICES
 
 # 状态通信队列
@@ -962,6 +963,8 @@ class JarvisAppManager:
             print(f"[歌词字幕启动失败] {_e}")
 
         self.tray_icon = None
+        self.remote = None
+        self._start_remote()
         self._start_tray()
 
         threading.Thread(target=self._start_core, daemon=True).start()
@@ -1215,6 +1218,10 @@ class JarvisAppManager:
         except Exception:
             pass
         try:
+            if self.remote:
+                self.remote.stop()
+        except Exception: pass
+        try:
             if self.tray_icon:
                 self.tray_icon.stop()
         except Exception: pass
@@ -1238,6 +1245,42 @@ class JarvisAppManager:
         except Exception: pass
         os._exit(0)
 
+    def _start_remote(self):
+        try:
+            self.remote = remote_server.RemoteControlServer(
+                handle_command=jarvis.handle_command, config=jarvis.CONFIG)
+            if self.remote.start():
+                threading.Thread(target=self.remote.serve_forever,
+                                 name="phone-remote", daemon=True).start()
+        except Exception as exc:
+            print(f"[手机遥控启动失败] {type(exc).__name__}: {exc}", flush=True)
+
+    def _remote_url(self):
+        return self.remote.url if self.remote and self.remote.url else "未启用"
+
+    def copy_remote_url(self):
+        url = self._remote_url()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+        except Exception:
+            pass
+        messagebox.showinfo("手机遥控", f"局域网地址: {url}\n已复制到剪贴板，手机需连同一 Wi-Fi")
+
+    def show_remote_password(self):
+        if not self.remote:
+            return
+        messagebox.showinfo("手机遥控口令",
+                            f"口令: {self.remote.reveal_password()}\n只在手机首次登录时输入")
+
+    def reset_remote_password(self):
+        if not self.remote:
+            return
+        if not messagebox.askyesno("手机遥控", "重置后旧口令与已登录会话都会失效，继续？"):
+            return
+        password = self.remote.reset_password()
+        messagebox.showinfo("手机遥控口令", f"新口令: {password}\n请在手机上重新登录")
+
     def _start_tray(self):
         try:
             import pystray
@@ -1251,6 +1294,10 @@ class JarvisAppManager:
                 pystray.MenuItem("显示 Tk 胶囊", lambda _i, _it: self.root.after(0, self.use_capsule_ui)),
                 pystray.MenuItem("展开全屏大中枢", lambda _i, _it: self.root.after(0, self.use_classic_ui)),
                 pystray.MenuItem("切换为桌面悬浮球", lambda _i, _it: self.root.after(0, self.use_orb_ui)),
+                pystray.MenuItem(lambda _item: "手机遥控地址: " + self._remote_url(),
+                                 lambda _i, _it: self.root.after(0, self.copy_remote_url)),
+                pystray.MenuItem("显示手机遥控口令", lambda _i, _it: self.root.after(0, self.show_remote_password)),
+                pystray.MenuItem("重置手机遥控口令", lambda _i, _it: self.root.after(0, self.reset_remote_password)),
                 pystray.MenuItem("显示 / 隐藏歌词字幕", lambda _i, _it: self.root.after(0, self.toggle_lyric_visibility)),
                 pystray.MenuItem("切换字幕鼠标穿透", lambda _i, _it: self.root.after(0, self.toggle_lyric_click_through)),
                 pystray.MenuItem("字幕恢复顶部居中", lambda _i, _it: self.root.after(0, self.reset_lyric_position)),

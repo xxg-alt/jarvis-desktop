@@ -24,6 +24,7 @@ _backup/
 
 # ===== 本地密钥与运行时配置 =====
 config.json
+remote_password*
 .env
 *.pem
 *.key
