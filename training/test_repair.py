@@ -2,7 +2,7 @@
 """失败修复桩测: 假模型给出修正步, 验证修复路径/最多一次/危险修正步不直接执行。"""
 import sys
 import json
-sys.path.insert(0, "/data/workspace/jarvis-desktop")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 import jarvis
 import llm_brain
@@ -38,7 +38,6 @@ jarvis._agent_persist = lambda task: None
 jarvis._agent_notify = lambda text, spoken=False: notes.append(text)
 jarvis._agent_generation_changed = lambda gen: False
 jarvis.ui_bridge = None
-jarvis._AGENT_RUN.update({"stop": False, "skip": False})
 llm_brain._provider_chat = fake_chat
 
 GOOD_REPLY = ('{"action": "open_app", "args": {"exe": "notepad.exe", "name": "记事本"}, '
@@ -57,7 +56,6 @@ def run_task(answer):
                        "say": "这就打开记事本", "status": "pending",
                        "scope": jarvis.AGENT_SCOPE_FREE}]}
     gen["n"] += 1
-    jarvis._AGENT_RUN.update({"task": task, "gen": gen["n"]})
     jarvis._agent_loop(task, gen["n"])
     return task
 
@@ -87,7 +85,6 @@ if task.get("state") != "waiting_user" or step.get("status") != "waiting" \
 step["status"] = "pending"
 step["scope"] = jarvis.AGENT_SCOPE_NOTIFY
 gen["n"] += 1
-jarvis._AGENT_RUN.update({"task": task, "gen": gen["n"]})
 jarvis._agent_loop(task, gen["n"])
 if len(chat_calls) != 1:
     fails.append(f"续跑后又调了修复模型, 实际 {len(chat_calls)}")
@@ -283,7 +280,6 @@ try:
             "steps": [{"action": "open_app", "args": {"exe": "bad.exe", "name": "记事本"},
                        "say": "打开", "status": "pending", "scope": jarvis.AGENT_SCOPE_FREE}]}
     gen["n"] += 1
-    jarvis._AGENT_RUN.update({"task": task, "gen": gen["n"]})
     jarvis._agent_loop(task, gen["n"])
     if "tasks" not in snapshot or not snapshot["tasks"][0]["steps"][0].get("repair_attempted"):
         fails.append("修复调用前 repair_attempted 没有立即落盘")

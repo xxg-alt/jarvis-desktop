@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """自由对话通道分流测试: 指令必须留在命令通道, 聊天必须进对话通道。"""
 import sys
-sys.path.insert(0, "/data/workspace/jarvis-desktop")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 import jarvis
 import llm_brain

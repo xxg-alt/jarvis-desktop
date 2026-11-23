@@ -21,6 +21,7 @@ import webbrowser
 from pathlib import Path
 
 import audio_device
+import agent_core    # 平台无关的任务状态机 (云主机评测复用同一套逻辑)
 
 BASE = Path(__file__).resolve().parent
 DRY_RUN = False
@@ -74,6 +75,8 @@ def load_config():
         # auto = 优先本地 whisper(中英文都准) -> 系统引擎 -> Vosk
         "stt_engine": "auto",
         "whisper_model": "small",
+        # 截图落盘目录; 空 = 用默认 图片\贾维斯截图 (可由"以后截图放到工作区"这类指令改)
+        "screenshot_dir": "",
         "gemini_model": "gemini-flash-latest",
         "apps": {
             "记事本": "notepad.exe", "计算器": "calc.exe", "画图": "mspaint.exe",
@@ -118,6 +121,31 @@ def load_config():
 
 load_env()
 CONFIG = load_config()
+
+
+def save_user_config(updates: dict) -> bool:
+    """把用户设置写回 %APPDATA%\\Jarvis\\config.json (只合并给出的键, 不覆盖整份)。
+
+    为什么要单独一个函数: 以前没有任何"运行时改设置"的入口, 模型遇到
+    "以后截图放到哪" 这种请求只能编一个 write_file 文档来搪塞。
+    """
+    try:
+        existing = {}
+        if USER_CFG_FILE.exists():
+            raw = USER_CFG_FILE.read_text(encoding="utf-8")
+            existing = json.loads(raw) if raw.strip() else {}
+            if not isinstance(existing, dict):
+                existing = {}
+        existing.update({k: v for k, v in (updates or {}).items()})
+        USER_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USER_CFG_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception as exc:
+        print(f"[保存设置失败] {exc}")
+        return False
+
+
 if ui_bridge is not None:
     try:
         ui_bridge.update_flags(
@@ -922,12 +950,14 @@ AGENT_STATES = ("draft", "approved", "running", "waiting_user", "done", "failed"
 
 # 三级权限: 越界才问, 圈内直接干。agent 连续执行时每一步套这个格子,
 # 计划审批已经放行的圈内操作不再逐条弹确认 —— 否则 agent 名存实亡。
-AGENT_SCOPE_FREE = "free"        # 只读/开东西: list, read, open_*, search, chat, ask_doc, inspect
-AGENT_SCOPE_NOTIFY = "notify"   # 落盘/系统层: write_file, move, volume, screenshot, run_powershell(只读)
-AGENT_SCOPE_ASK = "ask"          # 危险: shutdown, restart, close_app, run_powershell(非只读)
+# 值定义在 agent_core.py (平台无关), 这里只做别名, 避免两处各写一套漂移。
+AGENT_SCOPE_FREE = agent_core.SCOPE_FREE        # 只读/开东西: list, read, open_*, search, chat, ask_doc, inspect
+AGENT_SCOPE_NOTIFY = agent_core.SCOPE_NOTIFY    # 落盘/系统层: write_file, move, volume, screenshot, run_powershell(只读)
+AGENT_SCOPE_ASK = agent_core.SCOPE_ASK          # 危险: shutdown, restart, close_app, run_powershell(非只读)
 
 _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
                        "web_search", "search_file", "ask_doc", "screenshot", "lock",
+                       "set_screenshot_dir",
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
 _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
@@ -1304,20 +1334,7 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
     return {"task": task, "say": text}
 
 
-# ---------- Agent 后台执行器 ----------
-# 设计要点:
-#   1. 任务跑在独立线程里, 不占 _RUN_LOCK —— 否则跑几分钟的 agent 会把语音循环锁死;
-#   2. 播报不 worker 里直接喊, 只往 _AGENT_EVENTS 塞, 由主循环统一出口 (避免和普通指令抢话筒);
-#   3. 步骤之间检查 stop/skip 标志: 正在跑的这一步无法打断 (比如一次 25 秒的接口调用),
-#      但一步结束立刻停 —— 这是"插话停得住"的现实边界。
-_AGENT_LOCK = threading.Lock()
-_AGENT_RUN = {"thread": None, "task": None, "stop": False, "skip": False, "gen": 0}
 _AGENT_EVENTS = queue.Queue()
-
-
-def _agent_busy() -> bool:
-    t = _AGENT_RUN.get("thread")
-    return bool(t and t.is_alive())
 
 
 def _agent_notify(text: str, spoken: bool = False):
@@ -1348,48 +1365,110 @@ def _agent_persist(task: dict):
     _agent_save_tasks({**data, "tasks": tasks})
 
 
+# 执行状态机本体在 agent_core.py (只依赖标准库): 云主机上可以用假执行器跑批量评测,
+# 这里只提供"动手"和"落盘/播报"的具体实现。
+def _agent_perform(step):
+    """真执行一步: 返回 (成败, 话术, 可传递的结构化文本)。"""
+    _TL.action_ok = True
+    # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
+    _TL.agent_context = True
+    _TL.agent_external_ok = bool(step.get("external_ok"))
+    try:
+        text = _perform_plan({"action": step.get("action"),
+                              "args": step.get("args", {}),
+                              "say": step.get("say", "")})
+        return bool(getattr(_TL, "action_ok", True)), text, getattr(_TL, "last_tool_text", "")
+    finally:
+        _TL.agent_context = False
+        _TL.agent_external_ok = False
+
+
+def _agent_pre_write(task, step, results_text):
+    """写文件步执行前, 用前面步骤的真实结果把 content 成稿。"""
+    composed = _agent_compose_write(task.get("goal", ""), step, results_text)
+    if composed and composed != (step.get("args", {}) or {}).get("content"):
+        step.setdefault("args", {})["content"] = composed
+
+
+def _agent_repair_wrapper(task, step, error_text):
+    """状态机的失败修复钩子: 转调 _agent_repair_step (晚绑定, 测试可整体替换)。"""
+    return _agent_repair_step(task, step, error_text)
+
+
+# ---------- 语音识别置信度闸门 ----------
+# 识别结果不确定时宁可问一遍, 不许拿鬼话去动电脑:
+#   13:00 那句 "好的、好、好、好…" 就是低置信度的重复幻觉, 却真去读了文件。
+_ASR_MIN_LOGPROB = float(os.environ.get("JARVIS_ASR_MIN_LOGPROB", "-0.9") or -0.9)
+_ASR_HINT_GAP = 6.0
+_last_asr_hint = 0.0
+
+
+def _asr_uncertain(meta) -> bool:
+    """这句识别的置信度低到不该执行吗 (meta 缺失时按"可执行"处理, 保持旧行为)。"""
+    try:
+        lp = float((meta or {}).get("logprob", 0.0))
+    except Exception:
+        return False
+    return lp < _ASR_MIN_LOGPROB
+
+
+def _asr_uncertain_hint(text: str):
+    """低置信度识别: 只上字幕, 冷却期内提醒一次, 不执行任何动作。"""
+    global _last_asr_hint
+    print(f"[语音] 低置信度不执行: {text}")
+    if ui_bridge is not None:
+        try:
+            ui_bridge.emit_subtitle(f"没听清：{text}", False)
+        except Exception:
+            pass
+    now = time.time()
+    if now - _last_asr_hint >= _ASR_HINT_GAP:
+        _last_asr_hint = now
+        speak("没听清，再说一遍吧")
+
+
+def _agent_ui_state(state):
+    if ui_bridge is not None:
+        try:
+            ui_bridge.emit_state(state)
+        except Exception:
+            pass
+
+
+_RUNNER = agent_core.TaskRunner(
+    perform=_agent_perform,
+    persist=_agent_persist,
+    notify=_agent_notify,
+    on_state=_agent_ui_state,
+    pre_write=_agent_pre_write,
+    repair=_agent_repair_wrapper,
+)
+
+
+def _agent_busy() -> bool:
+    return _RUNNER.busy()
+
+
 def _agent_start(task: dict) -> dict:
     """把任务丢进后台执行器, 立即返回一句"开始执行"——调用方线程不阻塞。"""
-    with _AGENT_LOCK:
-        if _agent_busy():
-            return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
-        _AGENT_RUN["gen"] += 1
-        gen = _AGENT_RUN["gen"]
-        _AGENT_RUN["stop"] = False
-        _AGENT_RUN["skip"] = False
-        _AGENT_RUN["task"] = task
-        thread = threading.Thread(target=_agent_loop, args=(task, gen),
-                                  name="jarvis-agent", daemon=True)
-        _AGENT_RUN["thread"] = thread
-        thread.start()
+    started, _gen = _RUNNER.start(task)
+    if not started:
+        return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
     total = len(task.get("steps", []))
     return {"say": f"开始执行任务「{task.get('goal', '')}」, 共 {total} 步。要中止就说「停」"}
 
 
 def _agent_stop() -> bool:
     """请求停止。返回是否真的打断了一个在跑的任务。"""
-    with _AGENT_LOCK:
-        if not _agent_busy():
-            return False
-        _AGENT_RUN["stop"] = True
-        _AGENT_RUN["gen"] += 1
-        task = _AGENT_RUN.get("task") or {}
-        if task:
-            task["state"] = "cancelled"
-            _agent_persist(task)
-    return True
+    return _RUNNER.stop()
 
 
 def _agent_skip() -> bool:
-    with _AGENT_LOCK:
-        if not _agent_busy():
-            return False
-        _AGENT_RUN["skip"] = True
-    return True
+    return _RUNNER.skip()
 
 
 def _agent_generation_changed(gen: int) -> bool:
-    return _AGENT_RUN.get("gen") != gen
+    return _RUNNER._gen != gen
 
 
 def _tool_items_text(items):
@@ -1572,7 +1651,11 @@ def _agent_compose_write(goal, step, results_text):
 
 
 def _agent_execute_step(step, note=""):
-    """执行一步并回读结果, 返回 (是否成功, 结构化数据文本); 成败写回 step。"""
+    """执行一步并回读结果, 返回 (是否成功, 结构化数据文本); 成败写回 step。
+
+    兼容层: 生产路径已由 agent_core.TaskRunner + _agent_perform 接管,
+    这里保留给旧测试/旧调用点; 语义与 _agent_perform + 状态机写回一致。
+    """
     if note:
         _agent_notify(note)
     _TL.action_ok = True
@@ -1597,7 +1680,7 @@ def _agent_execute_step(step, note=""):
 def _agent_repair_step(task, step, error_text):
     """失败后请模型重出一步: 先过 sanitize/作用域校验, 返回 (修正步, 未采用原因)。
 
-    危险修正步不在这里执行, 只把 danger 标出来, 交给调用方走现有护栏。
+    危险修正步不在这里执行, 只把 danger 标出来, 交给状态机走确认护栏。
     """
     from llm_brain import repair_step, sanitize_plan
     fixed = repair_step(task.get("goal", ""), step, error_text, CONFIG)
@@ -1616,130 +1699,22 @@ def _agent_repair_step(task, step, error_text):
 
 
 def _agent_loop(task: dict, gen: int):
-    """后台执行循环。每步之间检查 stop/skip, 遇 ask 步骤立刻挂起等确认。"""
-    steps = task.get("steps", [])
-    total = len(steps)
-    task["state"] = "running"
-    _agent_persist(task)
-    if ui_bridge is not None:
-        try: ui_bridge.emit_state("ACTING")
-        except Exception: pass
+    """兼容层: 同步驱动一次任务执行——与后台线程共用同一份 agent_core 状态机。
 
-    results_log, repaired_nums = [], []
-    try:
-        for i, step in enumerate(steps):
-            if _agent_generation_changed(gen) or _AGENT_RUN.get("stop"):
-                task["state"] = "cancelled"
-                _agent_persist(task)
-                _agent_notify("任务已停止, Sir", spoken=True)
-                return
-            if step.get("status") != "pending":
-                continue
-
-            if step.get("scope") == AGENT_SCOPE_ASK:
-                task["state"] = "waiting_user"
-                step["status"] = "waiting"
-                _agent_persist(task)
-                _agent_notify(
-                    f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步要动系统: "
-                    f"{step.get('say') or step.get('action')}。说「继续任务」放行, 说「停」中止",
-                    spoken=True,
-                )
-                return
-
-            if step.get("action") == "chat":
-                step["status"] = "done"
-                _agent_persist(task)
-                continue
-
-            if step.get("action") == "write_file" and results_log:
-                # 传结果: 写文件步先按前面步骤的真实结果成稿, 再执行
-                composed = _agent_compose_write(task.get("goal", ""), step,
-                                                "\n".join(results_log))
-                if composed and composed != (step.get("args", {}) or {}).get("content"):
-                    step.setdefault("args", {})["content"] = composed
-
-            ok, extra = _agent_execute_step(
-                step, f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
-
-            # 失败修复: 每步只给模型一次机会, 危险修正步必须走原来的确认护栏
-            if not ok and not step.get("repair_attempted"):
-                step["repair_attempted"] = True
-                _agent_persist(task)
-                error_text = str(step.get("result") or "")
-                if extra:
-                    error_text += f" | 数据: {extra}"
-                fixed, reason = _agent_repair_step(task, step, error_text)
-                if fixed and fixed.get("danger"):
-                    step.update({"action": fixed["action"], "args": fixed["args"],
-                                 "say": fixed["say"], "scope": AGENT_SCOPE_ASK,
-                                 "status": "waiting",
-                                 "result": (step.get("result") or "") + "；修正方案待确认"})
-                    task["state"] = "waiting_user"
-                    _agent_persist(task)
-                    _agent_notify(
-                        f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步失败, "
-                        f"修正方案要动系统: {fixed['say'] or fixed['action']}。"
-                        "说「继续任务」放行, 说「停」中止",
-                        spoken=True,
-                    )
-                    return
-                if fixed:
-                    step.update({"action": fixed["action"], "args": fixed["args"],
-                                 "say": fixed["say"], "scope": fixed["scope"],
-                                 "status": "pending"})
-                    step["repaired"] = True
-                    ok, extra = _agent_execute_step(
-                        step, f"第 {i + 1}/{total} 步修正后重试 · {step.get('say') or step.get('action')}")
-                    if not ok:
-                        step["result"] = f"修复后仍失败: {step.get('result') or ''}; 原错误: {error_text}"
-                else:
-                    step["result"] = f"{step.get('result') or ''}；修复未采用: {reason}"
-
-            if step.get("status") == "done":
-                label = f"第{i + 1}步" + ("经修复完成" if step.get("repaired") else "")
-                entry = f"{label}({step.get('say') or step.get('action')}): {step.get('result', '')}"
-                if extra:
-                    entry += f" | 数据: {extra}"
-                results_log.append(entry)
-                if step.get("repaired"):
-                    repaired_nums.append(i + 1)
-            _agent_persist(task)
-
-            if _AGENT_RUN.get("skip"):
-                with _AGENT_LOCK:
-                    _AGENT_RUN["skip"] = False
-                for rest in steps[i + 1:]:
-                    if rest.get("status") == "pending":
-                        rest["status"] = "skipped"
-                task["state"] = "done"
-                _agent_persist(task)
-                _agent_notify("已跳过剩余步骤, 任务收尾", spoken=True)
-                return
-
-        failed = [i for i, s in enumerate(steps) if s.get("status") == "failed"]
-        done_n = sum(1 for s in steps if s.get("status") == "done")
-        task["state"] = "failed" if failed and done_n == 0 else "done"
-        _agent_persist(task)
-        fix_note = ("；" + "；".join(f"第{n}步经修复完成" for n in repaired_nums)) if repaired_nums else ""
-        if failed:
-            _agent_notify(f"任务「{task.get('goal', '')}」结束, 第 "
-                          f"{'、'.join(str(i + 1) for i in failed)} 步没有成功{fix_note}", spoken=True)
-        else:
-            _agent_notify(f"任务「{task.get('goal', '')}」已完成, 共 {done_n} 步{fix_note}", spoken=True)
-    except Exception as exc:
-        print(f"[Agent 执行异常] {exc}")
-        task["state"] = "failed"
-        _agent_persist(task)
-        _agent_notify(f"任务执行出错了: {exc}", spoken=True)
-    finally:
-        if _AGENT_RUN.get("task") is task:
-            _AGENT_RUN["task"] = None
-        if ui_bridge is not None:
-            try: ui_bridge.emit_state("IDLE")
-            except Exception: pass
-
-
+    旧测试直接同步调它, 并整体替换模块级回调 (_perform_plan/_agent_persist/
+    _agent_notify/_agent_repair_step); 生产路径走 _RUNNER.start() 的后台线程。
+    每次调用现场组装 runner, 保证吃到的就是最新替换过的回调。
+    """
+    runner = agent_core.TaskRunner(
+        perform=_agent_perform,
+        persist=_agent_persist,
+        notify=_agent_notify,
+        on_state=_agent_ui_state,
+        pre_write=_agent_pre_write,
+        repair=_agent_repair_wrapper,
+    )
+    runner._gen = gen   # 代号对齐, 不会被误判成"已被新任务取代"
+    runner._run(task, gen)
 def agent_approve(index: int = -1) -> dict:
     """把最新的 draft 任务交给后台执行器, 立即返回, 不阻塞指令线程。"""
     data = _agent_load_tasks()
@@ -1788,8 +1763,12 @@ def agent_cancel() -> dict:
     return {"say": "任务已全部作废, Sir" if changed else "没有进行中的任务"}
 
 
-def parse_command(text):
-    """返回 plan dict 或 None (None = 规则不认识, 交给 Gemini)"""
+def _parse_rules(text):
+    """关键词规则层: 返回 plan dict 或 None。
+
+    注意: 这里只回答"句子里有没有这个词", 回答不了"这是在命令我、还是在问我、
+    还是在告诉我别做"。所以它不做最终判决, 由下面的 parse_command 过仲裁闸。
+    """
     t = text.strip().lower().replace(" ", "")
     raw = text.strip()
 
@@ -1809,8 +1788,35 @@ def parse_command(text):
     if "锁屏" in t or "锁定屏幕" in t:
         return {"action": "lock", "say": "已锁屏"}
 
-    # 截图
-    if "截图" in t or "截屏" in t:
+    # 截图保存目录: 省略宾语的续问 "能不能放到你的工作区内"(上一句就在问截图)
+    #   只认 授权别名/盘符路径, 且句子里没有"文档/文件/报告"这类宾语, 免得把
+    #   "把报告存到桌面" 抢成"改截图目录"。
+    if (any(w in t for w in ("能不能", "可不可以", "可以吗", "以后", "默认", "帮我"))
+            and any(w in t for w in ("放到", "存到", "保存到", "改到", "移到"))
+            and not any(w in t for w in ("文档", "文件", "周报", "报告", "清单", "总结",
+                                         "写", "生成", "表格", "图片", "照片"))):
+        m_b = re.search(r"(?:放到|存到|保存到|改到|移到)(.+)", raw)
+        cand = m_b.group(1).strip() if m_b else ""
+        cand = re.sub(r"^(?:你的|我的|我们的|咱的)", "", cand).strip()
+        cand = re.sub(r"(?:里面|里|内|中|文件夹|目录|吧|好吗|可以吗)+$", "", cand).strip()
+        aliases = [a for _n, aa in _WRITE_ROOT_ALIASES for a in aa]
+        if cand and (cand in aliases or re.match(r"^[A-Za-z]:\\", cand)):
+            return {"action": "set_screenshot_dir", "args": {"dir": cand},
+                    "say": "好，我把截图目录改到那儿"}
+
+    # 截图保存目录 (必须排在"截图"之前, 否则会被当成"再截一张")
+    #   "以后截图都放到工作区" / "把截图存到 D:\shots" / "能不能把截图放到另一个文件夹"
+    if ("截图" in t or "截屏" in t) and any(w in t for w in (
+            "放到", "放回", "存到", "保存到", "改到", "移到", "存进")):
+        m_t = re.search(r"(?:放到|放回|存到|保存到|改到|移到|存进)(.+)", raw)
+        target = m_t.group(1).strip() if m_t else ""
+        target = re.sub(r"^(?:你的|我的|我们的|咱的)", "", target).strip()
+        target = re.sub(r"(?:里面|里|文件夹|目录|吧|好吗|可以吗|行吗|了|去吧)+$", "", target).strip()
+        return {"action": "set_screenshot_dir", "args": {"dir": target},
+                "say": "好，我把截图目录改到那儿"}
+
+    # 截图 (含口语"截个图")
+    if "截图" in t or "截屏" in t or "截个图" in t:
         return {"action": "screenshot", "say": "已截图, 保存在图片文件夹的贾维斯截图里"}
 
     # 静音/音量
@@ -1946,6 +1952,235 @@ _CHAT_SIGNAL_RE = re.compile(
     r"怎么办|划不划算|值不值|建议|什么意思|什么梗|为什么|是什么|是怎么|"
     r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少"
 )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 规则仲裁层: 关键词命中 ≠ 可以动手
+# ═══════════════════════════════════════════════════════════════
+# 关键词规则只判断"句子里有没有这个词"。它看不见两种最要命的情形:
+#   ① 否定: "别截图了" —— 现在 if "截图" in t 会反着执行, 这是真会误伤电脑的
+#   ② 问句: "你截图的文件放到哪个文件夹里?" —— 会又截一张图, 而不是回答问题
+# 判定一律保守: "拿不准"就放过规则(保留原有的零延迟), 只有明确命中才拦。
+# 拦下来以后, 问句交给大模型答, 否定句只回一句"好, 不做", 不产生任何副作用。
+
+_NEG_RE = re.compile(
+    r"(?:不要|不用|不必|不许|不准|不需要|无需|别再|先别|暂别|甭|不想|别|不)"
+    r"(?:给我|帮我|再|把|去|要|用|用再)?$"
+)
+
+# 有副作用的动作: 这类才需要仲裁; 纯说话(chat)不拦
+_STATE_ACTIONS = {
+    "screenshot", "shutdown", "restart", "lock", "volume", "brightness",
+    "open_app", "open_file", "open_url", "close_app", "file_manage",
+    "file_delete", "write_file", "run_powershell", "web_search", "play_music",
+    "search_file", "set_screenshot_dir",
+}
+
+# 礼貌请求式命令: "能不能把截图放到工作区" 是请求, 不是提问, 照命令执行
+_REQUEST_ACTIONS = {"set_screenshot_dir"}
+
+# 动作 → 触发它的关键词, 用于回溯"这句话是不是在否定这个动作"
+_ACTION_WORDS = {
+    "screenshot": ("截图", "截屏", "截个图"),
+    "shutdown": ("关机",),
+    "restart": ("重启", "重新启动"),
+    "lock": ("锁屏", "锁定屏幕"),
+    "volume": ("静音", "音量"),
+    "brightness": ("亮度",),
+    "open_app": ("打开", "启动", "运行"),
+    "open_file": ("打开", "看一看", "看一下"),
+    "open_url": ("打开", "访问"),
+    "close_app": ("关闭", "关掉", "结束"),
+    "file_manage": ("移动", "复制", "删除", "删掉", "新建", "创建", "改名", "重命名"),
+    "file_delete": ("删除", "删掉"),
+    "write_file": ("写", "保存", "存成", "存到"),
+    "run_powershell": ("执行", "运行命令"),
+    "web_search": ("搜索", "百度", "搜一下"),
+    "play_music": ("播放", "放一首"),
+    "search_file": ("找", "搜索", "查", "文件"),
+    "set_screenshot_dir": ("截图", "截屏"),
+}
+
+_NEG_ACK = {
+    "screenshot": "好，不截图",
+    "shutdown": "好，不关机",
+    "restart": "好，不重启",
+    "lock": "好，不锁屏",
+    "volume": "好，不动音量",
+    "brightness": "好，不动亮度",
+    "close_app": "好，不关",
+    "open_app": "好，不打开",
+    "open_file": "好，不打开",
+    "open_url": "好，不打开",
+    "file_manage": "好，不动文件",
+    "file_delete": "好，不删",
+    "write_file": "好，不写",
+    "run_powershell": "好，不执行",
+    "web_search": "好，不搜",
+    "play_music": "好，不放",
+    "search_file": "好，不找了",
+    "set_screenshot_dir": "好，不改截图目录",
+}
+
+# 强问句标志: 命中即判定在问事, 哪怕句子以动词开头("查一下截图在哪")
+_Q_STRONG = ("在哪", "在哪儿", "哪个文件夹", "什么文件夹", "叫什么", "是多少",
+             "多少钱", "几点了", "几号", "几点", "在哪个")
+# 一般疑问词
+_Q_WORDS = ("哪", "什么", "为什么", "为啥", "怎么", "怎样", "如何", "是不是",
+            "有没有", "能不能", "可不可以", "会不会", "要不要", "是否",
+            "多少", "多久", "几号", "什么时候", "谁", "干什么", "干嘛", "呢")
+# 以这些动词开头 = 明确的命令, 不再按问句处理（"搜索明天天气怎么样"是在让我搜）
+_CMD_STARTS = ("搜索", "搜一下", "搜搜", "查一下", "查查", "查询", "百度", "谷歌",
+               "打开", "启动", "运行", "播放", "放一首", "调", "设置", "清理",
+               "删除", "删掉", "移动", "复制", "新建", "创建", "保存", "写", "念",
+               "朗读", "截图", "截屏", "关机", "重启", "静音", "锁屏",
+               "帮我搜", "帮我查", "帮我把")
+
+
+def _is_negated(low: str, tokens) -> bool:
+    """关键词前面紧邻着否定词吗。窗口式匹配, 只认紧贴词尾的否定。"""
+    if not tokens:
+        return False
+    for tok in tokens:
+        i = low.find(tok)
+        while i != -1:
+            pre = low[max(0, i - 8):i]
+            if _NEG_RE.search(pre):
+                return True
+            i = low.find(tok, i + 1)
+    return False
+
+
+def _is_question(text: str) -> bool:
+    """这句话是在问事, 还是在命令我。"""
+    low = str(text or "").strip().lower().replace(" ", "")
+    if not low:
+        return False
+    if any(w in low for w in _Q_STRONG):
+        return True
+    if low.endswith(("?", "？", "吗", "呢")):
+        return True
+    if any(low.startswith(v) for v in _CMD_STARTS):
+        return False
+    return any(w in low for w in _Q_WORDS)
+
+
+def screenshot_dir() -> Path:
+    """截图实际落盘的目录: 用户设过的优先, 否则 图片\\贾维斯截图。"""
+    raw = str(CONFIG.get("screenshot_dir") or "").strip()
+    if raw:
+        try:
+            p = Path(raw).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception as exc:
+            print(f"[截图目录不可用, 沿用默认] {exc}")
+    p = Path.home() / "Pictures" / "贾维斯截图"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _screenshot_dir_text() -> str:
+    """给用户报路径用 (Windows 的"图片"可能被 OneDrive 接管)。"""
+    return str(screenshot_dir())
+
+
+def _resolve_screenshot_target(raw: str):
+    """把"以后截图放到 X"里的 X 解析成可写目录。返回 (path|None, 追问话术)。
+
+    只接受三类: 授权别名(工作区/桌面/文档/下载) + 子目录、盘符绝对路径、
+    或者模糊说法 —— 模糊的一律反问, 绝不猜一个目录出来乱建。
+    """
+    raw = str(raw or "").strip().strip("，,。.；;、")
+    raw = re.sub(r"^(?:把|将|以后的|以后|新的|所有)", "", raw).strip()
+    if not raw:
+        return None, "以后截图要存到哪个目录？说个名字：工作区、桌面、文档、下载，或者给我完整路径"
+    if any(w in raw for w in ("什么文件夹", "哪个", "另一个", "别的", "其他", "某")):
+        return None, "要放到哪个具体目录？工作区、桌面、文档、下载，或给我一个完整路径"
+    if re.match(r"^[A-Za-z]:\\", raw) or raw.startswith("\\\\"):
+        target = Path(raw)
+        if any(part == ".." for part in target.parts):
+            return None, "这个路径里有 .. ，我不能用"
+    else:
+        hit, rest = None, raw
+        for name, aliases in _WRITE_ROOT_ALIASES:
+            for alias in aliases:
+                if raw == alias:
+                    hit, rest = name, ""
+                    break
+                if raw.startswith(alias + "\\") or raw.startswith(alias):
+                    tail = raw[len(alias):]
+                    if tail[:1] in ("", "\\"):
+                        hit, rest = name, tail.strip("\\")
+                        break
+            if hit:
+                break
+        if not hit:
+            return None, f"「{raw}」我听不出是哪个目录，只能说工作区、桌面、文档、下载，或给我完整路径"
+        root = _write_root_map().get(hit)
+        if root is None:
+            return None, "这个目录暂时定位不到，换个说法试试"
+        target = (root / rest) if rest else root
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / ".jarvis_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception as exc:
+        return None, f"「{target}」写不进去（{exc}），换个目录吧"
+    return target, ""
+
+
+# 已知事实: 这类问句不用绕模型, 直接照实答
+_FACT_ANSWERS = {
+    "screenshot": lambda: f"截图都存在 {_screenshot_dir_text()} 里，Sir",
+}
+
+
+def parse_command(text):
+    """规则分流入口: 先跑关键词规则, 再对命中结果做否定/问句仲裁。"""
+    plan = _parse_rules(text)
+    if not plan:
+        return None
+    action = str(plan.get("action") or "")
+    if action not in _STATE_ACTIONS:
+        return plan                     # 纯说话, 没有副作用, 直接放行
+    low = str(text or "").strip().lower().replace(" ", "")
+
+    # ① 否定优先: "别关机" / "不要截图" 只回话, 绝不动手
+    if _is_negated(low, _ACTION_WORDS.get(action, ())):
+        ack = _NEG_ACK.get(action, "好，不动手")
+        name = str((plan.get("args") or {}).get("name") or "").strip()
+        if action.startswith("open_") and name:
+            ack = f"好，不打开{name}"
+        print(f"[仲裁] 否定句 → 不执行 {action}", flush=True)
+        return {"action": "chat", "say": ack}
+
+    # ② 问句: 不是在命令我, 而是在问事 → 有事实就直接答, 否则让位给模型
+    # 例外: "截图放到哪" 有歧义 —— 问现状("放到哪个文件夹"?) 还是请求修改?
+    #       "能不能/帮我/以后/默认" 这类词在, 就是请求, 照命令走;
+    #       否则当成问现状, 直接答当前目录, 别把目录改成一个叫"哪个"的文件夹。
+    if action == "set_screenshot_dir":
+        d = str((plan.get("args") or {}).get("dir") or "")
+        requestish = any(w in low for w in
+                         ("能不能", "可不可以", "可以吗", "帮我", "给我", "我想",
+                          "我要", "改", "以后", "默认", "设", "换"))
+        if _is_question(text) and not requestish:
+            return {"action": "chat",
+                    "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
+        if any(w in d for w in ("哪", "什么", "另一个", "别的", "其他", "某")) and not requestish:
+            return {"action": "chat",
+                    "say": f"截图都存在 {_screenshot_dir_text()} 里，Sir"}
+
+    if _is_question(text) and action not in _REQUEST_ACTIONS:
+        fact = _FACT_ANSWERS.get(action)
+        if fact:
+            print(f"[仲裁] 问句 → 事实答复 {action}", flush=True)
+            return {"action": "chat", "say": fact()}
+        print(f"[仲裁] 问句 → 让位给模型 {action}", flush=True)
+        return None
+
+    return plan
 
 
 def _looks_conversational(command: str) -> bool:
@@ -2323,10 +2558,23 @@ def _perform_plan(plan):
                         say = f"没找到{query}, 你是不是想打开「{'」或「'.join(guess)}」?"
                     else:
                         say = f"在桌面、文档和下载里没找到{query}"
+        elif action == "set_screenshot_dir":
+            target, why = _resolve_screenshot_target(args.get("dir") or "")
+            if target is None:
+                say = why          # 解析不了就反问, 绝不猜目录乱建
+                _TL.action_ok = True
+            else:
+                CONFIG["screenshot_dir"] = str(target)
+                saved = save_user_config({"screenshot_dir": str(target)})
+                if saved:
+                    say = f"好，以后截图都存到 {target}，Sir（以前的旧截图没动）"
+                else:
+                    say = f"目录我改到 {target} 了，但这次没写进配置文件，重启后会恢复原样"
+                _TL.action_ok = True
+                print(f"[截图目录] 已改为 {target}", flush=True)
         elif action == "screenshot":
             import pyautogui
-            folder = Path.home() / "Pictures" / "贾维斯截图"
-            folder.mkdir(parents=True, exist_ok=True)
+            folder = screenshot_dir()
             fp = folder / f"截图_{datetime.datetime.now():%Y%m%d_%H%M%S}.png"
             vision_on = bool(CONFIG.get("vision_enabled", True))
             if ui_bridge is not None and vision_on:
@@ -3111,6 +3359,8 @@ def _wake_loop_whisper(hotkey_event):
                 # ("Hello"/"Uh-uh" 这类碎片), 英文单词仍会被中文模型尽量音译识别。
                 language=str(CONFIG.get("whisper_language", "zh")),
                 on_error=_on_mic_error,
+                # 要置信度: 低置信度的识别只提示"没听清", 不拿去执行
+                send_meta=True,
             )
         except Exception as e:
             failure["error"] = e
@@ -3159,10 +3409,19 @@ def _wake_loop_whisper(hotkey_event):
             follow_until = time.time() + 12
             continue
         try:
-            text = pending.get(timeout=0.2).replace(" ", "")
+            item = pending.get(timeout=0.2)
         except _queue.Empty:
             continue
+        if isinstance(item, tuple):
+            text, meta = str(item[0] or "").replace(" ", ""), (item[1] or {})
+        else:
+            text, meta = str(item or "").replace(" ", ""), {}
         if not text:
+            continue
+        # 识别不确定、又没喊唤醒词: 只提示"没听清", 不打断播报、不执行任何动作
+        if not _wake_hit(text) and _asr_uncertain(meta):
+            _asr_uncertain_hint(text)
+            _ui_listening()
             continue
         # 用户打断（Barge-in）：如果贾维斯此时正在说话，用户开口说了有效指令，立刻掐断旧播报
         if is_speaking():
@@ -3344,3 +3603,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -558,6 +558,13 @@ def run_child(port):
         background_color=BG_COLOR,
         js_api=_Api(child),
     )
+    # 悬浮胶囊不该占任务栏: 否则任务栏会多出一个 .py 通用图标的按钮
+    try:
+        import win_taskbar
+        win_taskbar.set_app_id()
+        win_taskbar.setup_window_async("Jarvis Capsule", hide=True)
+    except Exception:
+        pass
     webview.start(child.boot, debug=False)
 
 
