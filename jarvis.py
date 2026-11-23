@@ -22,6 +22,7 @@ from pathlib import Path
 
 import audio_device
 import agent_core    # 平台无关的任务状态机 (云主机评测复用同一套逻辑)
+import jarvis_memory
 import memory_store
 from asr_corrections import correct_asr_text
 
@@ -37,6 +38,8 @@ ON_EXIT = None
 
 
 def _notify_speak(text):
+    # GUI 字幕/远端文字流是最后一个可见出口: 哪怕上游忘了洗, 这里也必须收口。
+    text = sanitize_speak_text(text)
     if ON_SPEAK is not None:
         try:
             ON_SPEAK(text)
@@ -222,7 +225,8 @@ MEMORY = JarvisMemory()
 # Agent 任务拆解提示词: 只管"把目标拆成步骤", 不执行。
 # 步骤格式沿用现有动作白名单, 由 sanitize_plan 出口统一校验。
 AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
-只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, remember, forget_memory。
+只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, click_screen, remember, forget_memory。
+click_screen 只用于用户明确要求点击屏幕上某个按钮: args={"target":"按钮描述"}；它不是 open_app 的替代品，「点击进入微信」要点已打开界面上的按钮，不能用 open_app 重开软件。每条指令最多一步 click_screen，点完系统会核验播报，不许连续点。
 写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文", "folder": "目标目录，可省略"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
 folder 只能填四类：工作区、桌面、文档、下载，可带子目录（如 "下载\\报告"）。用户没说存哪就省略 folder，默认写进工作区。用户要求存到别处（如 D 盘某个目录）时，folder 填那个完整路径原样，别改写。
 各动作的参数必须齐全，缺参数的一律不要写进计划：
@@ -623,6 +627,10 @@ def sanitize_speak_text(text):
     if str(title).strip().lower() != "sir" and title:
         value = _SIR_VOCATIVE_RE.sub(lambda _m: str(title), value)
     return value
+
+
+# 落盘前也要走同一把清洗器: 用户可见的话术只有这一套称呼/泄漏规则。
+jarvis_memory.set_speak_sanitizer(sanitize_speak_text)
 
 
 def speak(text):
@@ -1053,7 +1061,7 @@ _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
 _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
-                         "type_text", "press_key", "click"}
+                         "type_text", "press_key", "click", "click_screen"}
 
 
 def agent_scope_of(action: str, args=None) -> str:
@@ -1863,7 +1871,23 @@ def agent_cancel() -> dict:
     return {"say": "任务已全部作废, Sir" if changed else "没有进行中的任务"}
 
 
-def _parse_rules(text):
+def _peek_question_from_text(text, followup=False):
+    """这句话是不是明确指向屏幕; 是则返回给视觉模型的问题, 否则 None。"""
+    raw = str(text or "").strip()
+    low = _tight(raw)
+    if followup and any(w in low for w in _PEEK_FOLLOW_DEICTIC) \
+            and any(w in low for w in _PEEK_FOLLOW_CONTENT):
+        return raw
+    if not any(w in low for w in _PEEK_SURFACE_WORDS):
+        return None
+    if not any(w in low for w in _PEEK_VIEW_WORDS):
+        return None
+    m = re.search(r"(?:看得到|看看|看一下|看下|识别|看懂|看|显示|读)(?:这个|我|一下)?"
+                  r"(?:屏幕|屏上|界面|窗口|页面)(.+)", raw)
+    return (m.group(1).strip() if m and m.group(1).strip() else raw)
+
+
+def _parse_rules(text, peek_followup=False):
     """关键词规则层: 返回 plan dict 或 None。
 
     注意: 这里只回答"句子里有没有这个词", 回答不了"这是在命令我、还是在问我、
@@ -1915,13 +1939,13 @@ def _parse_rules(text):
         return {"action": "set_screenshot_dir", "args": {"dir": target},
                 "say": "好，我把截图目录改到那儿"}
 
-    # 看屏: "看看屏幕上这个是什么" / "识别一下屏幕" / "屏幕上写了什么"
-    if any(w in t for w in ("看看屏幕", "看一下屏幕", "识别屏幕", "看懂屏幕", "看看这个页面",
-                             "这个页面是什么", "屏幕上是", "屏幕上写", "屏幕里", "看下屏幕",
-                             "屏幕上", "看屏", "屏幕中显示的是什么", "屏幕上显示什么",
-                             "屏幕里是什么", "我屏幕上是什么", "屏幕中显示", "屏幕上显示")):
-        m_q = re.search(r"(?:看看|看一下|看下|识别|看懂)(?:这个)?(?:屏幕|页面)(.+)", raw)
-        q = m_q.group(1).strip() if m_q else raw
+    # 截图看一下 = 看屏, 不是存档截图; 必须排在"截图"之前。
+    if any(w in t for w in _SCREENSHOT_PEEK_WORDS):
+        return {"action": "peek_screen", "args": {"question": raw}, "say": "我看看屏幕"}
+
+    # 看屏: 载体词 + 明确意图词才触发; 单纯提到屏幕/乱码都不看。
+    q = _peek_question_from_text(raw, peek_followup)
+    if q is not None:
         return {"action": "peek_screen", "args": {"question": q}, "say": "我看看屏幕"}
 
     # 截图 (含口语"截个图")
@@ -2043,7 +2067,18 @@ def _parse_rules(text):
         if t in [f"按{name}", f"按一下{name}", f"按下{name}"] or t == f"按{key}":
             return {"action": "press_key", "args": {"key": key}, "say": "好的"}
 
-    # 鼠标点击
+    # 看屏点击: 只有本句明确"点击/点一下/点开/按一下 + 目标"才走这里。
+    # "点击进入微信"是点已打开界面上的按钮, 不是 open_app。
+    m_click = _CLICK_INTENT_RE.search(raw)
+    if m_click:
+        target = m_click.group(1).strip().rstrip("。！？!?，,、；; ")
+        target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
+        key_names = set(key_map) | set(key_map.values()) | {"确认", "取消", "开始", "返回"}
+        if target and target.lower() not in key_names:
+            return {"action": "click_screen", "args": {"target": target},
+                    "say": "我看看屏幕上那个按钮"}
+
+    # 鼠标点击 (没有目标: 就在当前光标位置点一下)
     if t in ["点击", "点一下", "单击", "双击"]:
         return {"action": "click", "args": {"double": t == "双击"}, "say": "好的"}
 
@@ -2087,7 +2122,7 @@ _STATE_ACTIONS = {
     "screenshot", "shutdown", "restart", "lock", "volume", "brightness",
     "open_app", "open_file", "open_url", "close_app", "file_manage",
     "file_delete", "write_file", "run_powershell", "web_search", "play_music",
-    "search_file", "set_screenshot_dir", "peek_screen",
+    "search_file", "set_screenshot_dir", "peek_screen", "click_screen",
 }
 
 # 礼貌请求式命令: "能不能把截图放到工作区" 是请求, 不是提问, 照命令执行
@@ -2114,7 +2149,8 @@ _ACTION_WORDS = {
     "play_music": ("播放", "放一首"),
     "search_file": ("找", "搜索", "查", "文件"),
     "set_screenshot_dir": ("截图", "截屏"),
-    "peek_screen": ("屏幕", "页面"),
+    "peek_screen": ("屏幕", "屏上", "界面", "窗口", "页面", "截图看一下"),
+    "click_screen": ("点击", "点一下", "点开", "按一下", "点", "按"),
 }
 
 _NEG_ACK = {
@@ -2137,6 +2173,7 @@ _NEG_ACK = {
     "search_file": "好，不找了",
     "set_screenshot_dir": "好，不改截图目录",
     "peek_screen": "好，不看屏",
+    "click_screen": "好，不点",
 }
 
 # 强问句标志: 命中即判定在问事, 哪怕句子以动词开头("查一下截图在哪")
@@ -2185,8 +2222,19 @@ def _is_question(text: str) -> bool:
 _LEADING_FILLER_RE = re.compile(r"^(?:算了|那个|那么|嗯|呃|哦)[，,]?\s*")
 _CAPABILITY_RE = re.compile(r"^你(?:还能|能不能|会不会|可不可以|可以|能)")
 _PEEK_HINT_WORDS = ("看屏", "看看屏幕", "看一下屏幕", "看下屏幕", "识别屏幕", "看懂屏幕",
-                    "屏幕上是", "屏幕上写", "屏幕上", "屏幕里", "屏幕中显示", "屏幕上显示",
-                    "屏幕里是什么", "我屏幕上是什么", "这个页面是什么", "看看这个页面")
+                    "屏幕上是", "屏幕上写", "屏幕上", "屏幕里", "屏幕中", "屏幕中显示", "屏幕上显示",
+                    "屏幕里是什么", "我屏幕上是什么", "这个页面是什么", "看看这个页面",
+                    "界面", "窗口", "截图看一下", "截个图看看", "截图看看", "截图看下")
+# peek 节流: 必须"屏幕/界面"这类载体 + 看/显示/是什么这类意图同时出现;
+# 或者紧接上一次 peek 的下一句, 用"这段/这个/上面"+内容名词指代屏幕上的东西。
+_PEEK_SURFACE_WORDS = ("屏幕", "屏上", "界面", "窗口", "页面")
+_PEEK_VIEW_WORDS = ("看", "显示", "是什么", "有什么", "什么意思", "什么", "识别", "写", "读", "展示")
+_PEEK_FOLLOW_DEICTIC = ("这段", "这个", "上面", "这行")
+_PEEK_FOLLOW_CONTENT = ("代码", "文字", "报错", "按钮", "图", "内容")
+_SCREENSHOT_PEEK_WORDS = ("截图看一下", "截个图看看", "截图看看", "截图看下", "截个图看一下")
+_PEEK_FOLLOW_TTL = 120.0
+_PEEK_FOLLOW = {"armed": False, "ts": 0.0}
+_CLICK_INTENT_RE = re.compile(r"(?:点击|点一下|点开|按一下)\s*(.+)", re.S)
 _SELF_EXIT_WORDS = ("退下", "关闭自己", "关掉自己", "退出自己", "你可以退出了", "没你的事了可以退",
                     "你退出吧", "你先退下", "你退下吧", "先退下", "关闭贾维斯", "退出贾维斯",
                     "你休息吧", "你歇着吧", "你可以下班了")
@@ -2327,7 +2375,8 @@ _SENSITIVE_PROMPT = "当前窗口可能含敏感内容，确定要看吗？"
 _PEEK_CONFIRM_TTL = 60.0
 _PEEK_CONFIRM_LOCK = threading.Lock()
 _PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0, "window": (),
-                 "source": "local"}
+                 "source": "local", "action": "peek_screen", "target": "",
+                 "click_confirmed": False}
 _PEEK_YES = ("确定", "要看", "继续", "可以", "好的", "行", "是", "对", "嗯", "yes", "y")
 _PEEK_NO = ("取消", "不要", "不看", "算了", "不用", "不", "no", "n")
 _PEEK_PUNCT = re.compile(r"[。！？!?，,、\.；;：:“”\"‘’'（）()\[\]【】…·～~\s]")
@@ -2339,6 +2388,12 @@ _VISION_UNCERTAIN_WORDS = ("看不清", "看不清楚", "不清", "不清楚", "
                            "没看清楚", "不确定", "不明确", "不知道", "可能", "也许", "大概",
                            "似乎", "好像", "辨认不清", "看不出来", "看不到", "难以")
 _VISION_TRIM_CHARS = "。！？!?，,、.；;：:“”\"'‘’（）()【】[]《》<>·—…~～"
+
+# 看屏点击: 一次指令只点一下; 点完必须再拍一张核实, 绝不接着自作主张点第二下。
+_CLICK_DANGEROUS_WORDS = ("支付", "付款", "删除", "发送", "关机", "确认订单", "转账")
+_CLICK_VERIFY_DELAY = 0.6
+_CLICK_VERIFY_Q = "我刚点了「{target}」。目标还在不在？界面现在进到哪一步了？只据实说，不要猜。"
+_CLICK_NOT_FOUND = "没找到那个按钮，Sir。"
 
 
 def _foreground_window_info():
@@ -2470,6 +2525,41 @@ def _encode_jpeg_b64(img, long_edge=None, quality=None, label=""):
 def _screen_jpeg_b64(long_edge=None, quality=None):
     """把当前屏幕压成 base64 JPEG（内存直出）。返回 (base64, 尺寸说明)。"""
     return _encode_jpeg_b64(_capture_screen_image(), long_edge, quality)
+
+
+def _click_dangerous_word(text):
+    """目标描述/定位输出里有没有危险词; 返回命中的词或空串。"""
+    low = str(text or "").lower()
+    for word in _CLICK_DANGEROUS_WORDS:
+        if word in low:
+            return word
+    return ""
+
+
+def _clamp_click_point(x, y, width, height):
+    """点击坐标夹到屏幕内, 越界都拉回最近的合法像素。"""
+    return (max(0, min(int(width) - 1, int(x))),
+            max(0, min(int(height) - 1, int(y))))
+
+
+def _click_point_from_box(coords, width, height):
+    """定位框 → 框中心像素点。复用 peek 的坐标校验, 失败返回 None 绝不猜坐标。"""
+    if _peek_crop_box(coords, width, height) is None:
+        return None
+    try:
+        x0, x1 = float(coords["x_min"]), float(coords["x_max"])
+        y0, y1 = float(coords["y_min"]), float(coords["y_max"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    center_x = int(round((x0 + x1) / 2000.0 * int(width)))
+    center_y = int(round((y0 + y1) / 2000.0 * int(height)))
+    return _clamp_click_point(center_x, center_y, width, height)
+
+
+def _mouse_click_at(x, y):
+    """唯一的鼠标点击入口: 仓库里没有更好的坐标点击实现, 只用 pyautogui 点这一下。"""
+    import pyautogui
+    pyautogui.click(x, y)
 
 
 def _peek_needs_second_pass(question, first_answer):
@@ -2616,6 +2706,93 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
         return f"看屏失败：{msg}"
 
 
+def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
+                  confirmed_window=None, source="", confirmed=False):
+    """看屏点击: 敏感检查 → 截图 → 视觉定位 → 框中心点一次点击 → 再截图核验播报。
+
+    confirmed 表示危险目标已在执行前走过二次确认; 未确认绝不点。每次调用最多点一下。
+    """
+    target = str(target or "").strip()
+    _TL.click_ok = False
+    if not target:
+        return _CLICK_NOT_FOUND
+
+    # ① 敏感画面: 与 peek 同一套关键词、同一套确认/跳过政策。
+    sensitive_now = None
+    if sensitive_confirmed:
+        saved = confirmed_window if confirmed_window is not None else _PEEK_CONFIRM.get("window")
+        sensitive_now = _sensitive_window_hit()
+        if not _same_confirm_window(saved, _foreground_window_identity()) or sensitive_now:
+            print("[看屏点击] 确认窗口已变或复检敏感, 重走检查流程", flush=True)
+            sensitive_confirmed = False
+    if not sensitive_confirmed:
+        if sensitive_now is None:
+            sensitive_now = _sensitive_window_hit()
+        if sensitive_now:
+            if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
+                with _PEEK_CONFIRM_LOCK:
+                    _PEEK_CONFIRM.update(pending=True, question=target, ts=time.time(),
+                                         window=_foreground_window_identity(),
+                                         source=_input_source(source), action="click_screen",
+                                         target=target, click_confirmed=bool(confirmed))
+                print("[看屏点击] 敏感画面, 等用户确认", flush=True)
+                return _SENSITIVE_PROMPT
+            print("[看屏点击] 敏感画面跳过", flush=True)
+            return "当前窗口可能含敏感内容，这次点击跳过，Sir。"
+
+    # ② 危险目标: 复用现有 guard 的二次确认, 没点头就不动手。
+    word = _click_dangerous_word(target)
+    if word and not confirmed:
+        desc = f"点击可能含敏感操作的按钮：{target[:60]}（命中「{word}」）"
+        if not _guard_confirm(desc, source=source):
+            print(f"[看屏点击] 危险目标未确认, 不点: {word}", flush=True)
+            return "好，那就不点了，Sir。"
+        confirmed = True
+
+    try:
+        from llm_brain import query_vision, query_vision_locate
+    except Exception as exc:
+        print(f"[看屏点击] 视觉模块不可用: {exc}", flush=True)
+        return _CLICK_NOT_FOUND
+
+    try:
+        # ③ 截图只在内存里; 定位失败/坐标不合法一律不点, 绝不猜坐标。
+        img = _capture_screen_image()
+        b64, size = _encode_jpeg_b64(img)
+        located = str(query_vision_locate(target, b64, CONFIG) or "").strip()
+        coords = _parse_locate_box(located)
+        point = _click_point_from_box(coords, img.size[0], img.size[1])
+        if point is None:
+            print(f"[看屏点击] 定位失败/坐标无效, 不点: {located[:80]} (全屏={size})", flush=True)
+            return _CLICK_NOT_FOUND
+
+        # ④ 定位输出可能自带按钮文字, 同样过危险词护栏。
+        word = _click_dangerous_word(located)
+        if word and not confirmed:
+            desc = f"点击定位到的按钮：{target[:60]}（文字命中「{word}」）"
+            if not _guard_confirm(desc, source=source):
+                print(f"[看屏点击] 定位文字危险且未确认, 不点: {word}", flush=True)
+                return "好，那就不点了，Sir。"
+            confirmed = True
+
+        x, y = point
+        print(f"[看屏点击] {size} → 框中心=({x},{y}) (图像未落盘)", flush=True)
+        _mouse_click_at(x, y)               # 一条指令, 只点这一下
+        _TL.click_ok = True
+        time.sleep(_CLICK_VERIFY_DELAY)
+        after = _capture_screen_image()
+        after_b64, after_size = _encode_jpeg_b64(after)
+        question = _CLICK_VERIFY_Q.format(target=target)
+        answer = str(query_vision(question, after_b64, CONFIG) or "").strip()
+        print(f"[看屏点击] 点后 {after_size} → {len(answer)} 字", flush=True)
+        return answer or "我点了那个位置，但没看清界面到哪一步了，您看一眼？"
+    except Exception as exc:
+        print(f"[看屏点击失败] {exc}", flush=True)
+        if not getattr(_TL, "click_ok", False):
+            return _CLICK_NOT_FOUND
+        return f"我点了那个位置，但核验失败了：{exc}"
+
+
 def _peek_answer_verdict(text):
     """敏感看屏的下一句: 只认整句肯定/否定; 其它返回 None, 不当答复。"""
     low = _PEEK_PUNCT.sub("", str(text or "")).lower()
@@ -2654,12 +2831,22 @@ def _peek_confirm_answer(text, source="") -> bool:
             return False
         question = str(_PEEK_CONFIRM.get("question") or "")
         window = _PEEK_CONFIRM.get("window") or ()
-        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local")
+        pending_action = str(_PEEK_CONFIRM.get("action") or "peek_screen")
+        pending_target = str(_PEEK_CONFIRM.get("target") or "")
+        click_confirmed = bool(_PEEK_CONFIRM.get("click_confirmed"))
+        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local",
+                             action="peek_screen", target="", click_confirmed=False)
     verdict = _peek_answer_verdict(text)
     if verdict is None:
         return False
     if verdict == "yes":
-        speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window, source=src))
+        if pending_action == "click_screen":
+            speak(_click_screen(pending_target, sensitive_confirmed=True,
+                                confirmed_window=window, source=src, confirmed=click_confirmed))
+        else:
+            speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window, source=src))
+    elif pending_action == "click_screen":
+        speak("好，那就不点了，Sir。")
     else:
         speak("好，那就不看屏了，Sir")
     return True
@@ -2741,13 +2928,19 @@ _FACT_ANSWERS = {
 
 def parse_command(text):
     """规则分流入口: 先跑关键词规则, 再对命中结果做否定/问句仲裁。"""
-    if is_capability_question(text) and not _explicit_intent(text):
+    now = time.time()
+    followup = (bool(_PEEK_FOLLOW["armed"])
+                and now - float(_PEEK_FOLLOW["ts"] or 0.0) <= _PEEK_FOLLOW_TTL)
+    _PEEK_FOLLOW["armed"] = False           # 只认紧接的下一句, 用完即焚
+    if is_capability_question(text) and not (_explicit_intent(text) or followup):
         print(f"[护栏] 能力询问 → 跳过本地规则: {text}", flush=True)
         return None
-    plan = _parse_rules(text)
+    plan = _parse_rules(text, peek_followup=followup)
     if not plan:
         return None
     action = str(plan.get("action") or "")
+    if action == "peek_screen":
+        _PEEK_FOLLOW.update(armed=True, ts=now)
     if action not in _STATE_ACTIONS:
         return plan                     # 纯说话, 没有副作用, 直接放行
     low = str(text or "").strip().lower().replace(" ", "")
@@ -3190,6 +3383,20 @@ def _perform_plan(plan, source=""):
                 except Exception:
                     pass
             _TL.action_ok = True
+        elif action == "click_screen":
+            # 看屏点击: 定位→点一下→再拍一张据实播报; 安全护栏在 _click_screen 内。
+            if ui_bridge is not None:
+                try:
+                    ui_bridge.emit_state("PERCEIVING")
+                except Exception:
+                    pass
+            say = _click_screen(str(args.get("target") or ""), source=source)
+            if ui_bridge is not None:
+                try:
+                    ui_bridge.emit_state("IDLE")
+                except Exception:
+                    pass
+            _TL.action_ok = bool(getattr(_TL, "click_ok", False))
         elif action == "set_screenshot_dir":
             target, why = _resolve_screenshot_target(args.get("dir") or "")
             if target is None:
@@ -3354,6 +3561,13 @@ def execute_plan(plan, command_id=None, source=""):
     action = plan.get("action")
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
+
+    # 看屏点击只认用户本句的明确点击意图, 不许模型把 open_app 换成点击蒙一个。
+    user_text = str(getattr(_TL, "user_text", "") or "")
+    if action == "click_screen" and user_text and not _CLICK_INTENT_RE.search(user_text):
+        print("[看屏点击] 原话没有明确点击意图, 拒绝执行", flush=True)
+        speak("您明确说要点哪里，我才会点屏幕上的按钮，Sir。")
+        return False
 
     # 危险动作必须先在调用线程取得确认，后台线程绝不绕过安全护栏。
     if plan.get("danger"):
@@ -3689,6 +3903,8 @@ def _handle_command_inner(command, command_id, source=""):
         print("[指令已被新指令取代，丢弃]")
         return
 
+    if (plan or {}).get("action") == "peek_screen":
+        _PEEK_FOLLOW.update(armed=True, ts=time.time())
     if ui_bridge is not None:
         ui_bridge.emit_state("ACTING")
     async_started = False
