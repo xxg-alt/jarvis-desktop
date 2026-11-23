@@ -141,7 +141,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 回答用中文，默认 1~3 句，口吻忠诚、专业、有管家气质；除非用户明确要求展开，不要长篇大论。
 
 只能输出纯 JSON (不要 markdown 代码块)，格式：
-{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
+{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir|peek_screen", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
 
 动作规则：
 - 闲聊、提问、写代码、请教知识：action="chat"，say 填完整回答，不要 status_say。
@@ -153,6 +153,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 打开网址：action="open_url"，args={"url": "http(s)://..."}
 - 搜索：action="web_search"，args={"query": "搜索关键词"}。系统会真联网检索并把带出处的答案直接朗读给用户，所以 say 只写垫话（如“我查一下”），不要在 say 里自己编答案；需要实时信息（天气、价格、新闻、最新版本）的问题一律走 web_search，不要凭记忆回答。
 - 音量：action="volume"，args={"mode": "up|down|mute"}
+- 看屏幕内容（如"看看屏幕上这个是什么""屏幕上的报错什么意思""这个页面在干嘛"）：action="peek_screen"，args={"question": "把用户的问题原样带上"}。系统会截当前屏幕交给视觉模型，say 只写垫话（如"我看看屏幕"），绝不要在 say 里自己编屏幕上的内容；也不要用 screenshot 顶替（截图的图会存盘且不回答内容）。
 - 截图：action="screenshot"；锁屏：action="lock"
 - 改设置/改默认存放位置（如"以后截图放到工作区""把截图存到桌面某个文件夹"）：action="set_screenshot_dir"，args={"dir": "工作区"}；dir 只能是 工作区/桌面/文档/下载（可带子目录）或完整路径。用户说得含糊（"另一个文件夹""别的地方"）就原样把他的话填进 dir，系统会去追问，**绝不要**用 write_file 编一份文档来应付这类请求。
 - 文件管理 action="file_manage"，只允许四种，且只能操作 桌面/下载/文档 三个目录，不能删除：
@@ -653,6 +654,59 @@ def _http_error_message(provider_name: str, response) -> str:
     if code >= 500:
         return f"AI 服务端暂时不可用（HTTP {code}）：请稍后再试。"
     return f"AI 接口返回错误（HTTP {code}）：请检查模型名、接口地址和账户额度。"
+
+
+_VISION_SYSTEM = (
+    "你在看用户 Windows 电脑的屏幕截图。只依据图片里真实可见的内容作答:\n"
+    "1. 用中文，先给结论，1~3 句，能直接朗读；\n"
+    "2. 认字必须准确：报错文字、路径、数字、按钮名照抄原文；看不清就说看不清，绝不编造；\n"
+    "3. 用户问的是具体对象（某个按钮/某段文字/某个数值）就直接答那个对象，不要泛泛描述整屏；\n"
+    "4. 需要给操作建议时只给一句，不要列步骤。"
+)
+
+
+def query_vision(question: str, image_b64: str, config: dict,
+                 detail: str = "high", mime: str = "image/jpeg") -> str:
+    """看一张图并回答 (base64 直接进请求体, 图片全程不落盘)。
+
+    只适用于 OpenAI 兼容协议的视觉模型 (如 DeepSeek-V4.1-Flash / deepseek-flash)。
+    失败一律抛 _LlmError, 文案可直接朗读。
+    """
+    q = str(question or "").strip() or \
+        "看清这个屏幕，用一两句话说明这是什么界面、有什么值得注意的信息。"
+    b64 = str(image_b64 or "").strip()
+    if not b64:
+        raise _LlmError("没有拿到屏幕画面，这次没看成。")
+
+    provider_name = resolve_provider_name(config.get("ai_provider", "DeepSeek"))
+    info = LLM_PROVIDERS.get(provider_name) or {}
+    if info.get("type") != "openai_compatible":
+        raise _LlmError("当前这家服务商的接口不吃图片，换一家支持视觉的模型再试。")
+
+    messages = [
+        {"role": "system", "content": _VISION_SYSTEM},
+        {"role": "user", "content": [
+            {"type": "text", "text": q},
+            {"type": "image_url",
+             "image_url": {"url": f"data:{mime};base64,{b64}", "detail": detail}},
+        ]},
+    ]
+    # 视觉要用能看图的模型: 规划通道常用 deepseek-chat(纯文本), 传图会被拒。
+    # 所以这里单独挑模型, 不要求用户把全局模型改掉 (文本侧仍吃便宜+缓存)。
+    cfg = dict(config or {})
+    vision_model = str(cfg.get("vision_model") or "").strip()
+    if vision_model:
+        cfg["ai_model"] = vision_model
+    elif provider_name == "DeepSeek":
+        cfg["ai_model"] = "deepseek-flash"
+    try:
+        return _provider_chat(cfg, messages, max_tokens=320)
+    except _LlmError as exc:
+        text = str(exc)
+        if "HTTP 4" in text:
+            raise _LlmError(
+                f"{text}（看屏需要支持图片输入的模型，比如 DeepSeek 的 deepseek-flash）")
+        raise
 
 
 def _provider_chat(config: dict, messages,

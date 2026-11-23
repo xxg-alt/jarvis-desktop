@@ -72,6 +72,8 @@ def load_config():
         "api_key": "",
         "ai_model": "",
         "ai_url": "",
+        # 看屏用的视觉模型; 留空 = DeepSeek 默认走 deepseek-flash, 其它服务商用 ai_model
+        "vision_model": "",
         # auto = 优先本地 whisper(中英文都准) -> 系统引擎 -> Vosk
         "stt_engine": "auto",
         "whisper_model": "small",
@@ -957,7 +959,7 @@ AGENT_SCOPE_ASK = agent_core.SCOPE_ASK          # 危险: shutdown, restart, clo
 
 _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder",
                        "web_search", "search_file", "ask_doc", "screenshot", "lock",
-                       "set_screenshot_dir",
+                       "set_screenshot_dir", "peek_screen",
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
 _AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
@@ -1815,6 +1817,14 @@ def _parse_rules(text):
         return {"action": "set_screenshot_dir", "args": {"dir": target},
                 "say": "好，我把截图目录改到那儿"}
 
+    # 看屏: "看看屏幕上这个是什么" / "识别一下屏幕" / "屏幕上写了什么"
+    if any(w in t for w in ("看看屏幕", "看一下屏幕", "识别屏幕", "看懂屏幕", "看看这个页面",
+                             "这个页面是什么", "屏幕上是", "屏幕上写", "屏幕里", "看下屏幕",
+                             "屏幕上", "看屏")):
+        m_q = re.search(r"(?:看看|看一下|看下|识别|看懂)(?:这个)?(?:屏幕|页面)(.+)", raw)
+        q = m_q.group(1).strip() if m_q else raw
+        return {"action": "peek_screen", "args": {"question": q}, "say": "我看看屏幕"}
+
     # 截图 (含口语"截个图")
     if "截图" in t or "截屏" in t or "截个图" in t:
         return {"action": "screenshot", "say": "已截图, 保存在图片文件夹的贾维斯截图里"}
@@ -1965,7 +1975,7 @@ _CHAT_SIGNAL_RE = re.compile(
 
 _NEG_RE = re.compile(
     r"(?:不要|不用|不必|不许|不准|不需要|无需|别再|先别|暂别|甭|不想|别|不)"
-    r"(?:给我|帮我|再|把|去|要|用|用再)?$"
+    r"(?:给我|帮我|再|把|去|要|用|用再|看|看下|看看|动|碰)?$"
 )
 
 # 有副作用的动作: 这类才需要仲裁; 纯说话(chat)不拦
@@ -1973,11 +1983,12 @@ _STATE_ACTIONS = {
     "screenshot", "shutdown", "restart", "lock", "volume", "brightness",
     "open_app", "open_file", "open_url", "close_app", "file_manage",
     "file_delete", "write_file", "run_powershell", "web_search", "play_music",
-    "search_file", "set_screenshot_dir",
+    "search_file", "set_screenshot_dir", "peek_screen",
 }
 
 # 礼貌请求式命令: "能不能把截图放到工作区" 是请求, 不是提问, 照命令执行
-_REQUEST_ACTIONS = {"set_screenshot_dir"}
+# peek_screen 同理: "屏幕上写了什么" 虽然带疑问词, 但它要的就是我看一眼
+_REQUEST_ACTIONS = {"set_screenshot_dir", "peek_screen"}
 
 # 动作 → 触发它的关键词, 用于回溯"这句话是不是在否定这个动作"
 _ACTION_WORDS = {
@@ -1999,6 +2010,7 @@ _ACTION_WORDS = {
     "play_music": ("播放", "放一首"),
     "search_file": ("找", "搜索", "查", "文件"),
     "set_screenshot_dir": ("截图", "截屏"),
+    "peek_screen": ("屏幕", "页面"),
 }
 
 _NEG_ACK = {
@@ -2020,6 +2032,7 @@ _NEG_ACK = {
     "play_music": "好，不放",
     "search_file": "好，不找了",
     "set_screenshot_dir": "好，不改截图目录",
+    "peek_screen": "好，不看屏",
 }
 
 # 强问句标志: 命中即判定在问事, 哪怕句子以动词开头("查一下截图在哪")
@@ -2129,6 +2142,60 @@ def _resolve_screenshot_target(raw: str):
     except Exception as exc:
         return None, f"「{target}」写不进去（{exc}），换个目录吧"
     return target, ""
+
+
+# ── 看屏 (peek_screen): 图片只在内存里存在过 ──
+# 用户明确要"临时性、用完即删"。最干净的做法不是"写完再删", 而是根本不写:
+# pyautogui.screenshot() 拿到的是 PIL 对象, save() 到 BytesIO 也还在内存,
+# base64 直接进请求体, 函数返回后对象释放 —— 磁盘上不存在这个文件, 无需清扫。
+_PEEK_LONG_EDGE = 1600     # 长边上限: 再大只是烧 token, 字并不会更清楚
+_PEEK_QUALITY = 80
+
+
+def _screen_jpeg_b64(long_edge=None, quality=None):
+    """把当前屏幕压成 base64 JPEG（内存直出）。返回 (base64, 尺寸说明)。"""
+    import base64
+    import io
+
+    import pyautogui
+    from PIL import Image
+
+    long_edge = int(long_edge or _PEEK_LONG_EDGE)
+    quality = int(quality or _PEEK_QUALITY)
+    img = pyautogui.screenshot()
+    ow, oh = img.size
+    if max(ow, oh) > long_edge:
+        scale = long_edge / float(max(ow, oh))
+        img = img.resize((max(1, int(ow * scale)), max(1, int(oh * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)      # 内存缓冲, 不是文件
+    raw = buf.getvalue()
+    w, h = img.size
+    try:
+        img.close()
+        buf.close()
+    except Exception:
+        pass
+    return base64.b64encode(raw).decode("ascii"), f"{ow}x{oh}→{w}x{h}, {len(raw)//1024}KB"
+
+
+def _peek_screen(question="") -> str:
+    """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。"""
+    try:
+        from llm_brain import query_vision
+    except Exception as exc:
+        return f"看屏功能没加载起来: {exc}"
+    try:
+        b64, size = _screen_jpeg_b64()
+        answer = query_vision(question, b64, CONFIG)
+        print(f"[看屏] {size} → {len(answer)} 字 (图像未落盘)", flush=True)
+        return str(answer or "").strip() or "屏幕我看清了, 但没想出该怎么答, Sir。"
+    except Exception as exc:
+        msg = str(exc)
+        print(f"[看屏失败] {msg}", flush=True)
+        if "图片" in msg or "HTTP 4" in msg or "视觉" in msg:
+            return ("看屏失败：当前模型可能不支持图片输入，把模型名换成 deepseek-flash 再试，Sir。")
+        return f"看屏失败：{msg}"
 
 
 # 已知事实: 这类问句不用绕模型, 直接照实答
@@ -2558,6 +2625,20 @@ def _perform_plan(plan):
                         say = f"没找到{query}, 你是不是想打开「{'」或「'.join(guess)}」?"
                     else:
                         say = f"在桌面、文档和下载里没找到{query}"
+        elif action == "peek_screen":
+            # 看屏: 截图 → 内存压 JPEG → base64 → 视觉模型; 全程不写文件
+            if ui_bridge is not None:
+                try:
+                    ui_bridge.emit_state("PERCEIVING")
+                except Exception:
+                    pass
+            say = _peek_screen(str(args.get("question") or ""))
+            if ui_bridge is not None:
+                try:
+                    ui_bridge.emit_state("IDLE")
+                except Exception:
+                    pass
+            _TL.action_ok = True
         elif action == "set_screenshot_dir":
             target, why = _resolve_screenshot_target(args.get("dir") or "")
             if target is None:
