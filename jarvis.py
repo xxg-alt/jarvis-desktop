@@ -769,11 +769,14 @@ _CONFIRM_YES = ("没问题", "确定", "确认", "好的", "是的", "看吧", "
                 "同意", "执行", "可以", "好", "行", "是", "对", "嗯", "yes", "y")
 _CONFIRM_NO = ("不用", "不要", "不行", "别", "算了", "取消", "停下", "不关", "停", "不", "no", "n")
 _CONFIRM_FILLERS = frozenset("了啊吧呐呀哦噢喔呢嘛哈啦呗喽咯")
+_CONFIRM_SELF_LEAD = re.compile(
+    r"^我(?:就|是|才)?(?:说|讲|选|答应|答|回|道|想|觉得|认为)(?:的是|了|过)?[：:，,、]?")
 
 
 def classify_confirmation_answer(text):
     """语义确认判定: confirm / deny / none。只在已有待确认上下文调用。
 
+    先剥句首自述引导词 ("我说/我讲/我选" 等), 剩余部分再按纯答复判定。
     肯定核心允许重复、标点分隔和纯语气词尾巴 ("确定。"/"嗯嗯"/"好的嗯"/"确定确定哦")；
     整句必须只由肯定核心与语气词组成, 夹带其它内容 ("嗯打开浏览器") 不算答复。
     肯定与否定核心同现 ("好不") 是歧义句, 归 none: 既不消费也不取消。
@@ -781,6 +784,7 @@ def classify_confirmation_answer(text):
     raw = re.sub(r"\s+", "", str(text or "")).lower()
     for noisy, canonical in _CONFIRM_ASR.items():
         raw = raw.replace(noisy, canonical)
+    raw = _CONFIRM_SELF_LEAD.sub("", raw, count=1)
     if not raw:
         return "none"
     compact = _GUARD_PUNCT.sub("", raw)

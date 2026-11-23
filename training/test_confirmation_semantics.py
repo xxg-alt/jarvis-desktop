@@ -13,11 +13,11 @@ def check(ok, message):
         fails.append(message)
 
 for phrase in ("确定了，大哥，赶快看呐", "确订", "缺定", "确D", "却定", "好，可以继续",
-               "嗯嗯", "好的嗯", "确定确定", "确定确定哦"):
+               "嗯嗯", "好的嗯", "确定确定", "确定确定哦", "我说确定"):
     check(jarvis.classify_confirmation_answer(phrase) == "confirm", f"{phrase!r} 应确认")
-for phrase in ("不用了", "算了", "别看了", "取消", "不行"):
+for phrase in ("不用了", "算了", "别看了", "取消", "不行", "我说过不要点"):
     check(jarvis.classify_confirmation_answer(phrase) == "deny", f"{phrase!r} 应拒绝")
-for phrase in ("打开酷狗", "今天天气怎么样", "好不", "嗯打开浏览器"):
+for phrase in ("打开酷狗", "今天天气怎么样", "好不", "嗯打开浏览器", "我说点击发送会怎样"):
     check(jarvis.classify_confirmation_answer(phrase) == "none", f"{phrase!r} 不应确认")
 
 def arm_pending():
