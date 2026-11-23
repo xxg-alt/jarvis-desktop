@@ -1267,6 +1267,21 @@ class JarvisAppManager:
             pass
         messagebox.showinfo("手机遥控", f"局域网地址: {url}\n已复制到剪贴板，手机需连同一 Wi-Fi")
 
+    def show_public_url(self):
+        if not self.remote:
+            messagebox.showinfo("出门地址", "手机遥控尚未启动")
+            return
+        url = self.remote.public_url
+        if not url:
+            messagebox.showinfo("出门地址", "公网地址{}，请稍后再看".format(self.remote.public_status))
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+        except Exception:
+            pass
+        messagebox.showinfo("出门地址", "{}\n已复制到剪贴板；仅在本机显示，请勿公开转发".format(url))
+
     def show_remote_password(self):
         if not self.remote:
             return
@@ -1296,6 +1311,8 @@ class JarvisAppManager:
                 pystray.MenuItem("切换为桌面悬浮球", lambda _i, _it: self.root.after(0, self.use_orb_ui)),
                 pystray.MenuItem(lambda _item: "手机遥控地址: " + self._remote_url(),
                                  lambda _i, _it: self.root.after(0, self.copy_remote_url)),
+                pystray.MenuItem(lambda _item: "出门地址: " + (self.remote.public_status if self.remote else "未启用"),
+                                 lambda _i, _it: self.root.after(0, self.show_public_url)),
                 pystray.MenuItem("显示手机遥控口令", lambda _i, _it: self.root.after(0, self.show_remote_password)),
                 pystray.MenuItem("重置手机遥控口令", lambda _i, _it: self.root.after(0, self.reset_remote_password)),
                 pystray.MenuItem("显示 / 隐藏歌词字幕", lambda _i, _it: self.root.after(0, self.toggle_lyric_visibility)),

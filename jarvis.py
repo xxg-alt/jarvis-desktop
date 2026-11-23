@@ -126,6 +126,8 @@ def load_config():
         "vision_enabled": True,
         "remote_enabled": True,
         "remote_port": 8765,
+        "remote_public_enabled": False,
+        "cloudflared_path": "",
         "ai_provider": "DeepSeek",
         "api_key": "",
         "ai_model": "",

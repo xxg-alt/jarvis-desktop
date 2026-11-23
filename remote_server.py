@@ -12,6 +12,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from tunnel_manager import TunnelManager
+
 DEFAULT_PORT = 8765
 FEED_LIMIT = 100
 MAX_PASSWORD_FAILS = 5
@@ -191,6 +193,8 @@ def remote_config():
     return {
         "remote_port": config.get("remote_port", DEFAULT_PORT),
         "remote_enabled": config.get("remote_enabled", True),
+        "remote_public_enabled": bool(config.get("remote_public_enabled", False)),
+        "cloudflared_path": str(config.get("cloudflared_path", "") or ""),
     }
 
 
@@ -309,13 +313,31 @@ class RemoteControlServer:
         self._speak_module = None
         self._previous_hook = None
         self._httpd = None
+        self._serving = False
         self.url = ""
+        self._tunnel = None
 
     @property
     def server(self):
         return self._httpd
 
+    @property
+    def public_url(self):
+        return self._tunnel.url if self._tunnel is not None else ""
+
+    @property
+    def public_status(self):
+        if not self.config.get("remote_public_enabled", False):
+            return "未启用"
+        if self.public_url:
+            return "已就绪"
+        if self._tunnel is not None and self._tunnel.error:
+            return "异常"
+        return "连接中"
+
     def start(self):
+        self.stop_tunnel()
+        self._close_httpd()
         if not self.config.get("remote_enabled", True):
             print("[手机遥控] 已在配置中关闭 (remote_enabled=false)", flush=True)
             return False
@@ -327,28 +349,59 @@ class RemoteControlServer:
             print(f"[手机遥控] 端口 {port} 启动失败: {type(exc).__name__}", flush=True)
             return False
         self.passwords.get()
+        self._restore_speak_hook()
         self._install_speak_hook()
         self.url = "http://{}:{}/remote".format(lan_ip(), self._httpd.server_address[1])
         print(f"[手机遥控] 局域网地址: {self.url}", flush=True)
         print("[手机遥控] 口令可在托盘菜单「显示手机遥控口令」查看或重置", flush=True)
+        if self.config.get("remote_public_enabled", False):
+            try:
+                self._tunnel = TunnelManager(
+                    port=self._httpd.server_address[1],
+                    password_getter=self.passwords.get,
+                    enabled=True,
+                    executable_path=self.config.get("cloudflared_path", ""),
+                )
+                self._tunnel.start()
+            except Exception as exc:
+                print(f"[出门遥控] 启动失败: {type(exc).__name__}: {exc}", flush=True)
+                self._tunnel = None
         return True
+
+    def stop_tunnel(self):
+        if self._tunnel is None:
+            return
+        try:
+            self._tunnel.stop()
+        except Exception:
+            pass
+        self._tunnel = None
 
     def serve_forever(self):
         if self._httpd is not None:
-            self._httpd.serve_forever(poll_interval=0.2)
+            self._serving = True
+            try:
+                self._httpd.serve_forever(poll_interval=0.2)
+            finally:
+                self._serving = False
 
-    def stop(self):
+    def _close_httpd(self):
         if self._httpd is None:
             return
-        try:
-            self._httpd.shutdown()
-        except Exception:
-            pass
+        if self._serving:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
         try:
             self._httpd.server_close()
         except Exception:
             pass
         self._httpd = None
+
+    def stop(self):
+        self.stop_tunnel()
+        self._close_httpd()
         self._restore_speak_hook()
 
     def reveal_password(self):
