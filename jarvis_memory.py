@@ -175,6 +175,21 @@ class JarvisMemory:
             self._trim()
             self._save()
 
+        # 长期留档 (memory.json 是有上限的滚动窗口, 真正"永久"的是这份日志)。
+        # 放在锁外面: 文件 IO 不该占着记忆锁; 失败只打印, 绝不能把主流程带崩。
+        try:
+            import chat_log
+            chat_log.log_turn(
+                user=user,
+                reply=assistant_text,
+                action=clean_plan.get("action", ""),
+                args=clean_plan.get("args", ""),
+                source=source,
+                ts=now,
+            )
+        except Exception as exc:
+            print(f"[对话留档] 写入失败: {exc}")
+
     def last_exchange(self):
         """返回上一条用户指令及紧随其后的助手记录。"""
         with self._lock:
