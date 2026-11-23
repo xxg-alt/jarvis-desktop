@@ -364,12 +364,16 @@ class SuggestionState:
         low = normalize(text)
         if not low:
             return ""
-        no = any(w in low for w in ("不用", "不要", "算了", "别记", "不需要", "不记"))
-        if no:
+        try:
+            from jarvis import classify_confirmation_answer
+            verdict = classify_confirmation_answer(text)
+        except Exception:
+            verdict = "none"
+        if verdict == "deny":
             self.dismissed.add(normalize(self.pending))
             self.pending = ""
             return "no"
-        if low in _YES_PHRASES:
+        if verdict == "confirm":
             return "yes"
         return ""
 

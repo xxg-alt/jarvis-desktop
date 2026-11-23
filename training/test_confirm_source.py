@@ -113,6 +113,7 @@ def reset():
         jarvis._GUARD.update(active=False, source="local", answer="", event=None)
     with jarvis._PEEK_CONFIRM_LOCK:
         jarvis._PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=(), source="local")
+    jarvis._SENSITIVE_APPROVALS.clear()
     jarvis._sensitive_window_hit = lambda: True
 
 
