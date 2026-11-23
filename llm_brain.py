@@ -623,7 +623,11 @@ def sanitize_plan(plan: dict) -> dict:
         }, plan)
 
     if action == "remember":
-        text = _safe_text(args.get("text"), 200)
+        raw_text = args.get("text") if isinstance(args.get("text"), str) else ""
+        if len(raw_text.strip()) > 200:
+            return {"action": "chat", "say":
+                    "这条太长，单条记忆不能超过200字，请拆短一点再说，我没记下。", "danger": False}
+        text = _safe_text(raw_text, 200)
         if not text:
             return {"action": "chat", "say": "要我记住什么？说个内容就行。", "danger": False}
         kind = args.get("kind") if args.get("kind") in ("preference", "habit", "fact") else "fact"

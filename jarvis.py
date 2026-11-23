@@ -35,6 +35,32 @@ ON_AUDIO_LEVEL = None
 ON_EXIT = None
 QUIT_REQUESTED = threading.Event()
 _LAST_MEMORY_CANDIDATES = []
+_LAST_MEMORY_CANDIDATES_AT = 0.0
+_MEMORY_CANDIDATES_TTL = 60.0
+
+
+def _clear_memory_candidates():
+    global _LAST_MEMORY_CANDIDATES, _LAST_MEMORY_CANDIDATES_AT
+    _LAST_MEMORY_CANDIDATES = []
+    _LAST_MEMORY_CANDIDATES_AT = 0.0
+
+
+def _set_memory_candidates(entries):
+    global _LAST_MEMORY_CANDIDATES, _LAST_MEMORY_CANDIDATES_AT
+    _LAST_MEMORY_CANDIDATES = list(entries or [])
+    _LAST_MEMORY_CANDIDATES_AT = time.time() if _LAST_MEMORY_CANDIDATES else 0.0
+
+
+def _take_memory_candidate(index):
+    global _LAST_MEMORY_CANDIDATES, _LAST_MEMORY_CANDIDATES_AT
+    if not _LAST_MEMORY_CANDIDATES:
+        return ""
+    expired = (_LAST_MEMORY_CANDIDATES_AT > 0
+               and time.time() - _LAST_MEMORY_CANDIDATES_AT > _MEMORY_CANDIDATES_TTL)
+    valid = 0 <= index < len(_LAST_MEMORY_CANDIDATES)
+    entry = _LAST_MEMORY_CANDIDATES[index] if valid and not expired else None
+    _clear_memory_candidates()
+    return str(entry.get("id") or "") if entry else ""
 
 
 def _request_self_exit():
@@ -571,29 +597,24 @@ def _speak(text):
 
 
 _JSON_SPEAK_FALLBACK = "先生，刚才那句我没处理好，您再说一遍。"
+_SIR_VOCATIVE_RE = re.compile(
+    r"Sir(?=$|[，。！？；、,!?])|(?<=[，。！？；、,!?])Sir(?=\s|$)"
+)
 
 
 def sanitize_speak_text(text):
     value = str(text or "")
-    if "}{" in value or ('"action"' in value and ("{" in value or "}" in value
-                                                   or re.search(r'"action"\s*:', value))):
+    stripped = value.strip()
+    if ("}{" in value or (stripped.startswith("{") and "action" in stripped)
+            or value.count('"action"') >= 2):
         print(f"[朗读兜底] JSON 泄漏 → 整句替换: {value[:80]}", flush=True)
         return _JSON_SPEAK_FALLBACK
-    stripped = value.strip()
-    if stripped.startswith("{"):
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict) and "action" in parsed:
-                print(f"[朗读兜底] JSON 动作泄漏 → 整句替换: {value[:80]}", flush=True)
-                return _JSON_SPEAK_FALLBACK
-        except Exception:
-            pass
     try:
         title = memory_store.current_title()
     except Exception:
         title = memory_store.DEFAULT_TITLE
     if str(title).strip().lower() != "sir" and title:
-        value = re.sub(r"\bSir\b", lambda _m: str(title), value, flags=re.I)
+        value = _SIR_VOCATIVE_RE.sub(lambda _m: str(title), value)
     return value
 
 
@@ -2912,6 +2933,7 @@ def _perform_plan(plan):
         elif action == "forget_memory":
             keyword = str(args.get("keyword") or args.get("text") or "")
             res = memory_store.get_store().forget(keyword)
+            _set_memory_candidates(res.get("entries") if res.get("ambiguous") else [])
             say = res["say"]
             _TL.action_ok = bool(res.get("ok"))
         elif action == "open_app":
@@ -3413,8 +3435,9 @@ def _agent_control_command(command: str):
 
 
 def _handle_command_inner(command, command_id):
-    global _LAST_MEMORY_CANDIDATES
     print(f"你: {command}")
+    if not memory_store.SELECT_RE.match(_tight(command)):
+        _clear_memory_candidates()
     if ON_HEAR is not None:
         try: ON_HEAR(command)
         except Exception: pass
@@ -3478,11 +3501,10 @@ def _handle_command_inner(command, command_id):
         return
 
     choose = memory_store.SELECT_RE.match(_tight(command))
-    if choose and _LAST_MEMORY_CANDIDATES:
-        index = int(choose.group(1)) - 1
-        if 0 <= index < len(_LAST_MEMORY_CANDIDATES):
-            res = memory_store.get_store().forget("", choose_id=_LAST_MEMORY_CANDIDATES[index]["id"])
-            _LAST_MEMORY_CANDIDATES = []
+    if choose:
+        choose_id = _take_memory_candidate(int(choose.group(1)) - 1)
+        if choose_id:
+            res = memory_store.get_store().forget("", choose_id=choose_id)
             speak(res["say"])
             if ui_bridge is not None:
                 ui_bridge.emit_state("IDLE")
@@ -3491,7 +3513,7 @@ def _handle_command_inner(command, command_id):
     forget_text = memory_store.parse_forget(command)
     if forget_text:
         res = memory_store.get_store().forget(forget_text)
-        _LAST_MEMORY_CANDIDATES = list(res.get("entries") or []) if res.get("ambiguous") else []
+        _set_memory_candidates(res.get("entries") if res.get("ambiguous") else [])
         speak(res["say"])
         if ui_bridge is not None:
             ui_bridge.emit_state("IDLE")
