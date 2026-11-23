@@ -227,6 +227,7 @@ MEMORY = JarvisMemory()
 AGENT_PLANNER_PROMPT = """你是桌面助手贾维斯的任务规划器。用户给你一个目标，你把它拆解成最少可行的动作步骤清单。
 只能用这些动作: chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, click_screen, remember, forget_memory。
 click_screen 只用于用户明确要求点击屏幕上某个按钮: args={"target":"按钮描述"}；它不是 open_app 的替代品，「点击进入微信」要点已打开界面上的按钮，不能用 open_app 重开软件。每条指令最多一步 click_screen，点完系统会核验播报，不许连续点。
+【留档认知】本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）；用户问「聊天记录保存了没有」时如实答有，直接返回一个 chat 步骤即可，不要当成文件或搜索任务。
 写文件用 write_file: args={"name": "文件名.md或.txt或.docx", "content": "完整正文", "folder": "目标目录，可省略"}。content 必须是可以直接交付的成稿：用 Markdown 组织结构，写满真实内容，严禁留占位符、空条目、"（概述…）"这类待填空。
 folder 只能填四类：工作区、桌面、文档、下载，可带子目录（如 "下载\\报告"）。用户没说存哪就省略 folder，默认写进工作区。用户要求存到别处（如 D 盘某个目录）时，folder 填那个完整路径原样，别改写。
 各动作的参数必须齐全，缺参数的一律不要写进计划：
@@ -1896,6 +1897,10 @@ def _parse_rules(text, peek_followup=False):
     t = text.strip().lower().replace(" ", "")
     raw = text.strip()
 
+    # 留档认知: 问聊天记录有没有保存, 直接照实答有, 不触发任何操作
+    if _is_archive_question(raw):
+        return {"action": "chat", "say": _ARCHIVE_ANSWER}
+
     # 时间日期
     if any(w in t for w in ["几点", "现在时间", "今天几号", "今天星期几"]):
         now = datetime.datetime.now()
@@ -2068,14 +2073,14 @@ def _parse_rules(text, peek_followup=False):
             return {"action": "press_key", "args": {"key": key}, "say": "好的"}
 
     # 看屏点击: 只有本句明确"点击/点一下/点开/按一下 + 目标"才走这里。
-    # "点击进入微信"是点已打开界面上的按钮, 不是 open_app。
-    m_click = _CLICK_INTENT_RE.search(raw)
-    if m_click:
-        target = m_click.group(1).strip().rstrip("。！？!?，,、；; ")
-        target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
+    # "点击进入微信"是点已打开界面上的按钮, 不是 open_app; 否定句只回话不动手。
+    click_target, click_state = _click_intent(raw)
+    if click_state == "negated":
+        return {"action": "chat", "say": "好，不点"}
+    if click_state == "command":
         key_names = set(key_map) | set(key_map.values()) | {"确认", "取消", "开始", "返回"}
-        if target and target.lower() not in key_names:
-            return {"action": "click_screen", "args": {"target": target},
+        if click_target.lower() not in key_names:
+            return {"action": "click_screen", "args": {"target": click_target},
                     "say": "我看看屏幕上那个按钮"}
 
     # 鼠标点击 (没有目标: 就在当前光标位置点一下)
@@ -2231,10 +2236,48 @@ _PEEK_SURFACE_WORDS = ("屏幕", "屏上", "界面", "窗口", "页面")
 _PEEK_VIEW_WORDS = ("看", "显示", "是什么", "有什么", "什么意思", "什么", "识别", "写", "读", "展示")
 _PEEK_FOLLOW_DEICTIC = ("这段", "这个", "上面", "这行")
 _PEEK_FOLLOW_CONTENT = ("代码", "文字", "报错", "按钮", "图", "内容")
-_SCREENSHOT_PEEK_WORDS = ("截图看一下", "截个图看看", "截图看看", "截图看下", "截个图看一下")
+_SCREENSHOT_PEEK_WORDS = ("截图看一下", "截个图看看", "截图看看", "截图看下", "截个图看一下",
+                         "截屏看看", "截屏看一下", "截屏看下", "截个屏看看", "截个屏看一下")
 _PEEK_FOLLOW_TTL = 120.0
 _PEEK_FOLLOW = {"armed": False, "ts": 0.0}
-_CLICK_INTENT_RE = re.compile(r"(?:点击|点一下|点开|按一下)\s*(.+)", re.S)
+# 点击意图: 必须说出"点击/点一下/点开/按一下 + 目标"的明确命令。
+# 否定("不要点/别点")、引用/假设("我说点击发送会怎样"、"如果点了删除会")、
+# 疑问句都不能触发; 规则层和执行前复查共用同一个解析器, 不留纯子串后门。
+_CLICK_COMMAND_RE = re.compile(r"(?:点击|点一下|点开|按一下)\s*(.+)", re.S)
+_CLICK_NEG_TAIL_RE = re.compile(
+    r"(?:不要|不用|不必|不许|不准|不需要|无需|别|甭|先别|暂别|没|不)"
+    r"(?:给我|帮我|再|去|要|用|把|着)?$"
+)
+_CLICK_NONCOMMAND_WORDS = (
+    "如果", "假如", "假设", "要是", "万一", "我说", "你说", "他说", "听说", "说道", "说过",
+    "指的是", "意思是", "这个词", "这几个字", "这句话", "引号", "引用", "会怎样", "会怎么样",
+    "会如何", "会有什么", "什么后果", "什么效果", "什么反应", "会发生", "是不是", "能不能",
+    "可不可以", "会不会", "吗", "呢", "？", "?",
+)
+_CLICK_TARGET_NONCOMMAND_RE = re.compile(r"^(?:会|的话|之后|以后|了|了会|能|可以|将会|可能会)")
+
+
+def _click_intent(text):
+    """返回 (target, state)。state: command 明确命令 / negated 明确否定 / unclear 不确定。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return "", "unclear"
+    low = _tight(raw)
+    if any(w in low for w in _CLICK_NONCOMMAND_WORDS):
+        return "", "unclear"
+    m = _CLICK_COMMAND_RE.search(raw)
+    if not m:
+        return "", "unclear"
+    prefix = _tight(raw[:m.start()])
+    if _CLICK_NEG_TAIL_RE.search(prefix) or _NEG_RE.search(prefix):
+        return "", "negated"
+    target = m.group(1).strip().rstrip("。！？!?，,、；; ")
+    target = re.sub(r"^(?:那个|这个|帮我|给我)", "", target).strip()
+    if not target or _CLICK_TARGET_NONCOMMAND_RE.match(target):
+        return "", "unclear"
+    return target, "command"
+
+
 _SELF_EXIT_WORDS = ("退下", "关闭自己", "关掉自己", "退出自己", "你可以退出了", "没你的事了可以退",
                     "你退出吧", "你先退下", "你退下吧", "先退下", "关闭贾维斯", "退出贾维斯",
                     "你休息吧", "你歇着吧", "你可以下班了")
@@ -2392,8 +2435,19 @@ _VISION_TRIM_CHARS = "。！？!?，,、.；;：:“”\"'‘’（）()【】[]
 # 看屏点击: 一次指令只点一下; 点完必须再拍一张核实, 绝不接着自作主张点第二下。
 _CLICK_DANGEROUS_WORDS = ("支付", "付款", "删除", "发送", "关机", "确认订单", "转账")
 _CLICK_VERIFY_DELAY = 0.6
-_CLICK_VERIFY_Q = "我刚点了「{target}」。目标还在不在？界面现在进到哪一步了？只据实说，不要猜。"
+_CLICK_VERIFY_Q = "我刚点了「{target}」。目标界面或状态已经达成了吗？只答：已完成/未完成/无法判断，不要解释。"
+_CLICK_DONE = "已完成"
+_CLICK_NOT_DONE = "未完成"
+_CLICK_UNREADABLE = "无法判断"
+_CLICK_UNCONFIRMED = "点击已执行，结果未能确认，Sir。"
 _CLICK_NOT_FOUND = "没找到那个按钮，Sir。"
+# 点击前从定位框裁剪图里逐字读出按钮实际文字: 不拿用户 target 当按钮原文。
+_CLICK_LABEL_Q = "图中只有一个按钮或可点击元素。请逐字读出它上面显示的文字，原文照抄；不要翻译、不要解释、不要补字。看不清或没有文字就答：看不清"
+_CLICK_LABEL_PREFIXES = ("按钮上写着", "按钮上写的是", "按钮上的文字是", "按钮文字是", "按钮文字：",
+                         "按钮上显示", "按钮上显示的是", "上面写着", "上面写的是", "写的是",
+                         "显示的是", "文字是", "文字：", "答案是", "答案：", "按钮：", "文字为")
+_CLICK_LABEL_MAX = 30
+_CLICK_VERDICT_PREFIX_RE = re.compile(r"^(?:结论|裁决|判断|结果)?[:：]?")
 
 
 def _foreground_window_info():
@@ -2528,12 +2582,58 @@ def _screen_jpeg_b64(long_edge=None, quality=None):
 
 
 def _click_dangerous_word(text):
-    """目标描述/定位输出里有没有危险词; 返回命中的词或空串。"""
+    """目标描述/定位输出/按钮实际文字里有没有危险词; 返回命中的词或空串。"""
     low = str(text or "").lower()
     for word in _CLICK_DANGEROUS_WORDS:
         if word in low:
             return word
     return ""
+
+
+def _parse_click_label(answer):
+    """视觉读按钮原文: 严格解析, 看不清/含糊/整段解释都不当作按钮文字。"""
+    text = re.sub(r"\s+", "", str(answer or "")).strip(_VISION_TRIM_CHARS)
+    if not text:
+        return ""
+    if any(word in text for word in _VISION_UNCERTAIN_WORDS):
+        return ""
+    if any(word in text for word in ("看不清", "没有文字", "无文字", "空白", "无字", "读不出")):
+        return ""
+    for prefix in _CLICK_LABEL_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    text = text.strip(_VISION_TRIM_CHARS)
+    if not text or len(text) > _CLICK_LABEL_MAX:
+        return ""
+    return text
+
+
+def _click_label_matches_target(label, target):
+    """读出的按钮原文与用户目标是否对得上; 只认去口语后的包含关系, 不猜。"""
+    actual = _tight(label)
+    wanted = _tight(target)
+    if not actual or not wanted:
+        return False
+    if actual in wanted or wanted in actual:
+        return True
+    core = re.sub(r"(按钮|按键|图标|这个|那个|帮我|给我|一下|点击|点开|按一下|点一下|屏幕上)", "", wanted)
+    return bool(core) and (core in actual or actual in core)
+
+
+def _parse_click_verdict(answer):
+    """点后核验三选一: 已完成/未完成/无法判断, 严格解析不拿裸子串猜成功。"""
+    text = re.sub(r"\s+", "", str(answer or "")).strip(_VISION_TRIM_CHARS)
+    if not text:
+        return _CLICK_UNREADABLE
+    if any(word in text for word in _VISION_UNCERTAIN_WORDS):
+        return _CLICK_UNREADABLE
+    text = _CLICK_VERDICT_PREFIX_RE.sub("", text)
+    if text.startswith(_CLICK_NOT_DONE):
+        return _CLICK_NOT_DONE
+    if text.startswith(_CLICK_DONE):
+        return _CLICK_DONE
+    return _CLICK_UNREADABLE
 
 
 def _clamp_click_point(x, y, width, height):
@@ -2740,15 +2840,6 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
             print("[看屏点击] 敏感画面跳过", flush=True)
             return "当前窗口可能含敏感内容，这次点击跳过，Sir。"
 
-    # ② 危险目标: 复用现有 guard 的二次确认, 没点头就不动手。
-    word = _click_dangerous_word(target)
-    if word and not confirmed:
-        desc = f"点击可能含敏感操作的按钮：{target[:60]}（命中「{word}」）"
-        if not _guard_confirm(desc, source=source):
-            print(f"[看屏点击] 危险目标未确认, 不点: {word}", flush=True)
-            return "好，那就不点了，Sir。"
-        confirmed = True
-
     try:
         from llm_brain import query_vision, query_vision_locate
     except Exception as exc:
@@ -2756,24 +2847,48 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
         return _CLICK_NOT_FOUND
 
     try:
-        # ③ 截图只在内存里; 定位失败/坐标不合法一律不点, 绝不猜坐标。
+        # ② 截图只在内存里; 定位失败/坐标不合法一律不点, 绝不猜坐标。
         img = _capture_screen_image()
         b64, size = _encode_jpeg_b64(img)
         located = str(query_vision_locate(target, b64, CONFIG) or "").strip()
         coords = _parse_locate_box(located)
         point = _click_point_from_box(coords, img.size[0], img.size[1])
-        if point is None:
+        box = _peek_crop_box(coords, img.size[0], img.size[1])
+        if point is None or box is None:
             print(f"[看屏点击] 定位失败/坐标无效, 不点: {located[:80]} (全屏={size})", flush=True)
             return _CLICK_NOT_FOUND
 
-        # ④ 定位输出可能自带按钮文字, 同样过危险词护栏。
-        word = _click_dangerous_word(located)
+        # ③ 裁出定位框, 用视觉逐字读出按钮实际文字; 不只看用户 target 文案。
+        try:
+            crop = img.crop(box)
+            try:
+                crop_b64, crop_size = _encode_jpeg_b64(crop, label="按钮框")
+                raw_label = str(query_vision(_CLICK_LABEL_Q, crop_b64, CONFIG) or "").strip()
+            finally:
+                crop.close()
+        except Exception as exc:
+            print(f"[看屏点击] 读按钮文字失败: {exc}", flush=True)
+            return "我没看清按钮上的文字，不敢乱点，Sir。"
+        label = _parse_click_label(raw_label)
+        print(f"[看屏点击] 框={box} → {crop_size} → 读出「{label or '看不清'}」", flush=True)
+        if not label:
+            print("[看屏点击] 按钮文字读不出, 拒绝点击", flush=True)
+            return "我没看清按钮上的文字，不敢乱点，Sir。"
+
+        # ④ 危险词以读出的实际按钮文字为准, 二次确认话术必须报出它。
+        word = (_click_dangerous_word(label) or _click_dangerous_word(target)
+                or _click_dangerous_word(located))
         if word and not confirmed:
-            desc = f"点击定位到的按钮：{target[:60]}（文字命中「{word}」）"
+            desc = f"按钮上实际写着「{label}」（命中危险词「{word}」），确定要点这个按钮吗？"
             if not _guard_confirm(desc, source=source):
-                print(f"[看屏点击] 定位文字危险且未确认, 不点: {word}", flush=True)
+                print(f"[看屏点击] 危险按钮未确认, 不点: {word}", flush=True)
                 return "好，那就不点了，Sir。"
             confirmed = True
+
+        # ⑤ 与用户目标核对: 对不上就拒绝点击, 如实报出实际文字。
+        if not _click_label_matches_target(label, target):
+            print(f"[看屏点击] 按钮文字与目标不符: 「{label}」≠「{target}」, 不点", flush=True)
+            return f"按钮上写的是「{label}」，和您说的「{target}」对不上，我没点，Sir。"
 
         x, y = point
         print(f"[看屏点击] {size} → 框中心=({x},{y}) (图像未落盘)", flush=True)
@@ -2784,13 +2899,16 @@ def _click_screen(target="", allow_confirm=True, sensitive_confirmed=False,
         after_b64, after_size = _encode_jpeg_b64(after)
         question = _CLICK_VERIFY_Q.format(target=target)
         answer = str(query_vision(question, after_b64, CONFIG) or "").strip()
-        print(f"[看屏点击] 点后 {after_size} → {len(answer)} 字", flush=True)
-        return answer or "我点了那个位置，但没看清界面到哪一步了，您看一眼？"
+        verdict = _parse_click_verdict(answer)
+        print(f"[看屏点击] 点后 {after_size} → 裁决={verdict}", flush=True)
+        if verdict == _CLICK_DONE:
+            return f"已点击「{target}」，界面确认已完成，Sir。"
+        return _CLICK_UNCONFIRMED
     except Exception as exc:
         print(f"[看屏点击失败] {exc}", flush=True)
         if not getattr(_TL, "click_ok", False):
             return _CLICK_NOT_FOUND
-        return f"我点了那个位置，但核验失败了：{exc}"
+        return _CLICK_UNCONFIRMED
 
 
 def _peek_answer_verdict(text):
@@ -2921,9 +3039,21 @@ def _agent_visual_verify(task, step, ok, text, tool_text):
 
 
 # 已知事实: 这类问句不用绕模型, 直接照实答
+_ARCHIVE_FACT = "本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）"
+_ARCHIVE_ANSWER = f"有，{_ARCHIVE_FACT}；聊天记录都留着，Sir"
 _FACT_ANSWERS = {
     "screenshot": lambda: f"截图都存在 {_screenshot_dir_text()} 里，Sir",
 }
+
+
+def _is_archive_question(text):
+    """「聊天记录保存了没有」这类问句: 问留档现状, 不是操作指令。"""
+    low = _tight(text)
+    if not any(w in low for w in ("聊天记录", "对话记录", "聊天历史")):
+        return False
+    if not any(w in low for w in ("保存", "留档", "存了", "留存")):
+        return False
+    return any(w in low for w in ("没有", "没", "吗", "呢", "？", "?", "是否"))
 
 
 def parse_command(text):
@@ -3562,12 +3692,16 @@ def execute_plan(plan, command_id=None, source=""):
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
 
-    # 看屏点击只认用户本句的明确点击意图, 不许模型把 open_app 换成点击蒙一个。
-    user_text = str(getattr(_TL, "user_text", "") or "")
-    if action == "click_screen" and user_text and not _CLICK_INTENT_RE.search(user_text):
-        print("[看屏点击] 原话没有明确点击意图, 拒绝执行", flush=True)
-        speak("您明确说要点哪里，我才会点屏幕上的按钮，Sir。")
-        return False
+    # 看屏点击只认用户本句的明确点击命令; 与规则层复用同一个解析器, 不确定就反问。
+    if action == "click_screen":
+        user_text = str(getattr(_TL, "user_text", "") or "")
+        ordered, state = _click_intent(user_text)
+        planned = _tight(args.get("target") or "")
+        mismatch = bool(planned) and not (planned in _tight(ordered) or _tight(ordered) in planned)
+        if state != "command" or not ordered or mismatch:
+            print("[看屏点击] 原话没有明确点击命令或目标对不上, 拒绝执行并反问", flush=True)
+            speak("您明确说要点哪个按钮，我才会在屏幕上点，Sir；要我点哪一个？")
+            return False
 
     # 危险动作必须先在调用线程取得确认，后台线程绝不绕过安全护栏。
     if plan.get("danger"):
