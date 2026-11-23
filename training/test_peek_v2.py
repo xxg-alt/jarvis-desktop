@@ -7,6 +7,7 @@ query_vision_locate / 前台窗口探测 / speak / 任务落盘 全部打桩。
 import base64
 import io
 import sys
+import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -24,6 +25,7 @@ REAL = {
     "qv": llm_brain.query_vision,
     "locate": llm_brain.query_vision_locate,
     "fg": jarvis._foreground_window_info,
+    "identity": jarvis._foreground_window_identity,
     "speak": jarvis.speak,
     "perform": jarvis._perform_plan,
     "persist": jarvis._agent_persist,
@@ -59,7 +61,7 @@ def main():
     reset_confirm()
     pyautogui.screenshot = fake_screen
     jarvis._foreground_window_info = lambda: ("", "")
-    jarvis.speak = lambda text: None
+    jarvis.speak = lambda text: seen["spoken"].append(text)
     jarvis._agent_persist = lambda task: None
     jarvis._agent_notify = lambda text, spoken=False: None
     seen = {"qv": [], "loc": [], "spoken": []}
@@ -123,6 +125,21 @@ def main():
     if not ok:
         fails.append(("两段式/整体性", ans, len(seen["qv"])))
 
+    # 1c-2. F4: 面积阈值校验外扩+夹紧后的最终框，不是原始定位框
+    huge = jarvis._peek_crop_box({"x_min": 50, "y_min": 60, "x_max": 950, "y_max": 940},
+                                 1000, 600)
+    ok = huge is None
+    print(f"{'PASS' if ok else 'FAIL'}  F4 外扩后接近整屏的最终框放弃第二遍 → {huge}")
+    if not ok:
+        fails.append(("F4/最终框过大", huge))
+
+    small = jarvis._peek_crop_box({"x_min": 500, "y_min": 485, "x_max": 515, "y_max": 515},
+                                  2000, 1200)
+    ok = small == (994, 574, 1036, 626)
+    print(f"{'PASS' if ok else 'FAIL'}  F4 原始框偏小但外扩后达标则保留 → {small}")
+    if not ok:
+        fails.append(("F4/最终框达标", small))
+
     # 1d. 整体性问题不触发; 但第一遍说看不清就触发
     install_qv("第一遍: 一个桌面", "第二遍: 看出来了")
     seen["loc"] = []
@@ -165,6 +182,35 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  视觉核实 {answer} → ok={got_ok} 来源={vv.get('source')}")
         if not ok:
             fails.append(("视觉核实/" + answer, got_ok, vv, tool))
+
+    # 2a-2. F2: 去空白/首尾标点后严格解析；不确定措辞优先；只认前缀
+    verdict_cases = (
+        ("已出现", "已出现"), ("  未出现。 ", "未出现"), ("已出现了！", "已出现"),
+        ("已出现.", "已出现"),
+        ("结论：已出现", "看不清"), ("可能已出现", "看不清"),
+        ("已出现但不确定", "看不清"), ("没看清，似乎已出现", "看不清"),
+        ("已出现，未出现", "已出现"), ("未出现，已出现", "未出现"),
+        ("完全不知道", "看不清"), ("", "看不清"),
+    )
+    for answer, want in verdict_cases:
+        got = jarvis._parse_vision_verdict(answer)
+        ok = got == want
+        print(f"{'PASS' if ok else 'FAIL'}  F2 裁决 {answer!r} → {got} (期望 {want})")
+        if not ok:
+            fails.append(("F2/裁决", answer, got, want))
+
+    (got_ok, _text, tool), st, _task = verify(answer="可能已出现")
+    ok = (got_ok is False and (st.get("vision_verify") or {}).get("conclusion") == "看不清"
+          and "视觉核实=看不清" in tool)
+    print(f"{'PASS' if ok else 'FAIL'}  F2 不确定答复不走'已出现'分支 → ok={got_ok}")
+    if not ok:
+        fails.append(("F2/集成不确定", got_ok, st.get("vision_verify"), tool))
+
+    (got_ok, _text, tool), st, _task = verify(answer=" 未出现。")
+    ok = got_ok is False and (st.get("vision_verify") or {}).get("conclusion") == "未出现"
+    print(f"{'PASS' if ok else 'FAIL'}  F2 去空白/首尾标点后按前缀裁决 → ok={got_ok}")
+    if not ok:
+        fails.append(("F2/集成前缀", got_ok, st.get("vision_verify"), tool))
 
     # 2b. 调用失败 → 保持未核实
     (got_ok, _text, tool), st, _task = verify(fail=True)
@@ -212,32 +258,109 @@ def main():
         fails.append(("视觉核实/危险步", got_ok, len(seen["qv"]), tool))
 
     # ═══ 三、敏感画面护栏 ═══
-    # 3a. 用户 peek 命中 → 不发图, 先朗读提示
+    # 3a. 用户 peek 命中 → 不发图, 先朗读提示, 记下窗口身份
     reset_confirm()
     install_qv("不该被调用")
+    seen["spoken"] = []
     jarvis._foreground_window_info = lambda: ("微信 - 登录", "WeChat.exe")
+    jarvis._foreground_window_identity = lambda: ("hwnd-a", "微信 - 登录")
     ans = jarvis._peek_screen("屏幕上写了什么")
     ok = (ans == jarvis._SENSITIVE_PROMPT and not seen["qv"]
-          and jarvis._PEEK_CONFIRM["pending"] and jarvis._PEEK_CONFIRM["question"] == "屏幕上写了什么")
-    print(f"{'PASS' if ok else 'FAIL'}  敏感标题命中 → 不发图, 待确认 → {ans!r}")
+          and jarvis._PEEK_CONFIRM["pending"]
+          and jarvis._PEEK_CONFIRM["question"] == "屏幕上写了什么"
+          and jarvis._PEEK_CONFIRM["window"] == ("hwnd-a", "微信 - 登录"))
+    print(f"{'PASS' if ok else 'FAIL'}  敏感标题命中 → 不发图, 待确认并记下窗口 → {ans!r}")
     if not ok:
-        fails.append(("敏感/peek提示", ans, len(seen["qv"])))
+        fails.append(("敏感/peek提示", ans, jarvis._PEEK_CONFIRM["window"]))
 
-    # 3b. 用户肯定后才发图; 否定/无关取消
-    jarvis._peek_confirm_answer("确定")
-    ok = len(seen["qv"]) == 1 and not jarvis._PEEK_CONFIRM["pending"]
-    print(f"{'PASS' if ok else 'FAIL'}  用户肯定后发图 → qv={len(seen['qv'])}")
+    # 3b. F1: 肯定后复检仍敏感 → 不发图, 重走正常检查 (再次提示)
+    rc = jarvis._peek_confirm_answer("确定")
+    ok = (rc is True and not seen["qv"] and jarvis._PEEK_CONFIRM["pending"]
+          and jarvis._PEEK_CONFIRM["window"] == ("hwnd-a", "微信 - 登录"))
+    print(f"{'PASS' if ok else 'FAIL'}  F1 复检仍敏感 → 不发图, 重走检查 → qv={len(seen['qv'])}")
     if not ok:
-        fails.append(("敏感/肯定", len(seen["qv"])))
+        fails.append(("F1/复检敏感", rc, len(seen["qv"])))
+
+    # 3c. F1: 肯定后前台窗口换了 (hwnd/标题都变) → 不发图, 重新提示并绑定新窗口
+    jarvis._foreground_window_identity = lambda: ("hwnd-b", "支付页面 - 银行")
+    jarvis._foreground_window_info = lambda: ("支付页面 - 银行", "chrome.exe")
+    rc = jarvis._peek_confirm_answer("确定")
+    ok = (rc is True and not seen["qv"] and jarvis._PEEK_CONFIRM["pending"]
+          and jarvis._PEEK_CONFIRM["window"] == ("hwnd-b", "支付页面 - 银行"))
+    print(f"{'PASS' if ok else 'FAIL'}  F1 确认后换窗口 → 不发图, 按新窗口重走检查 → qv={len(seen['qv'])}")
+    if not ok:
+        fails.append(("F1/窗口切换", rc, len(seen["qv"]), jarvis._PEEK_CONFIRM["window"]))
+
+    # 3d. F1: 同一窗口复检不再敏感 → 才允许发图
+    jarvis._foreground_window_identity = lambda: ("hwnd-a", "微信 - 登录")
+    jarvis._foreground_window_info = lambda: ("支付页面 - 银行", "chrome.exe")
+    reset_confirm()
+    install_qv("确认后答案")
+    ans = jarvis._peek_screen("现在是什么")
+    jarvis._foreground_window_info = lambda: ("普通页面", "notepad.exe")
+    seen["spoken"] = []
+    rc = jarvis._peek_confirm_answer("确定")
+    ok = (ans == jarvis._SENSITIVE_PROMPT and rc is True and len(seen["qv"]) == 1
+          and not jarvis._PEEK_CONFIRM["pending"])
+    print(f"{'PASS' if ok else 'FAIL'}  F1 同窗口复检不敏感 → 发图 → qv={len(seen['qv'])}")
+    if not ok:
+        fails.append(("F1/同窗口放行", rc, len(seen["qv"])))
+
+    # 3e. F3: 只消费整句肯定/否定 (或 ≤4 字的纯确认短语)
+    verdict_cases = (
+        ("确定", "yes"), ("确定。！", "yes"), ("确定.", "yes"), ("嗯", "yes"), ("嗯嗯", "yes"),
+        ("好的嗯", "yes"), ("确定确定", "yes"), ("确定确定哦", None),
+        ("嗯打开浏览器", None), ("打开浏览器", None), ("不用", "no"),
+        ("no", "no"), ("不", "no"), ("好不", None), ("", None),
+    )
+    for answer, want in verdict_cases:
+        got = jarvis._peek_answer_verdict(answer)
+        ok = got == want
+        print(f"{'PASS' if ok else 'FAIL'}  F3 答复 {answer!r} → {got} (期望 {want})")
+        if not ok:
+            fails.append(("F3/答复判定", answer, got, want))
+
+    jarvis._foreground_window_info = lambda: ("微信 - 登录", "WeChat.exe")
+    reset_confirm()
+    install_qv("不该被调用")
+    seen["spoken"] = []
+    ans = jarvis._peek_screen("屏幕上写了什么")
+    rc = jarvis._peek_confirm_answer("嗯打开浏览器")
+    ok = (ans == jarvis._SENSITIVE_PROMPT and rc is False and not seen["qv"]
+          and not seen["spoken"] and not jarvis._PEEK_CONFIRM["pending"])
+    print(f"{'PASS' if ok else 'FAIL'}  F3 非明确答复 → 清状态、返回 False、不吞指令 → rc={rc}")
+    if not ok:
+        fails.append(("F3/前缀指令", rc, len(seen["qv"]), seen["spoken"]))
 
     ans = jarvis._peek_screen("屏幕上写了什么")
-    jarvis._peek_confirm_answer("不用了")
-    ok = ans == jarvis._SENSITIVE_PROMPT and len(seen["qv"]) == 1 and not jarvis._PEEK_CONFIRM["pending"]
-    print(f"{'PASS' if ok else 'FAIL'}  用户否定 → 取消看屏 → qv={len(seen['qv'])}")
+    seen["spoken"] = []
+    rc = jarvis._peek_confirm_answer("不用")
+    ok = (rc is True and not seen["qv"] and not jarvis._PEEK_CONFIRM["pending"]
+          and seen["spoken"] == ["好，那就不看屏了，Sir"])
+    print(f"{'PASS' if ok else 'FAIL'}  F3 明确否定 → 取消看屏 → spoken={seen['spoken']}")
     if not ok:
-        fails.append(("敏感/否定", len(seen["qv"])))
+        fails.append(("F3/明确否定", rc, seen["spoken"]))
 
-    # 3c. 自动核实命中 → 跳过且保持未核实
+    ans = jarvis._peek_screen("屏幕上写了什么")
+    seen["spoken"] = []
+    rc = jarvis._peek_confirm_answer("不用了")
+    ok = (rc is False and not seen["qv"] and not seen["spoken"]
+          and not jarvis._PEEK_CONFIRM["pending"])
+    print(f"{'PASS' if ok else 'FAIL'}  F3 非整句否定 → 不消费 → rc={rc}")
+    if not ok:
+        fails.append(("F3/非整句否定", rc, seen["spoken"]))
+
+    jarvis._peek_screen("屏幕上写了什么")
+    with jarvis._PEEK_CONFIRM_LOCK:
+        jarvis._PEEK_CONFIRM["ts"] = time.time() - jarvis._PEEK_CONFIRM_TTL - 1
+    rc = jarvis._peek_confirm_answer("确定")
+    ok = rc is False and not jarvis._PEEK_CONFIRM["pending"] and not seen["qv"]
+    print(f"{'PASS' if ok else 'FAIL'}  F3 超时确认不再消费 → rc={rc}")
+    if not ok:
+        fails.append(("F3/超时", rc, len(seen["qv"])))
+
+    # 3f. 自动核实命中 → 跳过且保持未核实
+    jarvis._foreground_window_identity = REAL["identity"]
     install_qv("已出现")
     (got_ok, _text, tool), st, _task = verify()
     vv = st.get("vision_verify") or {}
@@ -253,7 +376,7 @@ def main():
         for f in fails:
             print("  ", f)
         return 1
-    print("PASS: 两段式看屏5项 / 视觉核实6项 / 敏感护栏3项, 截图与视觉调用全程打桩")
+    print("PASS: 两段式看屏/F1窗口绑定/F2严格裁决/F3明确答复/F4最终框面积 + 原有敏感护栏, 全程打桩")
     return 0
 
 
@@ -266,6 +389,7 @@ if __name__ == "__main__":
         llm_brain.query_vision = REAL["qv"]
         llm_brain.query_vision_locate = REAL["locate"]
         jarvis._foreground_window_info = REAL["fg"]
+        jarvis._foreground_window_identity = REAL["identity"]
         jarvis.speak = REAL["speak"]
         jarvis._perform_plan = REAL["perform"]
         jarvis._agent_persist = REAL["persist"]

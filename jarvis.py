@@ -2175,14 +2175,18 @@ _SENSITIVE_KEYWORDS = ("密码", "登录", "支付", "银行", "钱包", "验证
 _SENSITIVE_PROMPT = "当前窗口可能含敏感内容，确定要看吗？"
 _PEEK_CONFIRM_TTL = 60.0
 _PEEK_CONFIRM_LOCK = threading.Lock()
-_PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0}
+_PEEK_CONFIRM = {"pending": False, "question": "", "ts": 0.0, "window": ()}
 _PEEK_YES = ("确定", "要看", "继续", "可以", "好的", "行", "是", "对", "嗯", "yes", "y")
 _PEEK_NO = ("取消", "不要", "不看", "算了", "不用", "不", "no", "n")
-_PEEK_PUNCT = re.compile(r"[。！？!?，,.、\s]")
+_PEEK_PUNCT = re.compile(r"[。！？!?，,、\.；;：:“”\"‘’'（）()\[\]【】…·～~\s]")
 
 # 视觉核实: 每任务最多 2 次, 只读拍屏, 危险步/敏感画面直接跳过。
 _VISION_VERIFY_MAX = 2
 _VISION_VERIFY_Q = "屏幕上现在显示什么？预期效果是：{expect}。它出现了吗？只答：已出现/未出现/看不清"
+_VISION_UNCERTAIN_WORDS = ("看不清", "看不清楚", "不清", "不清楚", "没法", "无法", "没看清",
+                           "没看清楚", "不确定", "不明确", "不知道", "可能", "也许", "大概",
+                           "似乎", "好像", "辨认不清", "看不出来", "看不到", "难以")
+_VISION_TRIM_CHARS = "。！？!?，,、.；;：:“”\"'‘’（）()【】[]《》<>·—…~～"
 
 
 def _foreground_window_info():
@@ -2231,6 +2235,46 @@ def _sensitive_window_hit():
             print("[敏感护栏] 进程名命中敏感词, 不发图", flush=True)
             return True
     return False
+
+
+def _foreground_window_identity():
+    """前台窗口身份 (hwnd, 标题); 取不到 hwnd 时靠标题, 供确认前后比对。"""
+    title, _proc = _foreground_window_info()
+    hwnd = ""
+    if os.name == "nt":
+        try:
+            hwnd = str(ctypes.windll.user32.GetForegroundWindow() or "")
+        except Exception:
+            hwnd = ""
+    return hwnd, str(title or "")
+
+
+def _same_confirm_window(saved, current):
+    """确认时与复检时是不是同一个窗口: 两边都有 hwnd 就比 hwnd, 否则比标题。"""
+    def parts(value):
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            return str(value[0] or ""), str(value[1] or "")
+        return "", str(value or "")
+
+    saved_hwnd, saved_title = parts(saved)
+    current_hwnd, current_title = parts(current)
+    if saved_hwnd and current_hwnd:
+        return saved_hwnd == current_hwnd
+    return bool(saved_title) and saved_title == current_title
+
+
+def _parse_vision_verdict(answer):
+    """视觉核实裁决: 严格解析, 不拿裸子串猜结论。"""
+    text = re.sub(r"\s+", "", str(answer or "")).strip(_VISION_TRIM_CHARS)
+    if not text:
+        return "看不清"
+    if any(word in text for word in _VISION_UNCERTAIN_WORDS):
+        return "看不清"
+    if text.startswith("未出现"):
+        return "未出现"
+    if text.startswith("已出现"):
+        return "已出现"
+    return "看不清"
 
 
 def _capture_screen_image():
@@ -2327,15 +2371,15 @@ def _peek_crop_box(coords, width, height):
     t = vals["y_min"] / 1000.0 * oh
     r = vals["x_max"] / 1000.0 * ow
     b = vals["y_max"] / 1000.0 * oh
-    area_ratio = ((r - l) * (b - t)) / float(ow * oh)
-    if not (_PEEK_MIN_CROP_AREA <= area_ratio <= _PEEK_MAX_CROP_AREA):
-        return None
     import math
     pad_x, pad_y = (r - l) * _PEEK_CROP_PAD, (b - t) * _PEEK_CROP_PAD
     left, top = max(0, int(l - pad_x)), max(0, int(t - pad_y))
     right = min(ow, int(math.ceil(r + pad_x)))
     bottom = min(oh, int(math.ceil(b + pad_y)))
     if right - left < 24 or bottom - top < 24:
+        return None
+    area_ratio = ((right - left) * (bottom - top)) / float(ow * oh)
+    if not (_PEEK_MIN_CROP_AREA <= area_ratio <= _PEEK_MAX_CROP_AREA):
         return None
     return left, top, right, bottom
 
@@ -2365,20 +2409,35 @@ def _peek_second_pass(question, full_img, full_b64, first_answer):
             pass
 
 
-def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False) -> str:
-    """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。"""
+def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False, confirmed_window=None) -> str:
+    """看当前屏幕并回答用户的问题。日志只记元信息, 不记图像内容。
+
+    sensitive_confirmed 只代表用户点过头, 不能绕过发图前的窗口/敏感性复检:
+    确认绑定的窗口变了或复检仍敏感, 就退回正常检查流程 (该提示提示、该跳过跳过)。
+    """
     try:
         from llm_brain import query_vision
     except Exception as exc:
         return f"看屏功能没加载起来: {exc}"
-    if not sensitive_confirmed and _sensitive_window_hit():
-        if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
-            with _PEEK_CONFIRM_LOCK:
-                _PEEK_CONFIRM.update(pending=True, question=str(question or ""), ts=time.time())
-            print("[看屏] 敏感画面, 等用户确认", flush=True)
-            return _SENSITIVE_PROMPT
-        print("[看屏] 敏感画面跳过", flush=True)
-        return "当前窗口可能含敏感内容，这次看屏跳过，Sir。"
+    sensitive_now = None
+    if sensitive_confirmed:
+        saved = confirmed_window if confirmed_window is not None else _PEEK_CONFIRM.get("window")
+        sensitive_now = _sensitive_window_hit()
+        if not _same_confirm_window(saved, _foreground_window_identity()) or sensitive_now:
+            print("[看屏] 确认窗口已变或复检敏感, 重走检查流程", flush=True)
+            sensitive_confirmed = False
+    if not sensitive_confirmed:
+        if sensitive_now is None:
+            sensitive_now = _sensitive_window_hit()
+        if sensitive_now:
+            if allow_confirm and not bool(getattr(_TL, "agent_context", False)):
+                with _PEEK_CONFIRM_LOCK:
+                    _PEEK_CONFIRM.update(pending=True, question=str(question or ""),
+                                         ts=time.time(), window=_foreground_window_identity())
+                print("[看屏] 敏感画面, 等用户确认", flush=True)
+                return _SENSITIVE_PROMPT
+            print("[看屏] 敏感画面跳过", flush=True)
+            return "当前窗口可能含敏感内容，这次看屏跳过，Sir。"
     try:
         img = _capture_screen_image()
         b64, size = _encode_jpeg_b64(img)
@@ -2404,29 +2463,43 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False) -> 
 
 
 def _peek_answer_verdict(text):
-    """敏感看屏的下一句: 肯定/否定; 无关回答按取消处理。"""
+    """敏感看屏的下一句: 只认整句肯定/否定; 其它返回 None, 不当答复。"""
     low = _PEEK_PUNCT.sub("", str(text or "")).lower()
     if not low:
-        return "no"
-    for words in (_PEEK_NO, _PEEK_YES):
-        for w in words:
-            if low == w or (len(low) <= 6 and low.startswith(w)):
-                return "no" if words is _PEEK_NO else "yes"
-    return "no"
+        return None
+    for words, verdict in ((_PEEK_NO, "no"), (_PEEK_YES, "yes")):
+        if any(low == word for word in words):
+            return verdict
+    # 纯确认短语拼成且总长不超过 4 字 (如 嗯嗯 / 好的嗯 / 确定确定) 才算答复。
+    if len(low) <= 4:
+        for words, verdict in ((_PEEK_NO, "no"), (_PEEK_YES, "yes")):
+            rest = low
+            while rest:
+                hit = next((word for word in words if rest.startswith(word)), None)
+                if hit is None:
+                    break
+                rest = rest[len(hit):]
+            if not rest:
+                return verdict
+    return None
 
 
 def _peek_confirm_answer(text) -> bool:
-    """消费敏感看屏的确认回答: 肯定才发图, 否定/无关直接取消。"""
+    """消费敏感看屏确认: 只有明确答复才算消费; 其它清掉待确认并放行原指令。"""
     with _PEEK_CONFIRM_LOCK:
         if not _PEEK_CONFIRM.get("pending"):
             return False
         if time.time() - float(_PEEK_CONFIRM.get("ts") or 0) > _PEEK_CONFIRM_TTL:
-            _PEEK_CONFIRM.update(pending=False, question="", ts=0.0)
+            _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=())
             return False
         question = str(_PEEK_CONFIRM.get("question") or "")
-        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0)
-    if _peek_answer_verdict(text) == "yes":
-        speak(_peek_screen(question, sensitive_confirmed=True))
+        window = _PEEK_CONFIRM.get("window") or ()
+        _PEEK_CONFIRM.update(pending=False, question="", ts=0.0, window=())
+    verdict = _peek_answer_verdict(text)
+    if verdict is None:
+        return False
+    if verdict == "yes":
+        speak(_peek_screen(question, sensitive_confirmed=True, confirmed_window=window))
     else:
         speak("好，那就不看屏了，Sir")
     return True
@@ -2485,14 +2558,9 @@ def _agent_visual_verify(task, step, ok, text, tool_text):
     try:
         from llm_brain import query_vision
         b64, size = _screen_jpeg_b64()
-        answer = str(query_vision(question, b64, CONFIG) or "").replace(" ", "")
+        answer = str(query_vision(question, b64, CONFIG) or "")
         print(f"[视觉核实] {size} → {len(answer)} 字", flush=True)
-        if "未出现" in answer:
-            conclusion = "未出现"
-        elif "已出现" in answer:
-            conclusion = "已出现"
-        elif "看不清" in answer:
-            conclusion = "看不清"
+        conclusion = _parse_vision_verdict(answer)
     except Exception as exc:
         conclusion = "调用失败"
         print(f"[视觉核实] 调用失败: {exc}", flush=True)
