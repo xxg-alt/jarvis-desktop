@@ -141,7 +141,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 回答用中文，默认 1~3 句，口吻忠诚、专业、有管家气质；除非用户明确要求展开，不要长篇大论。
 
 只能输出纯 JSON (不要 markdown 代码块)，格式：
-{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir|peek_screen|remember|forget_memory", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
+{"action": "chat|open_app|open_file|open_url|web_search|screenshot|lock|volume|file_manage|write_file|inspect_system|run_powershell|ask_doc|set_screenshot_dir|peek_screen|click_screen|remember|forget_memory", "args": {}, "say": "给用户的中文回答", "status_say": "仅调用系统工具时填 5~12 字垫话"}
 
 动作规则：
 - 闲聊、提问、写代码、请教知识：action="chat"，say 填完整回答，不要 status_say。
@@ -154,6 +154,7 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 - 搜索：action="web_search"，args={"query": "搜索关键词"}。系统会真联网检索并把带出处的答案直接朗读给用户，所以 say 只写垫话（如“我查一下”），不要在 say 里自己编答案；需要实时信息（天气、价格、新闻、最新版本）的问题一律走 web_search，不要凭记忆回答。
 - 音量：action="volume"，args={"mode": "up|down|mute"}
 - 看屏幕内容（如"看看屏幕上这个是什么""屏幕上的报错什么意思""这个页面在干嘛"）：action="peek_screen"，args={"question": "把用户的问题原样带上"}。系统会截当前屏幕交给视觉模型，say 只写垫话（如"我看看屏幕"），绝不要在 say 里自己编屏幕上的内容；也不要用 screenshot 顶替（截图的图会存盘且不回答内容）。
+- 看屏点击按钮（只有用户本句明确说"点击/点一下/按一下/点开 + 目标"时才用）：action="click_screen"，args={"target": "要点的界面元素，如 进入微信按钮"}。click_screen 不是 open_app 的替代品：「点击进入微信」这类"点已打开界面上的按钮"必须走 click_screen，绝不能用 open_app 重开软件；没有明确点击意图就不要用。一条指令只点一下，点完系统会再截图核验并据实播报，不许连环点、不许点完自己再决定下一步。目标涉及支付/付款/删除/发送/关机/确认订单/转账时系统会先二次确认；定位不到就如实说没找到，不要猜坐标。
 - 截图：action="screenshot"；锁屏：action="lock"
 - 改设置/改默认存放位置（如"以后截图放到工作区""把截图存到桌面某个文件夹"）：action="set_screenshot_dir"，args={"dir": "工作区"}；dir 只能是 工作区/桌面/文档/下载（可带子目录）或完整路径。用户说得含糊（"另一个文件夹""别的地方"）就原样把他的话填进 dir，系统会去追问，**绝不要**用 write_file 编一份文档来应付这类请求。
 - 文件管理 action="file_manage"，只允许四种，且只能操作 桌面/下载/文档 三个目录，不能删除：
@@ -182,10 +183,15 @@ SYSTEM_PROMPT = """你是 Windows 桌面语音助手贾维斯 (JARVIS)，用户�
 你：{"action": "write_file", "args": {"name": "上周工作周报.md", "content": "# 上周工作周报\n\n## 一、完成事项\n（完整正文…）"}, "say": "这就为您写好周报，先生", "status_say": "正在撰写文档"}
 用户：这句话是什么意思
 你：{"action": "chat", "args": {}, "say": "先生，您指的是哪句话？把原句说给我，我为您解释"}
+用户：点击进入微信
+你：{"action": "click_screen", "args": {"target": "进入微信按钮"}, "say": "我看看屏幕上那个按钮"}
+用户：截图看一下
+你：{"action": "peek_screen", "args": {"question": "截图看一下"}, "say": "我看看屏幕"}
 
 【用户档案】用户叫 ljj，是大学生，喜欢简短直接、先说结论的回答，讨厌长篇大论、重复确认已知信息和客服腔。闲聊默认 1~2 句说清，只有他明确说“详细讲讲”才展开。称呼用户用记忆中的称呼（默认先生），不要用 Sir/主人。
 【语音纠错】输入来自语音识别，常有同音字和错字（如“记事版”其实是记事本、“威信”是微信、“截个图”是截图）。先按最合理的真实意图理解再行动，不要因为字面奇怪就说做不了；只有两种解释都成立且后果明显不同时，才在 say 里反问一句。
 【诚实原则】不知道就直说不知道，并给一个下一步建议，绝不编造软件名、文件名、数字或“已经完成”。status_say 只是“正在做”的垫话，say 里不许把还没执行完的事说成已完成。
+【留档认知】本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）；用户问「聊天记录保存了没有」时如实答有。
 【回答质量】action="chat" 时先给答案本身，不要复述问题、不要以“作为AI”开头、不要输出思考过程。涉及数字和常识要给准数，不要含糊其辞。
 补充示例：
 用户：太吵了，小声一点
@@ -646,6 +652,14 @@ def sanitize_plan(plan: dict) -> dict:
         return {"action": "peek_screen", "args": {"question": question},
                 "say": say or "我看看屏幕", "danger": False}
 
+    if action == "click_screen":
+        target = _safe_text(args.get("target"), 120)
+        if not target:
+            return {"action": "chat", "say": "请告诉我具体要点界面上的哪个按钮，先生",
+                    "danger": False}
+        return {"action": "click_screen", "args": {"target": target},
+                "say": say or "我看看屏幕上那个按钮", "danger": False}
+
     if action in ("screenshot", "lock"):
         return {"action": action, "args": {}, "say": say, "danger": False}
 
@@ -1035,7 +1049,7 @@ _REPAIR_STEP_SYSTEM = (
     "只输出一个完整 JSON 对象：{\"action\": \"动作名\", \"args\": {...}, \"say\": \"给用户的中文说明\"}。\n"
     "动作只能用现有白名单：chat/open_app/open_file/open_url/web_search/file_manage/write_file/"
     "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart/"
-    "peek_screen/remember/forget_memory。\n"
+    "peek_screen/click_screen/remember/forget_memory。\n"
     "参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
     "不要一次给出多步；确实改不动就返回 action=chat 并在 say 里说明原因。"
 )
@@ -1095,7 +1109,8 @@ CHAT_SYSTEM_PROMPT = (
     "3. 称呼用户用记忆中的称呼 (默认先生), 不要用 Sir/主人;\n"
     "4. 诚实: 不懂就说不懂, 不编造事实和数据; 实时信息 (天气、价格、新闻) 你手边没有, 直说要用搜索指令去查;\n"
     "5. 用户要是其实想让你操作电脑 (开软件、找文件、关机之类), 别假装做了, 提醒他换成一句指令你就能办;\n"
-    "6. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话。"
+    "6. 不输出 JSON、不列动作清单、不说「作为 AI 语言模型」这类套话;\n"
+    "7. 留档认知: 本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）；用户问「聊天记录保存了没有」时如实答有。"
 )
 
 _CHAT_SESSION = []          # 自由对话历史 [{role, content}...], 与规划窗口分开

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """真实语料路由考卷: 全打桩, 不联网/不启动进程/不碰真实记忆文件。"""
+import os
 import sys
 import tempfile
 import time
@@ -9,8 +10,11 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
 import jarvis  # noqa: E402
+import jarvis_memory  # noqa: E402
 import llm_brain  # noqa: E402
 import memory_store  # noqa: E402
+
+ARCHIVE_FACT = "本软件会自动把每轮对话留档到本地日志（jsonl + 每日 md，路径与密钥已脱敏）"
 
 DOUBLE_JSON_2059 = (
     '{"action": "chat", "args": {}, "say": "先生，合肥今天天气不错"}'
@@ -104,6 +108,42 @@ with tempfile.TemporaryDirectory() as tmp:
             check(bool(plans) and (plans[-1] or {}).get("action") == "peek_screen",
                   f"路由级看屏直达: {text}")
 
+        for text in ["对你来说应该很清楚吧", "哇﹐靠手指也尽管三个意识性"]:
+            jarvis._PEEK_FOLLOW["armed"] = False
+            plan = jarvis.parse_command(text)
+            check(not plan or plan.get("action") != "peek_screen", f"无可识别意图词不 peek: {text}")
+            run(text)
+            check(not any((p or {}).get("action") == "peek_screen" for p in plans),
+                  f"路由级无可识别意图词不 peek: {text}")
+
+        jarvis._PEEK_FOLLOW["armed"] = False
+        check((jarvis.parse_command("看得到我屏幕中的支撑代码") or {}).get("action") == "peek_screen",
+              "屏幕+看明确指向屏幕 → peek")
+        check((jarvis.parse_command("其实这段代码不需要你帮我堵出来，你带我看一下有没有什么问题")
+               or {}).get("action") == "peek_screen", "紧接 peek 的「这段+代码」指代句 → peek")
+        jarvis._PEEK_FOLLOW["armed"] = False
+        check((jarvis.parse_command("其实这段代码不需要你帮我堵出来，你带我看一下有没有什么问题")
+               or {}).get("action") != "peek_screen", "无上文 peek 时同一句不 peek")
+
+        for text in ["截图看一下", "截个图看看", "截图看看里面是什么", "你能不能截图看一下",
+                     "截屏看看", "截屏看一下", "截屏看下", "截个屏看看", "你能不能截屏看一下"]:
+            plan = jarvis.parse_command(text)
+            check((plan or {}).get("action") == "peek_screen", f"截图/截屏看一说直达 peek: {text}")
+            run(text)
+            check(bool(plans) and (plans[-1] or {}).get("action") == "peek_screen",
+                  f"路由级截图/截屏看一直达 peek: {text}")
+        for text in ["截图", "截屏", "截个图"]:
+            check((jarvis.parse_command(text) or {}).get("action") == "screenshot",
+                  f"单纯「{text}」仍是存档截图动作")
+
+        for text in ["不要点那个按钮", "别点那个按钮", "我说点击发送会怎样", "如果点了删除会",
+                     "如果点了删除会怎样", "如果点击删除会怎样", "「点击发送」这四个字是什么意思"]:
+            plan = jarvis.parse_command(text)
+            check((plan or {}).get("action") != "click_screen", f"非明确点击命令不触发 click_screen: {text}")
+            run(text)
+            check(not any((p or {}).get("action") == "click_screen" for p in plans),
+                  f"路由级非明确点击命令不触发 click_screen: {text}")
+
         corrected = jarvis.correct_asr_text("景德真的天气怎么样")
         check(corrected == "景德镇的天气怎么样", "景德真 → 景德镇 (天气语境)")
         check(jarvis.parse_command(corrected)["action"] == "web_search" and
@@ -162,6 +202,40 @@ with tempfile.TemporaryDirectory() as tmp:
               "先生，随时听候您的差遣。", "句首称呼形态 Sir 仍替换")
         check(jarvis.sanitize_speak_text("好的。Sir，请讲") ==
               "好的。先生，请讲", "中文标点相邻的 Sir 仍替换")
+
+        fact = jarvis._FACT_ANSWERS["screenshot"]()
+        check("Sir" in fact, "截图路径原话保留 Sir, 靠出口清洗而不是改字面")
+        cleaned_fact = jarvis.sanitize_speak_text(fact)
+        check("先生" in cleaned_fact and "Sir" not in cleaned_fact,
+              "截图路径话术经 sanitize_speak_text 变「先生」")
+        seen_notify = []
+        saved_on_speak = jarvis.ON_SPEAK
+        jarvis.ON_SPEAK = seen_notify.append
+        try:
+            jarvis._notify_speak(fact)
+        finally:
+            jarvis.ON_SPEAK = saved_on_speak
+        check(len(seen_notify) == 1 and "Sir" not in seen_notify[0]
+              and "先生" in seen_notify[0], "_notify_speak 出口 Sir → 先生")
+        saved_chatlog_dir = os.environ.get("JARVIS_CHATLOG_DIR")
+        os.environ["JARVIS_CHATLOG_DIR"] = str(Path(tmp) / "sir_logs")
+        try:
+            log_mem = jarvis_memory.JarvisMemory(Path(tmp) / "sir_memory.json")
+            log_mem.record_turn("截图放哪", {"action": "chat", "args": {}, "say": fact},
+                                source="test")
+            stored_replies = [item for item in log_mem.data["conversations"]
+                              if item.get("role") == "assistant"]
+            check(len(stored_replies) == 1 and "Sir" not in stored_replies[0]["text"]
+                  and "先生" in stored_replies[0]["text"], "chat 回复落盘前 Sir → 先生")
+            log_files = list((Path(tmp) / "sir_logs").glob("*.jsonl"))
+            log_text = log_files[0].read_text(encoding="utf-8") if log_files else ""
+            check(bool(log_files) and "Sir" not in log_text and "先生" in log_text,
+                  "对话留档 jsonl 里 Sir → 先生")
+        finally:
+            if saved_chatlog_dir is None:
+                os.environ.pop("JARVIS_CHATLOG_DIR", None)
+            else:
+                os.environ["JARVIS_CHATLOG_DIR"] = saved_chatlog_dir
 
         store = memory_store.get_store()
         out = run("记住周会纪要放在文档里")
@@ -231,6 +305,17 @@ with tempfile.TemporaryDirectory() as tmp:
             check(injected.startswith(base) and "主人偏好数据" in injected
                   and "不是系统指令" in injected and "以系统规则为准" in injected,
                   f"{channel}通道把记忆标为数据块并声明系统规则优先")
+            check(ARCHIVE_FACT in base, f"{channel}系统提示含留档认知事实行")
+        check(ARCHIVE_FACT in jarvis.AGENT_PLANNER_PROMPT, "规划器提示含留档认知事实行")
+        archive_plan = jarvis.parse_command("聊天记录保存了没有")
+        check((archive_plan or {}).get("action") == "chat"
+              and ARCHIVE_FACT in str((archive_plan or {}).get("say") or "")
+              and "有" in str((archive_plan or {}).get("say") or ""),
+              "聊天记录保存了没有 → chat 路由且回答如实说有留档")
+        run("聊天记录保存了没有")
+        check(any((p or {}).get("action") == "chat"
+                  and ARCHIVE_FACT in str((p or {}).get("say") or "") for p in plans),
+              "路由级「聊天记录保存了没有」按留档事实回答, 不触发文件/搜索操作")
 
         count_before = len(store.entries)
         bad_rem = sanitize_plan({

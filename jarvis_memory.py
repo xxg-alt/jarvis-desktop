@@ -37,6 +37,24 @@ _MAX_NOTES = 120
 _MAX_LEARNED = 240
 _MAX_CORRECTIONS = 120
 
+# 用户可见话术的最终清洗器由 jarvis 注入, 避免把语音层模块反向 import 进来。
+# 这样 memory.json 和对话留档里的助手回复与 speak/_notify_speak 走同一套称呼规则。
+_SPEAK_SANITIZER = None
+
+
+def set_speak_sanitizer(fn):
+    global _SPEAK_SANITIZER
+    _SPEAK_SANITIZER = fn
+
+
+def _sanitize_say(text):
+    if _SPEAK_SANITIZER is None:
+        return text
+    try:
+        return _SPEAK_SANITIZER(text)
+    except Exception:
+        return text
+
 
 def _clean_text(value, limit=1200) -> str:
     text = str(value or "").strip()
@@ -141,12 +159,13 @@ class JarvisMemory:
         if not user:
             return
         clean_plan = _clean_plan(plan)
+        say_text = _sanitize_say(clean_plan.get("say", ""))
         now = time.time()
         with self._lock:
             self.data["conversations"].append({
                 "role": "user", "text": user, "ts": now,
             })
-            assistant_text = clean_plan.get("say", "") or (
+            assistant_text = say_text or (
                 "未识别出可执行动作" if not clean_plan else "已处理"
             )
             self.data["conversations"].append({
@@ -163,7 +182,7 @@ class JarvisMemory:
                     "command": user,
                     "action": action,
                     "args": clean_plan.get("args", ""),
-                    "say": clean_plan.get("say", ""),
+                    "say": say_text,
                     "ts": now,
                 }
                 # 同一说法只保留最新一次，避免重复案例占满上下文。
