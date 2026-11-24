@@ -1,9 +1,9 @@
-"""第二步：给大模型装上手 —— 三个真实系统工具。
+"""文件/系统工具：显式 typed ops + 统一授权根。
 
 设计原则：
 - 入参与返回值都是标准类型（dict / list / str / int / bool），可直接 JSON 序列化
-- 文件操作严格限制在 Desktop / Downloads / Documents 三个目录，越界一律拒绝
-- 不做删除；移动不覆盖（重名自动加序号）
+- 文件类动作只认 agent_file_roots 一处白名单（默认桌面/下载/文档 + agent 工作区）
+- read_file / list_dir 只读；write_file 原子写且不覆盖同名；move/delete 由上层护栏确认
 - PowerShell 只跑单条命令（管道/重定向在上一层已被过滤），黑名单拦高危操作
 - 任何失败都返回 ok=False + 可朗读的中文说明，绝不把异常栈抛给用户
 
@@ -17,32 +17,104 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 MAX_LIST = 200
 MAX_SEARCH = 100
+MAX_READ_BYTES = 512 * 1024
+MAX_TEXT_CHARS = 6000
+TEXT_SUFFIXES = frozenset((".txt", ".md", ".markdown", ".log", ".csv", ".json",
+                           ".ini", ".cfg", ".yaml", ".yml", ".xml"))
+DOC_SUFFIXES = frozenset((".pdf", ".docx"))
 
-# 中文 Windows 的真实文件夹名仍是 Desktop/Downloads/Documents（显示名才是中文），
-# 中文别名一并保留，便于在特殊环境下也能命中。
 ALLOWED_FOLDER_NAMES = ("Desktop", "Downloads", "Documents", "桌面", "下载", "文档")
 
-# 大模型经常回英文目录名（downloads / desktop），这里统一映射到真实文件夹名。
 FOLDER_ALIASES = {
     "desktop": "Desktop", "桌面": "Desktop",
     "downloads": "Downloads", "download": "Downloads", "下载": "Downloads",
     "documents": "Documents", "document": "Documents", "文档": "Documents",
+    "workspace": "贾维斯工作区", "agent工作区": "贾维斯工作区",
+    "工作区": "贾维斯工作区", "你的工作区": "贾维斯工作区",
 }
+_ROOT_NAMES = {
+    "Desktop": ("Desktop", "桌面"),
+    "Downloads": ("Downloads", "Download", "下载"),
+    "Documents": ("Documents", "文档"),
+    "贾维斯工作区": ("贾维斯工作区", "agent工作区", "工作区"),
+}
+_FILE_ROOTS_OVERRIDE = None
+_WS_CACHE = {}
+
+AGENT_WS_FALLBACK = Path.home() / "Documents" / "贾维斯工作区"
 
 
-def _alias_folder(path_like):
-    """把单独的目录别名换成授权目录的绝对路径；带分隔符的原样返回。"""
-    raw = str(path_like).strip().strip("\\/")
-    if not raw or "/" in raw or "\\" in raw:
-        return path_like
-    name = FOLDER_ALIASES.get(raw.lower())
-    return Path.home() / name if name else path_like
+def agent_workspace() -> Path:
+    """Agent 专用工作区：仓库外一层，探测不可写时退回文档目录。"""
+    cached = _WS_CACHE.get("path")
+    if cached and Path(cached).parent.exists():
+        return Path(cached)
+    candidate = Path(__file__).resolve().parent.parent / "贾维斯工作区"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        print(f"[工作区不可写, 退回文档目录] {exc}")
+        candidate = AGENT_WS_FALLBACK
+        candidate.mkdir(parents=True, exist_ok=True)
+    _WS_CACHE["path"] = candidate
+    return candidate
+
+
+def configure_file_roots(roots=None) -> None:
+    """设置 agent_file_roots（None = 用默认四根）；配置改动后必须调这里生效。"""
+    global _FILE_ROOTS_OVERRIDE
+    if roots is None:
+        _FILE_ROOTS_OVERRIDE = None
+        return
+    items = roots if isinstance(roots, (list, tuple)) else [roots]
+    _FILE_ROOTS_OVERRIDE = [str(item) for item in items if str(item or "").strip()]
+
+
+def default_file_roots() -> list:
+    home = Path.home()
+    return [home / "Desktop", home / "Downloads", home / "Documents", agent_workspace()]
+
+
+def allowed_roots() -> list:
+    """唯一授权根来源：agent_file_roots 配置，缺省为桌面/下载/文档 + 工作区。"""
+    raw = _FILE_ROOTS_OVERRIDE if _FILE_ROOTS_OVERRIDE is not None else default_file_roots()
+    roots = []
+    for item in raw:
+        try:
+            candidate = Path(str(item)).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path.home() / candidate
+            if candidate.is_dir():
+                resolved = candidate.resolve()
+                if resolved not in roots:
+                    roots.append(resolved)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return roots
+
+
+def root_for_alias(name) -> Path:
+    """别名 -> 配置里的根（配置没有该根时退回用户目录下的标准名）。"""
+    canonical = FOLDER_ALIASES.get(str(name or "").strip().lower())
+    if not canonical:
+        return Path(str(name or "")).expanduser()
+    names = tuple(x.lower() for x in _ROOT_NAMES.get(canonical, (canonical,)))
+    for root in allowed_roots():
+        if root.name.lower() in names:
+            return root
+    if canonical == "贾维斯工作区":
+        return agent_workspace()
+    return Path.home() / canonical
 
 
 def _result(ok: bool, summary: str, data: Any = None, danger: bool = False) -> dict:
@@ -50,46 +122,35 @@ def _result(ok: bool, summary: str, data: Any = None, danger: bool = False) -> d
     return {"ok": bool(ok), "summary": str(summary), "data": data, "danger": bool(danger)}
 
 
-def allowed_roots() -> list:
-    """当前用户的授权目录（只返回真实存在的）。"""
-    home = Path.home()
-    roots = []
-    for name in ALLOWED_FOLDER_NAMES:
-        candidate = home / name
-        try:
-            if candidate.is_dir():
-                resolved = candidate.resolve()
-                if resolved not in roots:
-                    roots.append(resolved)
-        except OSError:
-            continue
-    return roots
-
-
 def _inside(path_like) -> Path | None:
-    """把路径解析成绝对路径，并确认落在授权目录内；越界返回 None。
-
-    先 resolve() 展开 `..` 与相对路径，避免 `../../Windows` 这类绕过。
-    相对路径以 Downloads 为基准，避免调用方猜不到根。
-    """
-    if not path_like:
+    """resolve 后确认落在授权根内；符号链接指向外部同样被拒。"""
+    if path_like is None or not str(path_like or "").strip():
         return None
-    path_like = _alias_folder(path_like)
+    raw = str(path_like).strip()
+    parts = re.split(r"[/\\]", raw)
+    if parts and parts[0].lower() in FOLDER_ALIASES:
+        rest = [p for p in parts[1:] if p and p != ".."]
+        base = root_for_alias(parts[0])
+        raw = str(base.joinpath(*rest)) if rest else str(base)
     try:
-        target = Path(str(path_like)).expanduser()
-        if not target.is_absolute():
-            target = Path.home() / "Downloads" / target
-        target = target.resolve()
+        target = Path(raw).expanduser()
+        candidates = [target] if target.is_absolute() else [root / target for root in allowed_roots()]
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            for root in allowed_roots():
+                try:
+                    resolved.relative_to(root)
+                    return resolved
+                except ValueError:
+                    continue
     except (OSError, RuntimeError, ValueError):
         return None
-
-    for root in allowed_roots():
-        try:
-            target.relative_to(root)
-            return target
-        except ValueError:
-            continue
     return None
+
+
+def inside_path(path_like) -> Path | None:
+    """供上层回读完整路径用；与文件工具共用同一校验。"""
+    return _inside(path_like)
 
 
 def _fmt_size(num: float) -> str:
@@ -104,6 +165,267 @@ def _fmt_size(num: float) -> str:
 
 def _fmt_time(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+# ------------------------------------------------------------ 显式 typed 文件 ops
+
+def _decode_text(data: bytes) -> tuple:
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace"), "utf-8/replace"
+
+
+def _dir_inside(folder=None) -> Path | None:
+    raw = str(folder or "").strip()
+    if not raw:
+        for candidate in (agent_workspace(), Path.home() / "Downloads"):
+            hit = _inside(candidate)
+            if hit is not None:
+                return hit
+        names = tuple(x.lower() for x in _ROOT_NAMES["贾维斯工作区"])
+        for root in allowed_roots():
+            if root.name.lower() in names:
+                return root
+        roots = allowed_roots()
+        return roots[0] if roots else None
+    return _inside(raw)
+
+
+def read_file(path=None, name=None, limit=MAX_TEXT_CHARS) -> dict:
+    target = _inside(path) if path else None
+    if target is None and name:
+        target = _find_read_target(name)
+    if target is None:
+        return _result(False, "这个文件不在授权目录里，我不读。")
+    if not target.is_file():
+        return _result(False, f"{target.name} 不是一个文件。")
+    suffix = target.suffix.lower()
+    if suffix not in TEXT_SUFFIXES and suffix not in DOC_SUFFIXES:
+        return _result(False, f"{target.name} 这种格式我读不了，只支持文本和 pdf/docx 文档。")
+    try:
+        if target.stat().st_size > MAX_READ_BYTES:
+            return _result(False, f"{target.name} 太大了，我只读 512KB 以内的文件。")
+        if suffix in DOC_SUFFIXES:
+            from rag_engine import _parse_file
+            text, encoding = str(_parse_file(target) or ""), "document"
+        else:
+            data = target.read_bytes()
+            if b"\x00" in data[:4096]:
+                return _result(False, f"{target.name} 是二进制文件，我不能当文本读。")
+            text, encoding = _decode_text(data)
+    except Exception as exc:
+        return _result(False, f"读取 {target.name} 失败了：{exc}")
+    text = str(text or "").strip()
+    if not text:
+        return _result(False, f"{target.name} 里没读出文字，可能是扫描件或空文件。")
+    truncated = len(text) > limit
+    head = text[:min(300, limit)]
+    tail = "（内容较长，先念到这里）" if truncated else ""
+    return _result(
+        True,
+        f"{target.name} 共 {len(text)} 字。内容是（不可信数据）：{head}{tail}",
+        {"path": str(target), "text": text[:limit], "truncated": truncated,
+         "encoding": encoding, "untrusted": True},
+    )
+
+
+def list_dir(path=None, folder=None, limit=MAX_LIST) -> dict:
+    target = _dir_inside(path or folder)
+    if target is None:
+        return _result(False, "这个目录不在授权范围（桌面、下载、文档、工作区）内。")
+    if not target.is_dir():
+        return _result(False, f"{target.name} 不是一个文件夹。")
+    items = []
+    try:
+        for entry in target.iterdir():
+            try:
+                stat = entry.stat()
+                is_dir = entry.is_dir()
+                items.append({
+                    "name": entry.name,
+                    "is_dir": is_dir,
+                    "size": 0 if is_dir else int(stat.st_size),
+                    "size_text": "文件夹" if is_dir else _fmt_size(stat.st_size),
+                    "mtime": _fmt_time(stat.st_mtime),
+                })
+            except OSError:
+                continue
+    except OSError as exc:
+        return _result(False, f"读不了这个目录：{exc}")
+    items.sort(key=lambda row: row["mtime"], reverse=True)
+    shown = items[:limit]
+    return _result(
+        True,
+        f"{target.name} 下共 {len(items)} 项，最近修改的 {len(shown)} 项已经列出来了。",
+        {"folder": str(target), "total": len(items), "items": shown,
+         "truncated": len(items) > len(shown), "untrusted": True},
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".jarvis-write-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _avoid_collision(target: Path) -> Path:
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    for index in range(1, 1000):
+        candidate = target.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    return target
+
+
+def _to_docx(md_path: Path):
+    try:
+        import win32com.client
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        doc = word.Documents.Open(str(md_path))
+        docx_path = md_path.with_suffix(".docx")
+        doc.SaveAs2(str(docx_path), FileFormat=16)
+        doc.Close(False)
+        word.Quit()
+        return docx_path
+    except Exception:
+        return None
+
+
+def write_file(path=None, name=None, content=None, folder=None,
+               overwrite=False, allow_outside=False) -> dict:
+    text = str(content or "").strip()
+    if not text:
+        return _result(False, "要写入的内容是空的，Sir")
+    target = None
+    if path:
+        target = _inside(path)
+        if target is None:
+            return _result(False, "目标位置不在授权目录里，我不写。")
+    else:
+        raw = str(name or "").strip().strip("\"'“”‘’")
+        if not raw or len(raw) > 200 or re.search(r"[\\/&|;<>`$(){}\r\n]", raw):
+            return _result(False, "这个文件名我不能用，换一个普通的名字")
+        if Path(raw).suffix.lower() in (".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js",
+                                        ".py", ".lnk", ".msi", ".scr", ".com", ".jar",
+                                        ".reg", ".hta"):
+            return _result(False, "出于安全我只能写文档（md/txt/docx），不能生成可执行文件")
+        if Path(raw).suffix.lower() not in TEXT_SUFFIXES | DOC_SUFFIXES | {".docx"}:
+            raw += ".md"
+        base = _dir_inside(folder)
+        if base is None:
+            return _result(False, "这个目录不在授权范围（桌面、下载、文档、工作区）内。")
+        target = _inside(base / raw)
+        if target is None:
+            return _result(False, "目标位置跳出了授权目录，我不写。")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _result(False, f"那个目录建不出来：{exc}")
+    replaced = target.exists() and bool(overwrite)
+    final = target if replaced else _avoid_collision(target)
+    try:
+        if target.suffix.lower() == ".docx":
+            md_path = final.with_suffix(".md")
+            if md_path.exists() and not overwrite:
+                md_path = _avoid_collision(md_path)
+            _atomic_write_text(md_path, text)
+            converted = _to_docx(md_path)
+            final = converted if converted else md_path
+            label = "Word 文档" if converted else "Markdown（Word 不可用）"
+        else:
+            _atomic_write_text(final, text)
+            label = "文档"
+    except OSError as exc:
+        return _result(False, f"写文件失败了：{exc}")
+    return _result(
+        True,
+        f"已写好{label}{final.name}，放在{final.parent.name}里",
+        {"path": str(final), "name": final.name, "folder": str(final.parent),
+         "overwritten": bool(replaced), "untrusted": False},
+    )
+
+
+def move_file(src=None, dst=None, overwrite=False) -> dict:
+    source = _inside(src)
+    if source is None:
+        return _result(False, "源文件不在授权目录里，我不动。")
+    if not source.is_file():
+        return _result(False, "目前只支持移动单个文件。")
+    target_dir = _inside(dst)
+    if target_dir is None:
+        return _result(False, "目标位置不在授权目录里，我不动。")
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _result(False, f"建不了目标目录：{exc}")
+    if not target_dir.is_dir():
+        return _result(False, "目标给的是一个文件，我需要一个目录。")
+    replaced = (target_dir / source.name).exists() and bool(overwrite)
+    target = target_dir / source.name if replaced else _avoid_collision(target_dir / source.name)
+    try:
+        shutil.move(str(source), str(target))
+    except OSError as exc:
+        return _result(False, f"移动失败：{exc}")
+    return _result(
+        True,
+        f"已经把 {source.name} 移到 {target_dir.name}。",
+        {"action": "move", "src": str(source), "dst": str(target),
+         "overwritten": bool(replaced)},
+        danger=True,
+    )
+
+
+def delete_file(path=None, recycle=True) -> dict:
+    target = _inside(path)
+    if target is None:
+        return _result(False, "这个文件不在授权目录里，我不删。")
+    if not target.exists():
+        return _result(False, f"没找到 {target.name}。")
+    if not target.is_file():
+        return _result(False, "目前只支持删除单个文件。")
+    recycled = False
+    if recycle:
+        try:
+            from send2trash import send2trash
+            send2trash(str(target))
+            recycled = True
+        except Exception:
+            try:
+                import ctypes
+                operation = ctypes.windll.shell32.SHFileOperationW
+                info = ctypes.create_unicode_buffer(str(target) + "\0\0")
+                result = operation(0x0003, 0x0001 | 0x0040, None, info, None, 0)
+                recycled = result == 0
+            except Exception:
+                recycled = False
+    if not recycled:
+        try:
+            target.unlink()
+        except OSError as exc:
+            return _result(False, f"删除失败：{exc}")
+    return _result(
+        True,
+        (f"已经把 {target.name} 放进回收站。" if recycled else
+         f"已经真删掉 {target.name}（这台机器没有回收站接口，不可恢复）。"),
+        {"action": "delete", "path": str(target), "recycled": bool(recycled)},
+        danger=True,
+    )
 
 
 # ---------------------------------------------------------------- 工具 1：文件管家
@@ -130,7 +452,7 @@ def _find_read_target(name: str) -> Path | None:
         import rag_engine
         for path in rag_engine._iter_doc_files():
             if path.name.lower() == lowered:
-                return path
+                return _inside(path)
     except Exception:
         pass
     return None
@@ -141,37 +463,11 @@ def file_manage(action, src=None, dst=None, pattern=None, folder=None, name=None
     act = str(action or "").strip().lower()
 
     if act == "list":
-        target = _inside(folder) if folder else _inside(Path.home() / "Downloads")
-        if target is None:
-            return _result(False, "我只能查看桌面、下载、文档这三个目录，这个位置不在授权范围。")
-        if not target.is_dir():
-            return _result(False, f"{target.name} 不是一个文件夹。")
-
-        items = []
-        try:
-            for entry in target.iterdir():
-                try:
-                    stat = entry.stat()
-                    is_dir = entry.is_dir()
-                    items.append({
-                        "name": entry.name,
-                        "is_dir": is_dir,
-                        "size": 0 if is_dir else int(stat.st_size),
-                        "size_text": "文件夹" if is_dir else _fmt_size(stat.st_size),
-                        "mtime": _fmt_time(stat.st_mtime),
-                    })
-                except OSError:
-                    continue
-        except OSError as exc:
-            return _result(False, f"读不了这个目录：{exc}")
-
-        items.sort(key=lambda row: row["mtime"], reverse=True)
-        shown = items[:MAX_LIST]
-        return _result(
-            True,
-            f"{target.name} 下共 {len(items)} 项，最近修改的 {len(shown)} 项已经列出来了。",
-            {"folder": str(target), "total": len(items), "items": shown},
-        )
+        res = list_dir(folder=folder or Path.home() / "Downloads")
+        if res.get("ok"):
+            res["summary"] = res["summary"].replace("授权范围（桌面、下载、文档、工作区）",
+                                                     "桌面、下载、文档、工作区")
+        return res
 
     if act == "search":
         pat = str(pattern or "").strip()
@@ -214,75 +510,16 @@ def file_manage(action, src=None, dst=None, pattern=None, folder=None, name=None
                        {"pattern": pat, "items": hits})
 
     if act == "read":
-        path = _find_read_target(name)
-        if path is None:
-            return _result(False, "我在桌面、下载和文档里没找到这个文件；授权范围外的文件我也不读。")
-        if path.suffix.lower() not in (".txt", ".md", ".pdf", ".docx"):
-            return _result(False, f"{path.name} 这种格式我还读不了，目前支持 txt、md、pdf、docx。")
-        try:
-            from rag_engine import _parse_file
-            text = _parse_file(path)
-        except Exception as exc:
-            return _result(False, f"读取 {path.name} 失败了：{exc}")
-        text = str(text or "").strip()
-        if not text:
-            return _result(False, f"{path.name} 里没读出文字，可能是扫描件或空文件。")
-        head, truncated = text[:600], len(text) > 600
-        tail = "（内容较长，先念到这里）" if truncated else ""
-        return _result(
-            True,
-            f"{path.name} 共 {len(text)} 字。内容是：{head}{tail}",
-            {"path": str(path), "text": text, "truncated": truncated},
-        )
+        res = read_file(name=name)
+        if res.get("ok"):
+            res["data"]["action"] = "read"
+        return res
 
     if act == "move":
-        src_path = _inside(src)
-        if src_path is None:
-            return _result(False, "源文件不在桌面、下载、文档里，授权范围之外的文件我不动。")
-        if not src_path.exists():
-            return _result(False, f"没找到 {Path(str(src)).name}。")
-        if not src_path.is_file():
-            return _result(False, "目前只支持移动单个文件，还不支持整个文件夹。")
+        return move_file(src=src, dst=dst or Path.home() / "Downloads")
 
-        if dst:
-            dst_dir = _inside(dst)
-            if dst_dir is None:
-                return _result(False, "目标位置不在授权范围（只能是桌面、下载、文档）。")
-            if dst_dir.is_file():
-                return _result(False, "目标给的是一个文件，我需要一个目录。")
-        else:
-            dst_dir = _inside(Path.home() / "Downloads")
-            if dst_dir is None:
-                return _result(False, "找不到下载目录。")
-
-        try:
-            dst_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return _result(False, f"建不了目标目录：{exc}")
-
-        # 绝不覆盖：重名自动加 (1)(2)…
-        target = dst_dir / src_path.name
-        if target.exists():
-            stem, suffix = target.stem, target.suffix
-            for index in range(1, 1000):
-                candidate = dst_dir / f"{stem} ({index}){suffix}"
-                if not candidate.exists():
-                    target = candidate
-                    break
-            else:
-                return _result(False, "目标目录同名文件太多了，换个目录吧。")
-
-        try:
-            shutil.move(str(src_path), str(target))
-        except OSError as exc:
-            return _result(False, f"移动失败：{exc}")
-
-        return _result(
-            True,
-            f"已经把 {src_path.name} 移到 {dst_dir.name}。",
-            {"src": str(src_path), "dst": str(target)},
-            danger=True,
-        )
+    if act == "delete":
+        return delete_file(path=name or src)
 
     return _result(False, "文件这块我只会「列目录、按名字找、归类移动、读取内容」四件事。")
 
