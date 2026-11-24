@@ -2091,7 +2091,7 @@ def _parse_rules(text, peek_followup=False):
         return {"action": "chat", "say": say}
 
     # 打开软件 / 打开文档
-    m = re.search(r"(?:打开|启动|运行)(.+)", raw)
+    m = re.search(r"(?:重开|重新打开|再打开|打开|启动|运行)(.+)", raw)
     if m:
         target = m.group(1).strip()
         tl = target.lower().replace(" ", "")
@@ -3353,7 +3353,7 @@ def _looks_conversational(command: str) -> bool:
 # _peek_question_from_text / _click_intent(看屏/点击意图)。
 # ═══════════════════════════════════════════════════════════════
 _TASK_TTL = 180.0          # "还是这件事"的短窗口; 跨时段自然失效
-_CURRENT_TASK = {"action": "", "target": "", "result": "", "status": "", "ts": 0.0}
+_CURRENT_TASK = {"action": "", "target": "", "result": "", "status": "", "ts": 0.0, "source": ""}
 _TASK_VERB = {
     "open_app": "打开", "click_screen": "点击", "peek_screen": "看屏",
     "screenshot": "截图", "search_file": "找", "web_search": "搜索",
@@ -3381,21 +3381,28 @@ _LOOK_NOW_RE = re.compile(r"赶快看|赶紧看|快看|马上看|立刻看|看�
 _INTENT_KEEP_RE = re.compile(
     r"进入|点击|点一下|点开|点进|按一下|按钮|看一下|看看|截图|打开|启动|播放|再点"
 )
+_OPERATE_CURRENT_RE = re.compile(r"进入|点击|点一下|点开|点进|按一下|按钮|再点|点它|按它")
+_REOPEN_APP_RE = re.compile(r"重开|重新打开|重新启动|重新开启|再打开|再启动|打开|启动|开启|开一下")
+_NEW_REQUEST_RE = re.compile(
+    r"打开|启动|重开|重新|截图|截屏|播放|搜索|搜一下|查找|找出|关机|记住|记一下|"
+    r"写(?:文档|篇|一段|一份|个)|设置"
+)
 
 
 def reset_dialogue_state():
-    _CURRENT_TASK.update(action="", target="", result="", status="", ts=0.0)
+    _CURRENT_TASK.update(action="", target="", result="", status="", ts=0.0, source="")
 
 
 def current_task_snapshot():
     return dict(_CURRENT_TASK)
 
 
-def set_current_task(action="", target="", result="", status="open", ts=None):
+def set_current_task(action="", target="", result="", status="open", ts=None, source=""):
     _CURRENT_TASK.update(
         action=str(action or ""), target=str(target or ""),
         result=str(result or "")[:200], status=str(status or "open"),
         ts=float(ts if ts is not None else time.time()),
+        source=_source_label(source) if source else str(_CURRENT_TASK.get("source") or ""),
     )
 
 
@@ -3417,6 +3424,46 @@ def is_feedback(text):
     if any(w in t.replace("不错", "") for w in ("没", "不", "别", "未", "还")):
         return False
     return bool(_FEEDBACK_RE.search(t))
+
+
+def _feedback_remainder(text):
+    t = _GUARD_PUNCT.sub("", _FEEDBACK_RE.sub("", _tight(str(text or ""))))
+    return re.sub(r"^(?:了|的|吧|啊|呀|呢|嘛)+", "", t)
+
+
+def _has_new_request(text):
+    t = _GUARD_PUNCT.sub("", _tight(str(text or "")))
+    if not t:
+        return False
+    if _click_intent(text)[1] == "command":
+        return True
+    if _OPERATE_CURRENT_RE.search(t) or _LOOK_NOW_RE.search(t) or _screenshot_intent(t):
+        return True
+    return bool(_NEW_REQUEST_RE.search(t))
+
+
+def feedback_remainder(text):
+    raw = str(text or "")
+    if not is_feedback(raw):
+        return ""
+    rest = _feedback_remainder(raw)
+    return rest if rest and _has_new_request(rest) else ""
+
+
+def _plan_for_request(text, plan=None):
+    if plan is not None and str(plan.get("action") or "") not in ("", "chat"):
+        return plan
+    kind = classify_dialogue_turn(text, plan or {})
+    if kind == "action:peek_screen" or _LOOK_NOW_RE.search(text):
+        question = _peek_question_from_text(str(text or ""), followup=True) or str(text or "")
+        return {"action": "peek_screen", "args": {"question": question}, "say": "我看一眼屏幕，Sir"}
+    if kind == "action:click_screen" or _OPERATE_CURRENT_RE.search(str(text or "")):
+        target, _ = _click_intent(text)
+        return {"action": "click_screen", "args": {"target": target or "屏幕"},
+                "say": "我点一下，Sir"}
+    if kind == "action:screenshot":
+        return {"action": "screenshot", "args": {}, "say": "我截个图，Sir"}
+    return plan
 
 
 def _is_followup(text):
@@ -3468,6 +3515,8 @@ def _same_ongoing(text):
     low = re.sub(
         r"^(?:我说的是|我说|我说的|就是|那个|那么|所以|嗯|呃|哦|算了|然后|确定并|确定|取消)",
         "", low)
+    if _REOPEN_APP_RE.search(low) or not _OPERATE_CURRENT_RE.search(low):
+        return False
     if not _INTENT_KEEP_RE.search(low):
         return False
     target = _ongoing_target()
@@ -3525,13 +3574,16 @@ def capability_gate(text, plan):
 
 def classify_dialogue_turn(text, plan=None):
     """类别判定入口: 可测层 + 当前任务状态, 给语料考试和运行时共用。"""
+    raw = str(text or "")
+    routed = feedback_remainder(raw)
+    if routed:
+        raw, plan = routed, None
     if plan is None:
         try:
-            plan = parse_command(text) or {}
+            plan = parse_command(raw) or {}
         except Exception:
             plan = {}
     action = str(plan.get("action") or "")
-    raw = str(text or "")
     if _is_followup(raw):
         return "followup"
     if is_feedback(raw):
@@ -3583,14 +3635,15 @@ def _verify_last_action():
         return
     try:
         out = _peek_screen(question=f"核验刚才的{_ongoing_target() or '操作'}是否已生效",
-                           allow_confirm=False, source="local")
+                           allow_confirm=False,
+                           source=_source_label(_CURRENT_TASK.get("source")))
         _CURRENT_TASK["result"] = str(out or "")[:200]
         _CURRENT_TASK["status"] = "done"
     except Exception as exc:
         print(f"[核验] 没能核验上轮动作: {exc}", flush=True)
 
 
-def note_current_task(command, plan, reply=""):
+def note_current_task(command, plan, reply="", source=""):
     """执行完一轮后写回结果: 夸奖类反馈顺手把当前任务标记完成。"""
     if is_feedback(str(command or "")):
         _mark_task_done()
@@ -3605,7 +3658,8 @@ def note_current_task(command, plan, reply=""):
         target = target or str(args.get("url") or "")
     ok = bool(getattr(_TL, "action_ok", True))
     status = "unverified" if action == "click_screen" or not ok else "done"
-    set_current_task(action, target, str(reply or (plan or {}).get("say") or ""), status)
+    set_current_task(action, target, str(reply or (plan or {}).get("say") or ""), status,
+                     source=source)
 
 
 def gemini_plan(command, memory_context=""):
@@ -4506,8 +4560,14 @@ def _handle_command_inner(command, command_id, source=""):
         speak(habit_question)
 
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
+    routed = feedback_remainder(command)
+    if routed:
+        command = routed
     plan = parse_command(command)
     plan_source = "local" if plan is not None else ""
+    if routed and (plan is None or str(plan.get("action") or "") == "chat"):
+        plan = _plan_for_request(command, plan)
+        plan_source = "local" if plan is not None else ""
 
     # 1.2 对话方式机制: 反馈只收尾 / 短追问由上轮动作记录回答 / 同意图换策略。
     # 传 {} 占住 plan 位, 免得 classify_dialogue_turn 再跑一次 parse_command 消耗看屏指代状态。
@@ -4588,7 +4648,7 @@ def _handle_command_inner(command, command_id, source=""):
     try:
         async_started = execute_plan(plan, command_id=command_id, source=source)
     finally:
-        note_current_task(command, plan, (plan or {}).get("say", ""))
+        note_current_task(command, plan, (plan or {}).get("say", ""), source=source)
         MEMORY.record_turn(command, plan,
                            source=getattr(_TL, "command_source", None) or plan_source or "unresolved")
         # 同步动作已经结束；异步工具仍由主循环等待最终结果。
