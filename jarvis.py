@@ -316,6 +316,9 @@ AGENT_DECIDE_SYSTEM = """你是桌面助手贾维斯的多步任务大脑。用�
 {"kind":"ask","question":"确实需要用户本人回答的中文问题"}
 {"kind":"finish","say":"给用户的收尾结论"}
 规则：
+- 先看类别再选下一步：每步失败都有 failure_classification（失败类别+真实信号来源+界面取证结论），按类别换招；拿不到信号标未知，不许无类别盲重试。
+- forced_route 非空时，只准在「换类别/问用户/收尾报告」里选：换类别要给不同 action 的下一步，问用户给 ask，收尾给 finish；同类 action 连续失败 2 次后禁止第三次同类尝试。
+- 阶段切换时在输出里带 stage（目标段落名）和可选的 next_hint；每完成 3 步也会报一次阶段进展，同阶段不重复汇报。
 - 一次只给一步，且必须与目标直接相关；同样的动作+同样的参数已经做过就不许再做，系统会在第 2 次出现时判打转并强制收尾。
 - 只能用白名单动作：chat, open_app, open_file, open_url, web_search, file_manage(list/search/move/read), write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, click_screen, remember, forget_memory。
 - 参数要齐全：open_app 给 exe 和 name；read_file 给 path，list_dir 给 folder（可省略），move_file 给 src/dst，delete_file 给 path，web_read 给 url，write_file 给 name 和完整 content，web_search 给 query。缺参数的步会被系统剔除，等于没有可执行下一步。
@@ -349,6 +352,10 @@ def _agent_decide(context):
         "recent_entities": ctx.get("recent_entities", ""),
         "source": ctx.get("source", ""),
         "pending_question": ctx.get("pending_question", ""),
+        "failure_classification": ctx.get("failure_classification") or {},
+        "forced_route": ctx.get("forced_route") or {},
+        "stage": ctx.get("stage", ""),
+        "next_hint": ctx.get("next_hint", ""),
     }, ensure_ascii=False, default=str)[:6000]
     messages = [
         {"role": "system", "content": AGENT_DECIDE_SYSTEM},
@@ -1856,6 +1863,7 @@ def _agent_perform(step, task=None):
     """
     _TL.action_ok = False
     _TL.last_tool_text = ""      # 不把上一步的回读带到这一步, 免得误触发视觉核实
+    _TL.last_failure_signal = {}
     if step.get("status") == AGENT_STEP_REBUILD or step.get("redacted"):
         return False, "这一步已标为待用户重建：参数在保存时被脱敏，需要您重新说明后才能执行，Sir", ""
     # started 是"本次调用执行器时"的正常状态; 恢复层已把它转成 unknown, 这里只挡 unknown。
@@ -1878,7 +1886,20 @@ def _agent_perform(step, task=None):
             accepts_source = False
         text = (_perform_plan(plan, source=src) if accepts_source
                 else _perform_plan(plan))
-        return bool(getattr(_TL, "action_ok", False)), text, getattr(_TL, "last_tool_text", "")
+        ok = bool(getattr(_TL, "action_ok", False))
+        signals = {}
+        if not ok:
+            structured = getattr(_TL, "last_failure_signal", None)
+            if isinstance(structured, dict):
+                signals.update(structured)
+            verify = str(getattr(_TL, "open_app_verify", "") or "")
+            if verify == "fail":
+                signals["kind"] = "action_failed"
+        if ok:
+            step.pop("failure_signal", None)
+        else:
+            step["failure_signal"] = signals
+        return ok, text, getattr(_TL, "last_tool_text", "")
     finally:
         _TL.agent_context = False
         _TL.agent_external_ok = False
@@ -1899,6 +1920,23 @@ def _agent_repair_wrapper(task, step, error_text):
 def _agent_visual_verify_hook(task, step, ok, text, tool_text):
     """状态机的回读钩子: 晚绑定到视觉核实实现 (实现在看屏段落, 测试可整体替换)。"""
     return _agent_visual_verify(task, step, ok, text, tool_text)
+
+
+def _agent_failure_evidence(task, step, signals):
+    """界面失败后的只读取证: 仍用已有 peek_screen, 不新增动作, 不做任何点击。"""
+    if _sensitive_window_hit():
+        return {"ok": False, "skipped": True, "text": "",
+                "reason": "敏感画面跳过取证（护栏未放行）"}
+    target = str((step or {}).get("say") or (step or {}).get("action") or "刚才的操作")[:120]
+    question = f"界面失败取证：屏幕上实际看到了什么？核验「{target}」是否已生效"
+    try:
+        text = _peek_screen(question, allow_confirm=False,
+                            source=str((task or {}).get("source") or "local"))
+        return {"ok": bool(getattr(_TL, "peek_ok", False)), "skipped": False,
+                "text": str(text or ""), "reason": ""}
+    except Exception as exc:
+        return {"ok": False, "skipped": True, "text": "",
+                "reason": f"取证调用异常: {type(exc).__name__}"}
 
 
 # ---------- 语音识别置信度闸门 ----------
@@ -1950,6 +1988,7 @@ _RUNNER = agent_core.TaskRunner(
     pre_write=_agent_pre_write,
     repair=_agent_repair_wrapper,
     verify=_agent_visual_verify_hook,
+    evidence=_agent_failure_evidence,
     guard_text=_agent_guard_text,
     decide=_agent_decide,
     sanitize=_agent_sanitize_step,
@@ -4917,6 +4956,7 @@ def _perform_plan(plan, source=""):
                     else:
                         err = (proc.stderr or proc.stdout or "").strip()
                         fail_reason = f"taskkill返回码{rc}" + (f": {err[:120]}" if err else "")
+                        _TL.last_failure_signal = {"returncode": rc}
                         print(f"[关闭程序失败] {exe}: {fail_reason}")
                 except Exception as exc:
                     fail_reason = str(exc)
@@ -5007,6 +5047,11 @@ def _perform_plan(plan, source=""):
                     res = run_powershell(args.get("command"))
 
                 _TL.action_ok = bool(res.get("ok"))
+                if not _TL.action_ok and isinstance(res, dict):
+                    _TL.last_failure_signal = {
+                        k: res[k] for k in ("errno", "code", "reason_code", "http_status")
+                        if k in res and isinstance(res[k], (int, str))
+                    }
                 if _TL.action_ok:
                     say = _format_tool_say(action, res)
                     _TL.last_tool_text = _tool_data_text(action, res)
@@ -5182,6 +5227,11 @@ def _perform_plan(plan, source=""):
     except Exception as e:
         say = f"执行失败了: {e}"
         _TL.action_ok = False
+        err = getattr(e, "errno", None)
+        _TL.last_failure_signal = {
+            "exception_type": type(e).__name__,
+            **({"errno": err} if isinstance(err, int) else {}),
+        }
         print(f"[执行失败] {action}: {e}")
     if action == "open_app":
         action_ok = bool(getattr(_TL, "action_ok", True))

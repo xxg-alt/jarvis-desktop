@@ -1132,7 +1132,8 @@ _REPAIR_STEP_SYSTEM = (
     "动作只能用现有白名单：chat/open_app/open_file/open_url/web_search/file_manage/write_file/"
     "inspect_system/volume/screenshot/lock/open_folder/search_file/close_app/shutdown/restart/"
     "peek_screen/click_screen/remember/forget_memory。\n"
-    "参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
+    "先看失败类别（目标不存在/权限被拒/网络失败/界面未达预期/动作执行失败/未知）再改步，"
+    "不许无类别盲重试；参数要针对失败原因改正（比如 exe 名写错就换成正确的），不要输出解释、不要改任务目标、"
     "不要一次给出多步；确实改不动就返回 action=chat 并在 say 里说明原因。"
 )
 
