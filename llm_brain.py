@@ -449,7 +449,8 @@ def sanitize_plan(plan: dict) -> dict:
     # 红/黄灯（危险/变更）：shutdown, restart, close_app, run_cmd, file_delete 等
     DANGEROUS_ACTIONS = {"shutdown", "restart", "close_app", "kill_process", "run_cmd", "file_delete", "file_move"}
     is_danger = bool(plan.get("danger")) or (action in DANGEROUS_ACTIONS)
-    guard_desc = plan.get("guard_desc") or ""
+    raw_guard = plan.get("guard_desc")
+    guard_desc = re.sub(r"\s+", " ", str(raw_guard or "")).strip()[:300]
 
     if action == "open_app":
         exe = _safe_text(args.get("exe"), 260)
@@ -468,7 +469,7 @@ def sanitize_plan(plan: dict) -> dict:
             "args": {"exe": exe, "name": name},
             "say": say or f"已关闭{name}",
             "danger": True,
-            "guard_desc": f"关闭应用程序：{name} ({exe})"
+            "guard_desc": guard_desc or f"关闭应用程序：{name} ({exe})"
         }
 
     if action in ("shutdown", "restart"):
@@ -478,7 +479,7 @@ def sanitize_plan(plan: dict) -> dict:
             "args": args,
             "say": say or f"准备{action_name}",
             "danger": True,
-            "guard_desc": f"高危系统操作：{action_name}"
+            "guard_desc": guard_desc or f"高危系统操作：{action_name}"
         }
 
     if action == "open_url":
@@ -546,7 +547,7 @@ def sanitize_plan(plan: dict) -> dict:
                 "args": out_args,
                 "say": say or "这就帮你归档",
                 "danger": True,
-                "guard_desc": f"移动文件：{out_args['src']} → {out_args.get('dst') or '下载'}",
+                "guard_desc": guard_desc or f"移动文件：{out_args['src']} → {out_args.get('dst') or '下载'}",
             }, plan)
         return _with_status_say(
             {"action": "file_manage", "args": out_args, "say": say, "danger": False}, plan
@@ -595,7 +596,7 @@ def sanitize_plan(plan: dict) -> dict:
             "args": {"command": command},
             "say": say,
             "danger": not readonly,
-            "guard_desc": "" if readonly else f"执行命令：{command[:80]}",
+            "guard_desc": guard_desc or ("" if readonly else f"执行命令：{command[:80]}"),
         }, plan)
 
     if action == "write_file":
@@ -617,7 +618,7 @@ def sanitize_plan(plan: dict) -> dict:
             "args": {"name": name, "content": content[:12000], "folder": folder},
             "say": say or f"这就为您写{name}",
             "danger": False,
-            "guard_desc": f"写入文档：{name}" + (f"（{folder}）" if folder else ""),
+            "guard_desc": guard_desc or (f"写入文档：{name}" + (f"（{folder}）" if folder else "")),
         }, plan)
 
     if action == "ask_doc":

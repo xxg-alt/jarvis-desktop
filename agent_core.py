@@ -25,6 +25,9 @@
     verify(task, step, ok, text, tool_text) -> (ok, text, tool_text)
         可选：单步执行完、修复决策之前的回读钩子。只读核实, 不改状态机流程；
         抛异常时忽略, 保持原回读结论。
+    guard_text(step) -> str
+        可选：挂起确认话术里的具体内容（命令/路径）；默认读 guard_desc/say。
+    perform 可接受可选的 task 关键字参数；提供时按任务来源执行，兼容单参实现。
     pre_write(task, step, results_text)  可选：写文件前的成稿钩子。
     repair(task, step, error_text) -> (fixed_step | None, reason)  可选：失败修复钩子。
         fixed_step 为 {action, args, say, scope, danger}；
@@ -34,6 +37,7 @@
         修复调用前崩溃也不会丢标记。
 """
 
+import inspect
 import threading
 import time
 
@@ -95,11 +99,16 @@ class TaskRunner:
     """单任务后台执行器：启线程跑步骤，支持停止/跳过/挂起等确认。"""
 
     def __init__(self, perform, persist, notify, scope_of=None,
-                 on_state=None, pre_write=None, repair=None, verify=None):
+                 on_state=None, pre_write=None, repair=None, verify=None,
+                 guard_text=None):
         self._perform = perform
         self._persist = persist
         self._notify = notify
         self._scope_of = scope_of or (lambda step: step.get("scope") or SCOPE_FREE)
+        self._guard_text = guard_text or (
+            lambda step: str((step or {}).get("guard_desc")
+                             or (step or {}).get("say")
+                             or (step or {}).get("action") or ""))
         self._on_state = on_state
         self._pre_write = pre_write
         self._repair = repair
@@ -187,6 +196,21 @@ class TaskRunner:
     def _generation_changed(self, gen) -> bool:
         return self._gen != gen or self._stop
 
+    def _call_perform(self, step, task):
+        """把任务一起交给执行器（来源强绑定）；老的单参回调照旧可用。"""
+        try:
+            if "task" in inspect.signature(self._perform).parameters:
+                return self._perform(step, task=task)
+        except (TypeError, ValueError):
+            pass
+        return self._perform(step)
+
+    def _step_guard_text(self, step) -> str:
+        try:
+            return str(self._guard_text(step) or "")
+        except Exception:
+            return str((step or {}).get("say") or (step or {}).get("action") or "")
+
     # ── 执行循环 ──
     def _run(self, task, gen):
         steps = task.get("steps", [])
@@ -212,7 +236,7 @@ class TaskRunner:
                     self._safe_persist(task)
                     self._safe_notify(
                         f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步要动系统: "
-                        f"{step.get('say') or step.get('action')}。"
+                        f"{self._step_guard_text(step)}。"
                         "说「继续任务」放行, 说「停」中止",
                         spoken=True,
                     )
@@ -233,7 +257,7 @@ class TaskRunner:
                     f"第 {i + 1}/{total} 步 · {step.get('say') or step.get('action')}")
 
                 try:
-                    ok, text, tool_text = self._perform(step)
+                    ok, text, tool_text = self._call_perform(step, task)
                     if self._verify is not None:
                         try:
                             ok, text, tool_text = self._verify(
@@ -261,6 +285,7 @@ class TaskRunner:
                         step.update({"action": fixed.get("action"),
                                      "args": fixed.get("args") or {},
                                      "say": fixed.get("say") or "",
+                                     "guard_desc": fixed.get("guard_desc") or "",
                                      "scope": SCOPE_ASK,
                                      "status": "waiting",
                                      "result": (step.get("result") or "") + "；修正方案待确认"})
@@ -268,7 +293,7 @@ class TaskRunner:
                         self._safe_persist(task)
                         self._safe_notify(
                             f"任务「{task.get('goal', '')}」第 {i + 1}/{total} 步失败, "
-                            f"修正方案要动系统: {fixed.get('say') or fixed.get('action')}。"
+                            f"修正方案要动系统: {self._step_guard_text(step)}。"
                             "说「继续任务」放行, 说「停」中止",
                             spoken=True,
                         )
@@ -277,11 +302,12 @@ class TaskRunner:
                         step.update({"action": fixed.get("action"),
                                      "args": fixed.get("args") or {},
                                      "say": fixed.get("say") or "",
+                                     "guard_desc": fixed.get("guard_desc") or "",
                                      "scope": fixed.get("scope") or SCOPE_FREE})
                         step["status"] = "pending"
                         step["repaired"] = True
                         try:
-                            ok, text, tool_text = self._perform(step)
+                            ok, text, tool_text = self._call_perform(step, task)
                         except Exception as exc:
                             ok, text, tool_text = False, f"执行失败: {exc}", ""
                         step["result"] = text
