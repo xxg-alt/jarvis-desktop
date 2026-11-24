@@ -355,13 +355,13 @@ def _agent_decide(context):
         {"role": "user", "content": user},
     ]
     calls, raw = 0, ""
-    for attempt in range(3):   # 只在空白返回时逐档放大重发，三档封顶，绝不无限重试
+    for attempt in range(2):   # 空白只重发一次(第 1 轮既定契约): 换模式 + 放大上限
         try:
             # 推理型大脑会先把额度烧在思考通道上：上限太小很容易思考没完就
-            # 截断、正文空白（finish_reason=length）。逐档放大上限，空白才进
-            # 下一档；上限只是天花板，短回答不会多花。
+            # 截断、正文空白（finish_reason=length）。首发 1600；重发换成
+            # 非 JSON 模式并把上限放到 6000。上限只是天花板，短回答不会多花。
             raw = _provider_chat(CONFIG, messages,
-                                 max_tokens=(1600, 3200, 6000)[attempt],
+                                 max_tokens=(1600, 6000)[attempt],
                                  json_mode=(attempt == 0))
             calls += 1
             if str(raw or "").strip():
