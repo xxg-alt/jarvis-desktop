@@ -103,21 +103,35 @@ def _safe_url(url) -> tuple:
         parts = urlsplit(raw)
     except ValueError:
         return False, "这个网址格式不对", None
-    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
         return False, "我只读 http 或 https 的网页", None
     if parts.username or parts.password:
         return False, "这个网址带了登录信息，我不读", None
+    try:
+        port = parts.port
+    except ValueError:
+        return False, "这个网址的端口不对，我不读", None
+    if port is not None and port != (80 if scheme == "http" else 443):
+        return False, "我只读 80 或 443 端口的网页", None
     ok, reason = _safe_host(parts.hostname)
     return ok, reason, parts
 
 
+def _peer_ip(response) -> str:
+    """取实际连接对端 IP（含 DNS rebinding 后的真实落点）；拿不到就 fail closed。"""
+    raw = getattr(response, "raw", None)
+    sock = getattr(getattr(raw, "_connection", None), "sock", None)
+    if sock is None:
+        return ""
+    try:
+        return str(sock.getpeername()[0])
+    except (OSError, TypeError, ValueError, IndexError):
+        return ""
+
+
 def _response_bytes(response, max_bytes: int) -> bytes:
-    content = getattr(response, "content", None)
-    if isinstance(content, bytes) and content:
-        return content[:max_bytes]
-    text = getattr(response, "text", "") or ""
-    if text:
-        return str(text).encode("utf-8")[:max_bytes]
+    """只从流式响应读正文；绝不碰 .content/.text，避免校验对端前把正文读进来。"""
     iterator = getattr(response, "iter_content", None)
     if callable(iterator):
         chunks, total = [], 0
@@ -130,6 +144,13 @@ def _response_bytes(response, max_bytes: int) -> bytes:
             if total >= max_bytes:
                 break
         return b"".join(chunks)
+    read = getattr(getattr(response, "raw", None), "read", None)
+    if callable(read):
+        try:
+            data = read(max_bytes)
+        except Exception:
+            return b""
+        return data[:max_bytes] if isinstance(data, bytes) else b""
     return b""
 
 
@@ -146,7 +167,7 @@ def _decode_web(data: bytes, response) -> str:
 
 
 def fetch_web_text(url, limit=_WEB_READ_CHARS, timeout=_FETCH_TIMEOUT) -> tuple:
-    """只读抓取器：每一跳都校验协议/主机/解析 IP，非文本响应不落盘。"""
+    """只读抓取器：每一跳先校验 URL/DNS，再用 getpeername 校验实际对端公网 IP，最后才流式读正文。"""
     current = str(url or "").strip()
     seen = set()
     for _ in range(_MAX_REDIRECTS + 1):
@@ -157,12 +178,17 @@ def fetch_web_text(url, limit=_WEB_READ_CHARS, timeout=_FETCH_TIMEOUT) -> tuple:
         if not ok:
             return False, "", {"reason": reason, "url": current}
         try:
-            response = requests.get(current, headers=_HEADERS,
-                                    timeout=timeout, allow_redirects=False)
+            response = requests.get(current, headers=_HEADERS, timeout=timeout,
+                                    allow_redirects=False, stream=True)
         except Exception as exc:
             return False, "", {"reason": f"网页抓取失败：{exc}", "url": current}
         close = getattr(response, "close", None)
         try:
+            peer = _peer_ip(response)
+            if not peer:
+                return False, "", {"reason": "拿不到实际连接对端地址，已中断", "url": current}
+            if _blocked_ip(peer):
+                return False, "", {"reason": f"实际连接对端 {peer} 不是公网地址，已中断", "url": current}
             status = int(getattr(response, "status_code", 0) or 0)
             headers = getattr(response, "headers", {}) or {}
             location = headers.get("Location") or headers.get("location") or ""
@@ -181,6 +207,8 @@ def fetch_web_text(url, limit=_WEB_READ_CHARS, timeout=_FETCH_TIMEOUT) -> tuple:
                 return False, "", {"reason": "网页正文不是文本", "url": current}
             text = _clean(re.sub(r"<script.*?</script>|<style.*?</style>", " ",
                                  _decode_web(data, response), flags=re.S | re.I))
+            if not text:
+                return False, "", {"reason": "网页清洗后没有正文", "url": current}
             return True, text[:limit], {"url": current, "final_url": current,
                                         "content_type": ctype,
                                         "truncated": len(text) > limit,

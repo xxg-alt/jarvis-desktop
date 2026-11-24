@@ -1102,16 +1102,12 @@ _DOC_FILLER_TAILS = re.compile(r"(?:的)?(?:文本文件|文本|文件|文档|�
 
 
 def _doc_roots():
-    """会被"打开文档"和"写文档"共用的根目录集合。
-
-    两处必须共用同一份清单: 只进不出的路径等于写完之后自己都找不到,
-    这种不对称 bug 比权限漏洞更难查 (用户只会说"它说不知道")。
-    """
+    """文档查找根只从文件工具白名单取，不在本地另列一套常量。"""
     try:
-        ws = agent_workspace()
-    except Exception:
-        ws = Path.home() / "Documents" / "贾维斯工作区"
-    return [ws, Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"]
+        return list(_file_tools.allowed_roots())
+    except Exception as exc:
+        print(f"[文档根目录读取失败] {exc}")
+        return []
 
 
 def _normalize_file_query(text):
@@ -1471,9 +1467,11 @@ def _folder_hint_from_text(text) -> str:
     return ""
 
 
-def _write_document(name: str, content: str, folder=None, allow_outside: bool = False) -> tuple:
+def _write_document(name: str, content: str, folder=None, overwrite=False,
+                    allow_outside: bool = False) -> tuple:
     """写文档的兼容入口: 真正实现是 system_tools.write_file, 直连与 agent 共用。返回 (成败, 话术, 结构化结果)。"""
-    res = _file_tools.write_file(name=name, content=content, folder=folder)
+    res = _file_tools.write_file(name=name, content=content, folder=folder,
+                                 overwrite=bool(overwrite))
     ok = bool(res.get("ok"))
     say = str(res.get("summary") or "")
     if ok:
@@ -4897,7 +4895,8 @@ def _perform_plan(plan, source=""):
                 folder = str(Path(str(args["path"])).parent)
             success, msg, res = _write_document(
                 args.get("name") or (Path(str(args["path"])).name if args.get("path") else ""),
-                args.get("content"), folder=folder)
+                args.get("content"), folder=folder,
+                overwrite=bool(args.get("overwrite")))
             say = msg
             _TL.action_ok = bool(success)
             _TL.last_tool_text = _tool_data_text("write_file", res)

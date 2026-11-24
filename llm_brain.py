@@ -556,7 +556,7 @@ def sanitize_plan(plan: dict) -> dict:
                 "danger": True,
                 "guard_desc": guard_desc or (
                     f"移动文件：{out_args['src']} → {out_args.get('dst') or '下载'}" if sub == "move"
-                    else f"删除文件：{out_args['name']}（优先回收站）"),
+                    else f"删除文件：{out_args['name']}"),
             }, plan)
         return _with_status_say(
             {"action": "file_manage", "args": out_args, "say": say, "danger": False}, plan
@@ -687,7 +687,7 @@ def sanitize_plan(plan: dict) -> dict:
         return _with_status_say({
             "action": action, "args": {"path": target},
             "say": say or "准备删除文件", "danger": True,
-            "guard_desc": guard_desc or f"删除文件：{target}（优先回收站）",
+            "guard_desc": guard_desc or f"删除文件：{target}",
         }, plan)
 
     if action == "ask_doc":

@@ -129,7 +129,9 @@ def _inside(path_like) -> Path | None:
     raw = str(path_like).strip()
     parts = re.split(r"[/\\]", raw)
     if parts and parts[0].lower() in FOLDER_ALIASES:
-        rest = [p for p in parts[1:] if p and p != ".."]
+        rest = [p for p in parts[1:] if p]
+        if ".." in rest:
+            return None
         base = root_for_alias(parts[0])
         raw = str(base.joinpath(*rest)) if rest else str(base)
     try:
@@ -399,33 +401,28 @@ def delete_file(path=None, recycle=True) -> dict:
         return _result(False, f"没找到 {target.name}。")
     if not target.is_file():
         return _result(False, "目前只支持删除单个文件。")
-    recycled = False
     if recycle:
         try:
             from send2trash import send2trash
             send2trash(str(target))
-            recycled = True
-        except Exception:
-            try:
-                import ctypes
-                operation = ctypes.windll.shell32.SHFileOperationW
-                info = ctypes.create_unicode_buffer(str(target) + "\0\0")
-                result = operation(0x0003, 0x0001 | 0x0040, None, info, None, 0)
-                recycled = result == 0
-            except Exception:
-                recycled = False
-    if not recycled:
-        try:
-            target.unlink()
-        except OSError as exc:
-            return _result(False, f"删除失败：{exc}")
-    return _result(
-        True,
-        (f"已经把 {target.name} 放进回收站。" if recycled else
-         f"已经真删掉 {target.name}（这台机器没有回收站接口，不可恢复）。"),
-        {"action": "delete", "path": str(target), "recycled": bool(recycled)},
-        danger=True,
-    )
+        except Exception as exc:
+            return _result(False, f"回收站删除失败，文件没删：{exc}",
+                           {"action": "delete", "path": str(target),
+                            "recycled": False, "reason": str(exc)}, danger=True)
+        if target.exists():
+            return _result(False, "回收站删除后文件还在，我没把它当成功，也没改成真删。",
+                           {"action": "delete", "path": str(target), "recycled": False},
+                           danger=True)
+        return _result(True, f"已经把 {target.name} 放进回收站。",
+                       {"action": "delete", "path": str(target), "recycled": True},
+                       danger=True)
+    try:
+        target.unlink()
+    except OSError as exc:
+        return _result(False, f"永久删除失败：{exc}")
+    return _result(True, f"已经真删掉 {target.name}（不可恢复）。",
+                   {"action": "delete", "path": str(target), "recycled": False},
+                   danger=True)
 
 
 # ---------------------------------------------------------------- 工具 1：文件管家
@@ -489,13 +486,15 @@ def file_manage(action, src=None, dst=None, pattern=None, folder=None, name=None
                 continue
             for path in iterator:
                 try:
-                    if path.is_file():
-                        stat = path.stat()
-                        hits.append({
-                            "path": str(path),
-                            "size_text": _fmt_size(stat.st_size),
-                            "mtime": _fmt_time(stat.st_mtime),
-                        })
+                    checked = _inside(path) if path.is_file() else None
+                    if checked is None:
+                        continue
+                    stat = checked.stat()
+                    hits.append({
+                        "path": str(checked),
+                        "size_text": _fmt_size(stat.st_size),
+                        "mtime": _fmt_time(stat.st_mtime),
+                    })
                 except OSError:
                     continue
                 if len(hits) >= MAX_SEARCH:
