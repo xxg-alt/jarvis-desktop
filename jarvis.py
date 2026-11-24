@@ -3680,7 +3680,6 @@ def note_current_task(command, plan, reply="", source=""):
 _ENTITY_TTL = 300.0          # 约 5 分钟
 _ENTITY_TURNS = 10           # 或 10 轮, 先到者为准
 _ENTITY_MAX = 8
-_ENTITY_TIE_GAP = 1.0        # 同一轮且时间几乎相同 = 分不出先后
 _ENTITY_REF_TTL = 60.0       # 歧义反问的待选答复窗口, 与高危确认同风格
 _DEVICE_ALIASES = (
     ("电视机", "电视"), ("空调", "冷气"), ("电灯", "台灯", "灯"),
@@ -3716,8 +3715,11 @@ def _is_pronoun(text):
     return t in _PRONOUNS
 
 
-def _add_entity(name, typ, source="", ts=None, turn=None):
-    """写入/刷新一条最近实体: 同名同类只刷新, 不重复占清单位。"""
+def _add_entity(name, typ, source="", ts=None, turn=None, executed=False):
+    """写入/刷新一条最近实体: 同名同类只刷新, 不重复占清单位。
+
+    executed 标记"真动过手的目标"; 只提过没操作过的实体不能凭新近就压过别人。
+    """
     name = _tight(str(name or "")).strip("。！？，、；:")
     if not name or _is_pronoun(name) or name in ("屏幕", "这个", "那个"):
         return
@@ -3731,11 +3733,12 @@ def _add_entity(name, typ, source="", ts=None, turn=None):
     at_turn = int(turn) if turn is not None else int(_CURRENT_TASK.get("turn") or 0)
     for ent in ents:
         if ent.get("name") == name and ent.get("type") == typ:
-            ent.update(ts=at, turn=at_turn, source=_source_label(source) or ent.get("source", ""))
+            ent.update(ts=at, turn=at_turn, source=_source_label(source) or ent.get("source", ""),
+                       executed=bool(ent.get("executed")) or bool(executed))
             break
     else:
         ents.append({"name": name, "type": str(typ), "ts": at, "turn": at_turn,
-                     "source": _source_label(source)})
+                     "source": _source_label(source), "executed": bool(executed)})
     if len(ents) > _ENTITY_MAX:
         del ents[:len(ents) - _ENTITY_MAX]
 
@@ -3808,7 +3811,7 @@ def note_screen_target(plan, source=""):
     elif action == "click_screen":
         name = str(args.get("target") or "")
         if name:
-            _add_entity(name, "ui", source)
+            _add_entity(name, "ui", source, executed=True)
 
 
 def note_action_entity(plan, source=""):
@@ -3826,7 +3829,7 @@ def note_action_entity(plan, source=""):
     if action == "peek_screen":
         name = _ui_from_peek(args.get("question") or "") or name
     if name:
-        _add_entity(name, kind, source)
+        _add_entity(name, kind, source, executed=(action != "peek_screen"))
 
 
 def _live_entities():
@@ -3854,10 +3857,41 @@ def recent_entities_context_line():
             "打开→应用/文件/设备，点→界面元素，关→应用/设备；分不清就问，不要编造。")
 
 
+def _set_ref_state(status, name="", kind="", typ=""):
+    """本地解析结论: 结构化结论只此一份, 规划器只许沿用。"""
+    _TL.ref_state = {"status": str(status or ""), "name": str(name or ""),
+                     "kind": str(kind or ""), "typ": str(typ or "")}
+
+
+def _ref_state():
+    state = getattr(_TL, "ref_state", None)
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def _ref_command(kind, name):
+    """解析后的明确原话: 与普通解析路径一致, 供点击闸门复查。"""
+    if kind == "click":
+        return f"点一下{name}"
+    if kind == "close":
+        return f"把{name}关掉"
+    return f"打开{name}"
+
+
+def _reference_context_line():
+    state = _ref_state()
+    if state.get("status") == "resolved" and state.get("name"):
+        return f"【指代解析】代词已解析为 {state['name']}，规划沿用；不要另行解析或改换目标。"
+    if state.get("status") in ("ambiguous", "empty"):
+        return "【指代解析】本地未判定；目标只能取【最近提到的东西】清单里的实体，不许编造。"
+    return ""
+
+
 def _with_reference_context(memory_context):
-    line = recent_entities_context_line()
-    return ((str(memory_context or "").strip() + "\n" + line) if line
-            else str(memory_context or ""))
+    lines = [str(memory_context or "").strip()]
+    for line in (recent_entities_context_line(), _reference_context_line()):
+        if line:
+            lines.append(line)
+    return "\n".join(part for part in lines if part)
 
 
 def _ref_target(kind, text):
@@ -3882,8 +3916,17 @@ def _plan_target(plan):
     return str(args.get("name") or args.get("target") or args.get("query") or "")
 
 
+def _entity_executed(entity):
+    return bool((entity or {}).get("executed"))
+
+
 def _pick_reference(candidates):
-    """返回 (状态, 实体或候选列表): 最近且同轮同一瞬的多个候选才算分不出。"""
+    """返回 (状态, 实体或候选列表)。
+
+    放宽后的歧义判据: 前二候选都只提过没操作过、提及轮次相差 <=1 轮, 就反问,
+    不再要求同一轮 + 同一秒。刚执行过的动作目标不算"只提过", 可以最近优先;
+    紧邻上一轮提到的目标若比另一候选新出一轮以上, 也不落进歧义窗口。
+    """
     if not candidates:
         return "empty", []
     ordered = sorted(candidates,
@@ -3891,9 +3934,9 @@ def _pick_reference(candidates):
                      reverse=True)
     if len(ordered) > 1:
         top, second = ordered[0], ordered[1]
-        same_turn = int(top.get("turn") or 0) == int(second.get("turn") or 0)
-        near_time = abs(float(top.get("ts") or 0) - float(second.get("ts") or 0)) <= _ENTITY_TIE_GAP
-        if same_turn and near_time:
+        gap = abs(int(top.get("turn") or 0) - int(second.get("turn") or 0))
+        both_mention_only = not _entity_executed(top) and not _entity_executed(second)
+        if gap <= 1 and both_mention_only:
             return "ambiguous", list(reversed(ordered[:4]))   # 按提到顺序编号, 便于用户选
     return "resolved", ordered[0]
 
@@ -3910,11 +3953,18 @@ def _exe_for(name, typ):
 
 
 def _reference_plan(kind, entity, source=""):
-    """把解析出的实体交给原有动作通道; reference 字段供护栏报出实体名。"""
+    """把解析出的实体交给原有动作通道; reference 字段供护栏报出实体名。
+
+    设备/其它类实体只许"解析出来、点名说清", 不许当应用假装打开 —— 闲聊里
+    提到的电视机可以听懂指代, 但系统没有控制它的能力, 不能靠 open_app 冒充。
+    """
     name = str(entity.get("name") or "")
     typ = str(entity.get("type") or "other")
     ref = {"name": name, "type": typ, "source": _source_label(source),
            "turn": int(entity.get("turn") or 0)}
+    if typ in ("device", "other"):
+        return {"action": "chat", "args": {}, "reference": ref,
+                "say": f"你指的是{name}，我现在没有控制{name}的本事，Sir"}
     if kind == "click":
         return {"action": "click_screen", "args": {"target": name},
                 "say": f"我点一下{name}", "reference": ref}
@@ -3953,18 +4003,19 @@ def resolve_reference(text, plan=None, source=""):
     candidates = [e for e in _live_entities() if e.get("type") in _REF_TYPES[kind]]
     status, picked = _pick_reference(candidates)
     if status == "ambiguous":
+        _set_ref_state(status, kind=kind)
         _arm_reference_selection(kind, raw, picked, source)
         names = "、".join(f"{i + 1} {e.get('name')}" for i, e in enumerate(picked))
         speak(f"你指的是哪个：{names}？说第几条就行，Sir")
         return {"status": "ambiguous"}
     if status == "empty":
+        _set_ref_state(status, kind=kind)
         speak("你指的是哪个，Sir")
         return {"status": "empty"}
-    rewritten = (f"点一下{picked.get('name')}" if kind == "click" else
-                 f"把{picked.get('name')}关掉" if kind == "close" else
-                 f"打开{picked.get('name')}")
+    _set_ref_state(status, name=str(picked.get("name") or ""), kind=kind,
+                   typ=str(picked.get("type") or ""))
     return {"status": "resolved", "plan": _reference_plan(kind, picked, source),
-            "command": rewritten}
+            "command": _ref_command(kind, str(picked.get("name") or ""))}
 
 
 def _reference_answer(text, source=""):
@@ -4012,6 +4063,86 @@ def _consume_reference_choice():
         out = dict(_REF_PENDING)
         _REF_PENDING.update(active=False, chosen=None, candidates=[])
         return out
+
+
+def _plan_target_field(plan):
+    args = (plan or {}).get("args") or {}
+    for key in ("name", "target", "query", "url", "folder"):
+        if key in args:
+            return key
+    return ""
+
+
+def _plan_reference(plan):
+    """规划器自己填的目标: 本地没定时必须能在清单里验到, 否则算编造。"""
+    state = _ref_state()
+    if not state.get("status"):
+        return True
+    names = {str(e.get("name") or "") for e in _live_entities()}
+    key, target = _plan_target_field(plan), _plan_target(plan)
+    if state["status"] == "resolved" and target and target != state.get("name"):
+        return False
+    if state["status"] in ("ambiguous", "empty") and target and target not in names:
+        return False
+    return True
+
+
+def _align_plan_to_reference(plan, source=""):
+    """本地解析是唯一结构化结论: 规划器目标不一致时改回本地结论, 编造则拒执。"""
+    if not plan:
+        return plan
+    state = _ref_state()
+    if not state.get("status"):
+        return plan
+    key, target = _plan_target_field(plan), _plan_target(plan)
+    if _plan_reference(plan):
+        return plan
+    if state["status"] in ("ambiguous", "empty"):
+        print("[指代护栏] 规划目标不在最近实体清单内, 拒绝执行", flush=True)
+        speak("你指的是哪个，Sir")
+        return None
+    name = str(state.get("name") or "")
+    out = dict(plan)
+    out["args"] = dict((plan.get("args") or {}))
+    if key:
+        out["args"][key] = name
+    out["reference"] = {"name": name, "type": state.get("typ") or "app",
+                        "source": _source_label(source)}
+    print(f"[指代护栏] 规划目标改为本地解析结论 {name}", flush=True)
+    return out
+
+
+def _resolve_danger_reference(plan, command, source=""):
+    """规划器返回的危险计划若目标还是代词, 先解析, 再把实体名写进护栏话术。"""
+    if not plan or not plan.get("danger"):
+        return plan
+    target = _plan_target(plan)
+    if not _is_pronoun(target):
+        return plan
+    action = str(plan.get("action") or "")
+    kind = ("click" if action == "click_screen" else
+            "close" if action in ("close_app", "shutdown") else "open")
+    candidates = [e for e in _live_entities() if e.get("type") in _REF_TYPES[kind]]
+    status, picked = _pick_reference(candidates)
+    if status != "resolved":
+        _set_ref_state(status, kind=kind)
+        speak("你指的是哪个，Sir")
+        return None
+    name = str(picked.get("name") or "")
+    _set_ref_state("resolved", name=name, kind=kind, typ=str(picked.get("type") or ""))
+    out = dict(plan)
+    out["args"] = dict(plan.get("args") or {})
+    key = _plan_target_field(plan)
+    if key:
+        out["args"][key] = name
+    if key == "name" and "exe" in out["args"]:
+        out["args"]["exe"] = _exe_for(name, str(picked.get("type") or "")) or out["args"]["exe"]
+    ref = {"name": name, "type": str(picked.get("type") or "other"),
+           "source": _source_label(source), "turn": int(picked.get("turn") or 0)}
+    out["reference"] = ref
+    desc = str(plan.get("guard_desc") or f"执行操作：{action}")
+    out["guard_desc"] = desc if name in desc else f"{desc}（目标：{name}）"
+    return out
 
 
 def gemini_plan(command, memory_context=""):
@@ -4684,6 +4815,7 @@ def handle_command(command, source=""):
     # 原话留在 thread-local: 模型漏填 folder 时, 写文档要用它兜底解析存放位置
     _TL.user_text = command
     _TL.command_source = src
+    _TL.ref_state = {}          # 每条指令的本地指代结论独立, 不串到下一轮
     if source:
         print(f"[指令·{source}] {command[:80]}", flush=True)
     # 新指令一到先停掉上一条的声音；旧线程随后算出的结果都会因编号过期被丢弃。
@@ -4934,9 +5066,14 @@ def _handle_command_inner(command, command_id, source=""):
     # 本地直达和规划通道都从同一份清单取实体, 结果一致。
     choice = _consume_reference_choice()
     if choice:
-        plan = _reference_plan(choice.get("action_kind") or "open", choice["chosen"], source)
-        command = str(choice.get("command") or command)
+        kind = str(choice.get("action_kind") or "open")
+        picked = choice["chosen"]
+        plan = _reference_plan(kind, picked, source)
+        # 选择答复被消费后必须落回明确原话: 点击闸门会复查 _TL.user_text。
+        command = _ref_command(kind, str(picked.get("name") or ""))
         _TL.user_text = command
+        _set_ref_state("resolved", name=str(picked.get("name") or ""), kind=kind,
+                       typ=str(picked.get("type") or ""))
         plan_source = "local"
     else:
         ref = resolve_reference(command, plan, source)
@@ -5011,6 +5148,20 @@ def _handle_command_inner(command, command_id, source=""):
         plan = gemini_plan(command, memory_context if 'memory_context' in locals() else "")
         if plan is not None:
             plan_source = "gemini"
+
+    # 3.5 指代护栏: 规划器的危险计划仍是代词就先解析; 目标必须对齐本地结论/清单。
+    if plan is not None and plan_source in ("llm", "gemini"):
+        plan = _resolve_danger_reference(plan, command, source)
+        if plan is None:
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+            return
+    if plan is not None:
+        plan = _align_plan_to_reference(plan, source)
+        if plan is None:
+            if ui_bridge is not None:
+                ui_bridge.emit_state("IDLE")
+            return
 
     # 4. 用户对上一轮理解不满并给出正确指令时，保存纠正案例。
     previous = MEMORY.last_exchange()

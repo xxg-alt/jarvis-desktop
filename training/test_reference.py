@@ -66,7 +66,7 @@ def fake_exec(plan, command_id=None, source=""):
 
 def fake_perform(plan, source=""):
     performed.append(dict(plan or {}))
-    return "桩动作已完成"
+    return str((plan or {}).get("say") or "桩动作已完成")
 
 
 def fake_free_chat(command, config, memory_context=""):
@@ -90,6 +90,7 @@ def reset():
         jarvis._GUARD.update(active=False, answer="", event=None)
     with jarvis._REF_LOCK:
         jarvis._REF_PENDING.update(active=False, chosen=None, candidates=[])
+    jarvis._TL.ref_state = {}
 
 
 def run(text, source=""):
@@ -97,6 +98,14 @@ def run(text, source=""):
     plans.clear()
     jarvis.handle_command(text, source=source)
     return list(spoken), [str(p.get("action") or "") for p in plans]
+
+
+def run_real_exec(text, source=""):
+    jarvis.execute_plan = saved[1][2]
+    try:
+        return run(text, source)
+    finally:
+        jarvis.execute_plan = fake_exec
 
 
 def entities():
@@ -122,47 +131,91 @@ with tempfile.TemporaryDirectory() as tmp:
     llm_brain.query_llm_plan = fake_plan
     llm_brain.free_chat = fake_free_chat
     try:
-        # ---- 用户原例: 闲聊轮提到电视机, 下一轮"打开他" ----
+        # ---- (1) 闲聊提到的设备只能解析, 不许当应用假装打开 ----
         reset()
-        out, acts = run("我刚买了台电视机")
+        out, acts = run("我家的电视机坏了")
         check(not [a for a in acts if a != "chat"], f"闲聊轮不动手: {acts}")
         check(any(e["name"] == "电视机" and e["type"] == "device" for e in entities()),
               f"入口①: 闲聊轮提到的电视机进清单, 实际 {entities()}")
-        out, acts = run("打开他")
-        check(acts == ["open_app"] and plans[0]["args"].get("name") == "电视机",
-              f"用户原例: 打开他 → 对电视机执行打开, 实际 {acts} / {plans}")
-        check(not any("哪个" in line for line in out), f"单候选不反问: {out}")
+        out, acts = run("打开它")
+        check("open_app" not in acts and acts == ["chat"],
+              f"设备只解析不执行: {acts} / {plans}")
+        check("电视机" in plans[0]["say"] and "没有控制电视机" in plans[0]["say"],
+              f"点名实体并如实说没有控制能力: {plans[0].get('say')}")
         check(plans[0].get("reference", {}).get("name") == "电视机",
               "解析结果带实体来源, 护栏可核对")
+        out, acts = run_real_exec("打开它")
+        check(any("电视机" in line and "没有控制电视机" in line for line in out)
+              and not [p for p in performed if p.get("action") != "chat"],
+              f"真实执行路径也要如实答复且不产生动作: {out} / {performed}")
 
-        # ---- 两实体分先后: 取最近的空调 ----
+        # ---- app/file 照常执行 ----
         reset()
-        run("我刚买了台电视机")
-        run("客厅新装了空调")
+        run("我刚用微信聊了两句")
         out, acts = run("打开它")
-        check(acts == ["open_app"] and plans[0]["args"].get("name") == "空调",
-              f"先电视后空调: 打开它 → 最近的空调, 实际 {plans}")
+        check(acts == ["open_app"] and plans[0]["args"].get("name") == "微信",
+              f"应用类照常打开: {acts} / {plans}")
+        reset()
+        jarvis._add_entity("周报.md", "file")
+        out, acts = run("打开它")
+        check(acts == ["open_file"] and plans[0]["args"].get("name") == "周报.md",
+              f"文件类照常打开: {acts} / {plans}")
 
-        # ---- 几乎同时提到: 只问一句, 不先执行, 答复走共用选择机制 ----
+        # ---- (2) 放宽歧义: 只提过没操作过的相邻两轮候选要反问 ----
         reset()
-        run("我刚买了电视机和空调")
+        run("我装了微信")
+        run("又装了QQ")
         out, acts = run("打开它")
-        check(not acts, f"歧义: 反问时绝不先执行, 实际 {acts}")
-        check(any("哪个" in line and "电视机" in line and "空调" in line for line in out),
-              f"歧义: 一句话列出候选反问, 实际 {out}")
+        check(not acts, f"相邻两轮都只提过: 反问时绝不先执行, 实际 {acts}")
+        check(any("哪个" in line and "微信" in line and "qq" in line for line in out),
+              f"相邻两轮候选一句话列出反问, 实际 {out}")
         out2, acts2 = run("第2条")
-        check(acts2 == ["open_app"] and plans[0]["args"].get("name") == "空调",
-              f"歧义: 共用的'第N条'答复选中空调, 实际 {acts2} / {plans}")
+        check(acts2 == ["open_app"] and plans[0]["args"].get("name") == "qq",
+              f"共用的'第N条'答复选中 qq, 实际 {acts2} / {plans}")
 
-        # ---- 入口③: 看屏看过按钮后, "点一下这个" ----
+        # ---- 最近优先例外一: 刚执行过的动作目标 ----
+        reset()
+        run("我提了微信和QQ")
+        out, acts = run("打开QQ")
+        check(acts == ["open_app"] and any(e["name"] == "qq" and e["executed"]
+              for e in entities()), f"执行过的目标带动作标记: {entities()}")
+        out, acts = run("打开它")
+        check(acts == ["open_app"] and plans[0]["args"].get("name") == "qq",
+              f"刚执行过的目标最近优先, 实际 {plans}")
+
+        # ---- 最近优先例外二: 紧邻上一轮提到, 更早候选已在两轮以外 ----
+        reset()
+        run("我装了微信")
+        run("今天天气不错")
+        run("又装了QQ")
+        out, acts = run("打开它")
+        check(acts == ["open_app"] and plans[0]["args"].get("name") == "qq",
+              f"紧邻上一轮提到的目标最近优先, 实际 {acts} / {plans}")
+
+        # ---- 入口③ + (3) 歧义选择消费后改写成明确命令, 点击闸门复查通过 ----
         reset()
         out, acts = run("看看屏幕上那个进入微信按钮是什么")
         check(acts and acts[-1] == "peek_screen", f"看屏轮走到 peek_screen: {acts}")
         check(any(e["name"] == "进入微信按钮" and e["type"] == "ui" for e in entities()),
               f"入口③: 看屏目标描述进清单, 实际 {entities()}")
+        run("看看屏幕上那个返回按钮是什么")
+        out, acts = run("点一下这个")
+        check(not acts and any("哪个" in line and "进入微信按钮" in line
+              and "返回按钮" in line for line in out),
+              f"两个界面目标歧义反问且不先执行: {out} / {acts}")
+        out2, acts2 = run_real_exec("第2条")
+        check(getattr(jarvis._TL, "user_text", "") == "点一下返回按钮",
+              f"选择消费后原话改写成含实体名的明确命令: {getattr(jarvis._TL, 'user_text', '')}")
+        check(performed and performed[-1].get("action") == "click_screen"
+              and performed[-1]["args"].get("target") == "返回按钮",
+              f"点击闸门复查通过并成功点击: {performed}")
+        check(not any("您明确说要点哪个按钮" in line for line in out2),
+              f"点击没有被闸门拒绝: {out2}")
+        reset()
+        out, acts = run("看看屏幕上那个进入微信按钮是什么")
         out, acts = run("点一下这个")
         check(acts == ["click_screen"] and plans[0]["args"].get("target") == "进入微信按钮",
-              f"点一下这个 → 点刚看过的按钮, 实际 {plans}")
+              f"单界面候选照常点选: {plans}")
         check("进入微信按钮" in str(getattr(jarvis._TL, "user_text", "")),
               "点击闸门拿到的是解析后的明确目标原话")
 
@@ -190,7 +243,8 @@ with tempfile.TemporaryDirectory() as tmp:
         reset()
         jarvis.note_current_task("打开自研工具",
                                  {"action": "open_app", "args": {"name": "自研工具"}})
-        check(any(e["name"] == "自研工具" and e["type"] == "app" for e in entities()),
+        check(any(e["name"] == "自研工具" and e["type"] == "app" and e["executed"]
+              for e in entities()),
               f"入口②: note_current_task 写回执行目标, 实际 {entities()}")
         check(jarvis.current_task_snapshot().get("target") == "自研工具",
               "当前任务记录与实体清单同源, 不是两套状态")
@@ -208,19 +262,58 @@ with tempfile.TemporaryDirectory() as tmp:
               f"护栏话术含解析出的实体名且未确认不执行, 实际 {guard_desc} / {performed}")
         jarvis._guard_confirm = saved[7][2]
 
-        # ---- 规划器通道: 上下文行 + 本地/规划同口径 ----
+        # ---- (5) 规划器的危险计划目标还是代词: 先解析再写进护栏话术 ----
         reset()
-        run("我刚买了台电视机")
+        run("我装了微信")
+        guard_desc.clear()
+        jarvis._guard_confirm = lambda desc, **kw: guard_desc.append(desc) or False
+        llm_brain.query_llm_plan = (lambda command, config, memory_context="":
+                                    {"action": "close_app", "args": {"exe": "", "name": "它"},
+                                     "danger": True, "guard_desc": "关闭它", "say": "这就关掉它"})
+        out, acts = run("结束掉它")
+        check(acts == ["close_app"] and plans[0]["args"].get("name") == "微信"
+              and "微信" in plans[0].get("guard_desc", ""),
+              f"规划器危险计划的代词目标先本地解析并写入话术: {plans}")
+        saved[1][2](dict(plans[0]), source="text")
+        check(len(guard_desc) == 1 and "微信" in guard_desc[0] and not performed,
+              f"打桩确认前拦住危险动作: {guard_desc} / {performed}")
+        llm_brain.query_llm_plan = fake_plan
+        jarvis._guard_confirm = saved[7][2]
+
+        # ---- (4) 本地解析是唯一结构化结论; 未判定时规划目标须在清单内 ----
+        reset()
+        run("我装了微信")
         run("帮我弄一下那个东西")
         plan_ctx = [ctx for kind, ctx in contexts if kind == "plan"]
         check(bool(plan_ctx) and "【最近提到的东西】" in plan_ctx[-1]
-              and "电视机" in plan_ctx[-1],
+              and "微信" in plan_ctx[-1],
               f"规划器提示加了最近实体上下文行, 实际 {plan_ctx}")
-        check("【指代规则】" in llm_brain.SYSTEM_PROMPT,
-              "规划器静态提示声明按清单解析代词")
+        check("【指代规则】" in llm_brain.SYSTEM_PROMPT
+              and "唯一结构化结论" in llm_brain.SYSTEM_PROMPT,
+              "规划器静态提示声明本地结论唯一")
+        jarvis.resolve_reference("打开它", None, "text")
+        ctx = jarvis._with_reference_context("记忆")
+        check("代词已解析为 微信，规划沿用" in ctx,
+              f"上下文行写明解析结果让规划沿用: {ctx}")
+        wrong = {"action": "open_app", "args": {"name": "QQ"}, "say": ""}
+        aligned = jarvis._align_plan_to_reference(wrong, "text")
+        check(aligned["args"].get("name") == "微信"
+              and aligned.get("reference", {}).get("name") == "微信",
+              f"规划器目标与本地结论不一致时改回本地结论: {aligned}")
+        reset()
+        run("我装了微信")
+        run("又装了QQ")
+        out, acts = run("打开它")
+        fabricated = {"action": "open_app", "args": {"name": "编造的应用"}, "say": ""}
+        check(jarvis._align_plan_to_reference(fabricated, "text") is None
+              and not acts and any("哪个" in line for line in spoken),
+              f"本地歧义时规划器编造实体必须拒执: {spoken} / {acts}")
+        reset()
+        run("我装了微信")
         local_plan = jarvis.resolve_reference("打开它")["plan"]
-        check(local_plan["args"].get("name") in plan_ctx[-1],
-              "本地直达与规划上下文指向同一实体")
+        check(local_plan["args"].get("name") == "微信"
+              and "微信" in jarvis._with_reference_context(""),
+              f"本地直达与规划上下文指向同一实体: {local_plan}")
     finally:
         for obj, attr, value in saved:
             if (obj, attr) == (memory_store, "_STORE"):
