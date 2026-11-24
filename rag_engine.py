@@ -24,13 +24,26 @@ INDEX_PATH = Path(_INDEX_ENV) if _INDEX_ENV else (
     Path(os.environ.get("APPDATA") or Path.home()) / "Jarvis" / "rag_index.json"
 )
 
-# 正式环境只扫 桌面/下载/文档 三个授权目录; 测试可用 JARVIS_DOC_DIRS 覆盖 (分号分隔)
+# 默认扫描根与文件工具共用 allowed_roots() 这一处白名单; 测试可用 JARVIS_DOC_DIRS 覆盖 (分号分隔)
 _ENV_DIRS = os.environ.get("JARVIS_DOC_DIRS", "").strip()
-DOC_DIRS = (
-    [Path(p) for p in _ENV_DIRS.split(";") if p.strip()]
-    if _ENV_DIRS
-    else [Path.home() / "Desktop", Path.home() / "Downloads", Path.home() / "Documents"]
-)
+DOC_DIRS = []
+
+
+def doc_dirs() -> list:
+    """RAG 扫描根：默认从文件工具白名单现取，不在这里另列一套目录。"""
+    if _ENV_DIRS:
+        roots = [Path(p) for p in _ENV_DIRS.split(";") if p.strip()]
+    else:
+        try:
+            from system_tools import allowed_roots
+            roots = [Path(p) for p in allowed_roots()]
+        except Exception as exc:
+            print(f"[RAG] 授权目录读取失败: {exc}")
+            roots = []
+    DOC_DIRS[:] = roots
+    return DOC_DIRS
+
+
 DOC_EXTS = {".txt", ".md", ".pdf", ".docx"}
 MAX_FILE_MB = 10
 MAX_CHUNKS = 4000        # 全库片段上限, 防索引无限膨胀
@@ -256,7 +269,7 @@ def _chunks(text: str):
 
 
 def _iter_doc_files():
-    for root in DOC_DIRS:
+    for root in doc_dirs():
         if not root.exists():
             continue
         stack = [(root, 0)]

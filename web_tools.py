@@ -8,8 +8,10 @@
 - 回答纪律: 只依据抓到的内容, 带出处, 查不到就直说, 不编造。
 """
 import html as html_lib
+import ipaddress
 import re
-from urllib.parse import quote, urlsplit
+import socket
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
@@ -31,6 +33,11 @@ _WARM_HOMES = {
 _QUERY_CACHE = {}
 _CACHE_TTL = 600
 _ENGINE_FAILS = {}
+
+_WEB_READ_CHARS = 6000
+_WEB_READ_BYTES = 512 * 1024
+_MAX_REDIRECTS = 5
+_TEXT_TYPES = ("text/", "application/json", "application/xml", "+xml")
 
 
 def _fetch_page(url, timeout=_SEARCH_TIMEOUT):
@@ -54,6 +61,180 @@ def _fetch_page(url, timeout=_SEARCH_TIMEOUT):
     except Exception as exc:
         print(f"[联网搜索] 请求失败 {host}: {exc}")
         return 0, ""
+
+
+def _blocked_ip(address) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(address))
+    except ValueError:
+        return True
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _safe_host(host) -> tuple:
+    name = str(host or "").strip().lower().rstrip(".")
+    if not name or name == "localhost" or name.endswith((".localhost", ".local", ".internal")):
+        return False, "这个地址指向本机或内网"
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        address = None
+    if address is not None:
+        if _blocked_ip(address):
+            return False, "这个地址指向本机或内网"
+        return True, ""
+    try:
+        infos = socket.getaddrinfo(name, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return False, f"域名解析不了：{exc}"
+    if not infos:
+        return False, "域名解析不到地址"
+    for info in infos:
+        address = info[4][0] if len(info) > 4 and info[4] else ""
+        if _blocked_ip(address):
+            return False, "这个域名指向本机或内网地址"
+    return True, ""
+
+
+def _safe_url(url) -> tuple:
+    raw = str(url or "").strip()
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False, "这个网址格式不对", None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
+        return False, "我只读 http 或 https 的网页", None
+    if parts.username or parts.password:
+        return False, "这个网址带了登录信息，我不读", None
+    try:
+        port = parts.port
+    except ValueError:
+        return False, "这个网址的端口不对，我不读", None
+    if port is not None and port != (80 if scheme == "http" else 443):
+        return False, "我只读 80 或 443 端口的网页", None
+    ok, reason = _safe_host(parts.hostname)
+    return ok, reason, parts
+
+
+def _peer_ip(response) -> str:
+    """取实际连接对端 IP（含 DNS rebinding 后的真实落点）；拿不到就 fail closed。"""
+    raw = getattr(response, "raw", None)
+    sock = getattr(getattr(raw, "_connection", None), "sock", None)
+    if sock is None:
+        return ""
+    try:
+        return str(sock.getpeername()[0])
+    except (OSError, TypeError, ValueError, IndexError):
+        return ""
+
+
+def _response_bytes(response, max_bytes: int) -> bytes:
+    """只从流式响应读正文；绝不碰 .content/.text，避免校验对端前把正文读进来。"""
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        chunks, total = [], 0
+        for chunk in iterator(8192):
+            if not chunk:
+                continue
+            piece = chunk[:max_bytes - total]
+            chunks.append(piece)
+            total += len(piece)
+            if total >= max_bytes:
+                break
+        return b"".join(chunks)
+    read = getattr(getattr(response, "raw", None), "read", None)
+    if callable(read):
+        try:
+            data = read(max_bytes)
+        except Exception:
+            return b""
+        return data[:max_bytes] if isinstance(data, bytes) else b""
+    return b""
+
+
+def _decode_web(data: bytes, response) -> str:
+    encoding = str(getattr(response, "encoding", "") or "").strip()
+    for candidate in (encoding, "utf-8", "gbk"):
+        if not candidate:
+            continue
+        try:
+            return data.decode(candidate)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def fetch_web_text(url, limit=_WEB_READ_CHARS, timeout=_FETCH_TIMEOUT) -> tuple:
+    """只读抓取器：每一跳先校验 URL/DNS，再用 getpeername 校验实际对端公网 IP，最后才流式读正文。"""
+    current = str(url or "").strip()
+    seen = set()
+    for _ in range(_MAX_REDIRECTS + 1):
+        if current in seen:
+            return False, "", {"reason": "重定向形成了循环", "url": current}
+        seen.add(current)
+        ok, reason, _parts = _safe_url(current)
+        if not ok:
+            return False, "", {"reason": reason, "url": current}
+        try:
+            response = requests.get(current, headers=_HEADERS, timeout=timeout,
+                                    allow_redirects=False, stream=True)
+        except Exception as exc:
+            return False, "", {"reason": f"网页抓取失败：{exc}", "url": current}
+        close = getattr(response, "close", None)
+        try:
+            peer = _peer_ip(response)
+            if not peer:
+                return False, "", {"reason": "拿不到实际连接对端地址，已中断", "url": current}
+            if _blocked_ip(peer):
+                return False, "", {"reason": f"实际连接对端 {peer} 不是公网地址，已中断", "url": current}
+            status = int(getattr(response, "status_code", 0) or 0)
+            headers = getattr(response, "headers", {}) or {}
+            location = headers.get("Location") or headers.get("location") or ""
+            if status in (301, 302, 303, 307, 308) and location:
+                current = urljoin(current, location)
+                continue
+            if status != 200:
+                return False, "", {"reason": f"网页返回 HTTP {status}", "url": current}
+            ctype = str(headers.get("Content-Type") or
+                        headers.get("content-type") or "text/html").lower()
+            if not any(kind in ctype for kind in _TEXT_TYPES):
+                return False, "", {"reason": f"这是下载类内容（{ctype[:60]}），我只读网页正文，不保存文件",
+                                   "content_type": ctype, "url": current}
+            data = _response_bytes(response, _WEB_READ_BYTES)
+            if b"\x00" in data[:4096]:
+                return False, "", {"reason": "网页正文不是文本", "url": current}
+            text = _clean(re.sub(r"<script.*?</script>|<style.*?</style>", " ",
+                                 _decode_web(data, response), flags=re.S | re.I))
+            if not text:
+                return False, "", {"reason": "网页清洗后没有正文", "url": current}
+            return True, text[:limit], {"url": current, "final_url": current,
+                                        "content_type": ctype,
+                                        "truncated": len(text) > limit,
+                                        "untrusted": True}
+        finally:
+            if callable(close):
+                close()
+    return False, "", {"reason": "重定向次数太多", "url": current}
+
+
+def web_read(url, limit=_WEB_READ_CHARS) -> dict:
+    """网页正文只读工具：内容一律当不可信数据，不保存任何下载内容。"""
+    raw = str(url or "").strip()
+    ok, text, info = fetch_web_text(raw, limit=limit)
+    if not ok:
+        reason = str(info.get("reason") or "抓不到网页正文")
+        return {"ok": False, "summary": f"读不了这个网页：{reason}",
+                "data": {"url": raw, "reason": reason, "untrusted": True},
+                "danger": False}
+    return {"ok": True,
+            "summary": f"读到了网页正文，共 {len(text)} 字（内容不可信，只当数据）",
+            "data": {"url": raw, "final_url": info.get("final_url") or raw,
+                     "text": text, "truncated": bool(info.get("truncated")),
+                     "content_type": info.get("content_type") or "",
+                     "untrusted": True},
+            "danger": False}
 
 
 def _clean(fragment):
@@ -180,17 +361,11 @@ def web_search(query, limit=5):
 
 def fetch_text(url, limit=2500):
     """抓网页正文纯文本 (去脚本/样式/标签), 失败返回空串。"""
-    try:
-        r = requests.get(url, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
-        if r.status_code != 200 or "text/html" not in r.headers.get("Content-Type", "text/html"):
-            return ""
-        text = r.text
-    except Exception as exc:
-        print(f"[联网搜索] 抓取失败 {url}: {exc}")
-        return ""
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text, flags=re.S | re.I)
-    text = _clean(text)
-    return text[:limit]
+    ok, text, info = fetch_web_text(url, limit=limit)
+    if ok:
+        return text
+    print(f"[联网搜索] 抓取失败 {url}: {info.get('reason', '')}")
+    return ""
 
 
 _WEB_SYSTEM = (
