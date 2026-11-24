@@ -6,11 +6,13 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import agent_core
 import jarvis
 import llm_brain
 
@@ -66,6 +68,20 @@ def run_task(step, source="local", state="waiting_user"):
     tasks = load_raw()["tasks"]
     tasks[0] = task
     jarvis._agent_save_tasks({"tasks": tasks})
+    return task
+
+
+def rebuild_waiting(task, index=0):
+    """模拟用户读完脱敏摘要后重建步骤: 原敏感参数不再出现, 回到等待放行。"""
+    step = task["steps"][index]
+    step.pop("redacted", None)
+    step.pop("rebuild_note", None)
+    args = step.setdefault("args", {})
+    for key in ("content", "content_len", "content_sha256", "content_redacted",
+                "command", "command_masked", "command_redacted"):
+        args.pop(key, None)
+    step["status"] = "waiting"
+    task["state"] = "waiting_user"
     return task
 
 
@@ -161,9 +177,7 @@ try:
           "3a agent_draft_plan 归一保留 guard_desc(落盘只留脱敏摘要)")
     check("Remove-Item" in saved["say"], "3b 挂起话术含具体命令")
 
-    task = load_raw()["tasks"][0]
-    task["state"] = "waiting_user"
-    task["steps"][0]["status"] = "waiting"
+    task = rebuild_waiting(load_raw()["tasks"][0])
     jarvis._agent_save_tasks({"tasks": [task]})
     res = jarvis.agent_continue()
     check("Remove-Item" in res.get("say", "") and "执行命令" in res.get("say", ""),
@@ -187,6 +201,9 @@ try:
                "approved_fingerprint": jarvis._agent_step_fingerprint(old),
                "approved_scope": jarvis.AGENT_SCOPE_NOTIFY}
     run_task(changed)
+    rebuilt = load_raw()
+    rebuild_waiting(rebuilt["tasks"][0])
+    jarvis._agent_save_tasks(rebuilt)
     res = jarvis.agent_continue()
     data = load_raw()["tasks"][0]
     cur = data["steps"][0]
@@ -229,6 +246,9 @@ try:
           "5b 跨源 continue 被拒, 任务仍挂起")
     check(jarvis._agent_control_command("继续任务", source="local") is None,
           "5c 遥控「继续任务」不能放行本地/远端错源任务")
+    rebuilt = load_raw()
+    rebuild_waiting(rebuilt["tasks"][0])
+    jarvis._agent_save_tasks(rebuilt)
     res = jarvis.agent_continue(source="remote")
     check(load_raw()["tasks"][0]["state"] == "approved" and "已放行" in res.get("say", ""),
           "5d 同源 continue 正常放行")
@@ -308,6 +328,179 @@ finally:
     pass
 
 
+# ── 8. 脱敏账本重启恢复: 未执行步转"待用户重建", 不按空参数跑 ──
+try:
+    reset_tasks()
+    notes = []
+    jarvis._agent_notify = lambda text, spoken=False: notes.append(text)
+    secret = "重建专用机密内容ABCDEF"
+    command = "Remove-Item C:\\重建目录\\机密.txt"
+    data = {"tasks": [{"goal": "重启恢复任务", "state": "approved", "source": "remote",
+                       "steps": [
+        {"action": "write_file", "args": {"name": "草稿.md", "content": secret},
+         "say": "写草稿", "status": "pending", "scope": jarvis.AGENT_SCOPE_NOTIFY, "source": "remote"},
+        {"action": "run_powershell", "args": {"command": command},
+         "say": "清理", "status": "waiting", "scope": jarvis.AGENT_SCOPE_ASK, "source": "remote"},
+        {"action": "write_file", "args": {"name": "已完成.md", "content": "旧机密XYZ"},
+         "say": "已完成写入", "status": "done", "scope": jarvis.AGENT_SCOPE_NOTIFY,
+         "source": "remote", "result": "写入完成"},
+    ]}]}
+    jarvis._agent_save_tasks(data)
+    saved = load_raw()["tasks"][0]["steps"]
+    check(saved[0].get("redacted") is True and saved[1].get("redacted") is True
+          and saved[2].get("redacted") is not True,
+          "8a 保存时只给被脱敏的未执行步打 redacted 标记")
+
+    seen = []
+    jarvis._perform_plan = lambda plan, source="": seen.append(plan) or "stub"
+    jarvis._TL.action_ok = False
+    loaded = jarvis._agent_load_tasks()
+    steps = loaded["tasks"][0]["steps"]
+    check(steps[0]["status"] == jarvis.AGENT_STEP_REBUILD
+          and steps[1]["status"] == jarvis.AGENT_STEP_REBUILD,
+          "8b 重启加载: 带标记的 pending/waiting 步一律待用户重建")
+    check(steps[2]["status"] == "done" and "已完成写入" in steps[2]["say"]
+          and "旧机密XYZ" not in steps[2]["say"],
+          "8c 已完成步不重建, 展示脱敏照旧")
+    check(any("待用户重建" in n for n in notes), "8d 给用户一句重建说明")
+
+    res = jarvis.agent_continue(source="remote")
+    check(not seen and "重建" in res.get("say", "")
+          and load_raw()["tasks"][0]["state"] == "waiting_user",
+          "8e 重建步不被放行执行")
+    ok, text, tool = jarvis._agent_perform({"action": "run_powershell", "args": {},
+                                            "status": jarvis.AGENT_STEP_REBUILD,
+                                            "source": "remote"})
+    check(ok is False and "重建" in text and not seen,
+          "8f 直接调用执行器也不按空参数跑")
+
+    legacy = {"tasks": [{"goal": "旧脱敏账本", "state": "running", "source": "local",
+                         "steps": [{"action": "run_powershell",
+                                    "args": {"command_masked": "Remove-Item <路径已脱敏>",
+                                             "command_redacted": True},
+                                    "say": "清理", "status": "pending",
+                                    "scope": jarvis.AGENT_SCOPE_ASK, "source": "local"}]}]}
+    jarvis.AGENT_TASKS_PATH.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    old_loaded = jarvis._agent_load_tasks()
+    check(old_loaded["tasks"][0]["steps"][0]["status"] == jarvis.AGENT_STEP_REBUILD
+          and old_loaded["tasks"][0]["state"] == "waiting_user",
+          "8g 上一版只有 args 脱敏摘要的旧账本也按待重建迁移")
+finally:
+    jarvis._perform_plan = REAL["_perform_plan"]
+    jarvis._agent_notify = REAL["_agent_notify"]
+
+
+# ── 9. 修复步 guard_desc 写回 + 确认通知含新命令 ──
+try:
+    real_repair = llm_brain.repair_step
+    new_command = "Stop-Process -Name NEWAPP_999"
+    llm_brain.repair_step = lambda goal, step, err, cfg: {
+        "action": "run_powershell", "args": {"command": new_command}, "say": "换条命令"}
+    fixed, why = jarvis._agent_repair_step(
+        {"goal": "清理"}, {"action": "chat", "args": {}}, "旧步失败")
+    check(bool(fixed) and new_command in fixed.get("guard_desc", "") and why == "",
+          "9a _agent_repair_step 返回 guard_desc(含新命令)")
+
+    notes = []
+    def perform(step, task=None):
+        if step["action"] == "run_powershell":
+            return True, "新命令已派发（未核验）", ""
+        return False, "旧步失败", ""
+    def repair(task, step, error_text):
+        return {"action": "run_powershell", "args": {"command": new_command},
+                "say": "换条命令", "guard_desc": "执行命令：" + new_command,
+                "danger": True}, ""
+    runner = agent_core.TaskRunner(
+        perform=perform, persist=lambda t: None,
+        notify=lambda text, spoken=False: notes.append(text),
+        repair=repair, guard_text=jarvis._agent_guard_text)
+
+    task = agent_core.new_task("修复通知", [
+        {"action": "open_app", "args": {"name": "旧程序"}, "say": "旧步"}])
+    runner._run(task, 0)
+    step = task["steps"][0]
+    check(step["status"] == "waiting" and new_command in step.get("guard_desc", ""),
+          "9b 危险修复步把 guard_desc 写回步骤")
+    check(any(new_command in n for n in notes), "9c 修复换命令 -> 确认通知含新命令")
+
+    notes.clear()
+    task2 = agent_core.new_task("高危通知", [
+        {"action": "run_powershell", "args": {"command": new_command}, "say": "清理",
+         "guard_desc": "执行命令：" + new_command, "scope": jarvis.AGENT_SCOPE_ASK}])
+    runner._run(task2, 0)
+    check(any(new_command in n for n in notes), "9d 普通高危步挂起通知也含具体命令")
+finally:
+    llm_brain.repair_step = real_repair
+
+
+# ── 10. 来源强绑定: 不一致构造 + 以任务为准 + 拒绝放行 ──
+try:
+    reset_tasks()
+    mismatch = {"tasks": [{"goal": "错源任务", "state": "waiting_user", "source": "local",
+                           "steps": [{"action": "close_app",
+                                      "args": {"exe": "excel.exe", "name": "excel"},
+                                      "say": "关Excel", "guard_desc": "关闭程序：excel.exe",
+                                      "status": "waiting", "scope": jarvis.AGENT_SCOPE_ASK,
+                                      "source": "remote"}]}]}
+    jarvis.AGENT_TASKS_PATH.write_text(json.dumps(mismatch, ensure_ascii=False), encoding="utf-8")
+    loaded = jarvis._agent_load_tasks()
+    step = loaded["tasks"][0]["steps"][0]
+    check(step["source"] == "local" and step.get("source_mismatch") is True,
+          "10a 步骤来源与任务不一致: 以任务来源为准并留拒绝标记")
+
+    jarvis._agent_start = lambda task: {"say": "已放行"}
+    res = jarvis.agent_continue()
+    cur = load_raw()["tasks"][0]
+    check(cur["steps"][0]["status"] == "waiting" and "来源" in res.get("say", "")
+          and cur["state"] == "waiting_user", "10b 不一致的待确认步被拒放行")
+    res = jarvis.agent_continue()
+    check(load_raw()["tasks"][0]["state"] == "approved" and "已放行" in res.get("say", ""),
+          "10c 纠正来源后重新放行可继续")
+
+    seen = []
+    jarvis._perform_plan = lambda plan, source="": seen.append(source) or "stub"
+    jarvis._TL.action_ok = False
+    s = {"action": "chat", "args": {}, "source": "remote"}
+    jarvis._agent_perform(s, task={"source": "local", "steps": [s]})
+    check(seen == ["local"] and s["source"] == "local",
+          "10d 执行前强制步骤来源=任务来源")
+finally:
+    jarvis._agent_start = REAL["_agent_start"]
+    jarvis._perform_plan = REAL["_perform_plan"]
+
+
+# ── 11. 成功位兜底 False + 派发类动作标未核验 ──
+try:
+    reset_tasks()
+    jarvis._perform_plan = lambda plan, source="": "桩里没写 action_ok"
+    jarvis._TL.action_ok = True
+    ok, text, tool = jarvis._agent_perform({"action": "chat", "args": {}, "source": "local"})
+    check(ok is False, "11a 成功位缺失不兜底 True")
+
+    dispatch = ("screenshot", "volume", "brightness", "lock", "shutdown",
+                "restart", "cancel_shutdown", "type_text", "press_key", "click")
+    check(all("未核验" in jarvis._unverified_say(a, "已经派发了") for a in dispatch),
+          "11b 派发类动作结果文本统一带未核验")
+
+    jarvis._perform_plan = REAL["_perform_plan"]
+    old_mod = sys.modules.get("pyautogui")
+    old_dry = jarvis.DRY_RUN
+    sys.modules["pyautogui"] = types.SimpleNamespace(press=lambda key: None)
+    jarvis.DRY_RUN = True
+    try:
+        said = jarvis._perform_plan({"action": "volume",
+                                     "args": {"mode": "up", "steps": 1}, "say": "调音量"})
+        check("未核验" in said, "11c volume 端到端结果不冒充已核实")
+    finally:
+        jarvis.DRY_RUN = old_dry
+        if old_mod is None:
+            sys.modules.pop("pyautogui", None)
+        else:
+            sys.modules["pyautogui"] = old_mod
+finally:
+    jarvis._perform_plan = REAL["_perform_plan"]
+
+
 for name in REAL:
     setattr(jarvis, name, REAL[name])
 llm_brain.query_vision = REAL_QUERY_VISION
@@ -318,4 +511,4 @@ if fails:
     for item in fails:
         print("  ", item)
     raise SystemExit(1)
-print("全部通过 (成功位/护栏/guard_desc/重算/来源/账本/sanitize_plan)")
+print("全部通过 (成功位/护栏/guard_desc/重算/来源/账本/重启恢复/修复话术/未核验)")

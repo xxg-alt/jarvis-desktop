@@ -1093,6 +1093,8 @@ def _open_document(name):
 AGENT_TASKS_PATH = BASE / "agent_tasks.json"
 AGENT_MAX_STEPS = 8
 AGENT_STATES = ("draft", "approved", "running", "waiting_user", "done", "failed", "cancelled")
+# 保存时被脱敏过的未执行步, 重启后不能拿空参数照跑: 先转成这个状态等用户重建。
+AGENT_STEP_REBUILD = "needs_rebuild"
 
 # 三级权限: 越界才问, 圈内直接干。agent 连续执行时每一步套这个格子,
 # 计划审批已经放行的圈内操作不再逐条弹确认 —— 否则 agent 名存实亡。
@@ -1417,7 +1419,11 @@ def _agent_mask_text(text, limit=160) -> str:
 
 
 def _agent_redact_tasks(data) -> dict:
-    """只把要落盘的那份脱敏; 内存里的任务仍可用于本次执行。"""
+    """只把要落盘的那份脱敏; 内存里的任务仍可用于本次执行。
+
+    未执行且确实被脱敏过的步打 redacted 标记: 重启后原参数没了, 不许按空参数跑。
+    已完成步只做展示脱敏, 不加重建标记。
+    """
     out = copy.deepcopy(data)
     tasks = out.get("tasks") if isinstance(out, dict) else None
     if not isinstance(tasks, list):
@@ -1429,23 +1435,102 @@ def _agent_redact_tasks(data) -> dict:
         for step in task.get("steps", []):
             if not isinstance(step, dict):
                 continue
+            touched = False
             args = step.get("args")
-            if not isinstance(args, dict):
-                continue
-            content = args.pop("content", None)
-            if isinstance(content, str):
-                args["content_len"] = len(content)
-                args["content_sha256"] = hashlib.sha256(
-                    content.encode("utf-8")).hexdigest()[:16]
-                args["content_redacted"] = True
-            command = args.pop("command", None)
-            if isinstance(command, str):
-                args["command_masked"] = _agent_mask_text(command, 120)
-                args["command_redacted"] = True
+            if isinstance(args, dict):
+                content = args.pop("content", None)
+                if isinstance(content, str):
+                    args["content_len"] = len(content)
+                    args["content_sha256"] = hashlib.sha256(
+                        content.encode("utf-8")).hexdigest()[:16]
+                    args["content_redacted"] = True
+                    touched = True
+                command = args.pop("command", None)
+                if isinstance(command, str):
+                    args["command_masked"] = _agent_mask_text(command, 120)
+                    args["command_redacted"] = True
+                    touched = True
             for key in ("result", "guard_desc", "say"):
-                if isinstance(step.get(key), str):
-                    step[key] = _agent_mask_text(step[key], 300)
+                value = step.get(key)
+                if isinstance(value, str):
+                    masked = _agent_mask_text(value, 300)
+                    if masked != value:
+                        step[key] = masked
+                        touched = True
+            if step.get("status") == "done":
+                step.pop("redacted", None)
+            elif touched:
+                step["redacted"] = True
     return out
+
+
+def _agent_bind_sources(data) -> bool:
+    """旧账本缺来源按任务来源迁移; 步骤来源与任务不一致时以任务为准并留标记。"""
+    changed = False
+    for task in (data or {}).get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        steps = [s for s in task.get("steps", []) if isinstance(s, dict)]
+        task_src = _source_label(task.get("source") or "local")
+        if not task.get("source") and any(s.get("source") for s in steps):
+            task["source"] = task_src
+            changed = True
+        if task.get("source"):
+            task["source"] = task_src
+        for step in steps:
+            cur = step.get("source")
+            if not str(cur or "").strip():
+                if task.get("source") and cur != task_src:
+                    step["source"] = task_src
+                    changed = True
+                continue
+            if _source_label(cur) != task_src:
+                step["source"] = task_src
+                step["source_mismatch"] = True
+                changed = True
+    return changed
+
+
+def _agent_step_redacted(step) -> bool:
+    """新账本看步级标记; 上一版账本只有 args 里的脱敏摘要, 也要认出来。"""
+    if not isinstance(step, dict):
+        return False
+    if step.get("redacted"):
+        return True
+    args = step.get("args") or {}
+    return bool(isinstance(args, dict) and
+                (args.get("content_redacted") or args.get("command_redacted")))
+
+
+def _agent_recover_redacted(data) -> bool:
+    """带脱敏标记的未执行步一律转"待用户重建", 并给用户一句说明。"""
+    changed = False
+    notices = []
+    for task in (data or {}).get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        nums = []
+        for index, step in enumerate(task.get("steps", [])):
+            if not _agent_step_redacted(step):
+                continue
+            if step.get("status") in ("done", AGENT_STEP_REBUILD):
+                continue
+            step["redacted"] = True
+            step["status"] = AGENT_STEP_REBUILD
+            step["rebuild_note"] = "待用户重建：原参数在保存时被脱敏，请重新说明这一步"
+            step.pop("external_ok", None)
+            step.pop("approved_fingerprint", None)
+            step.pop("approved_scope", None)
+            nums.append(index + 1)
+            changed = True
+        if nums:
+            if task.get("state") in (None, "draft", "approved", "running", "waiting_user"):
+                task["state"] = "waiting_user"
+            notices.append(f"任务「{task.get('goal', '')}」第 {'、'.join(str(n) for n in nums)} 步"
+                           "的参数保存时被脱敏，重启后不能照原样执行，已标为待用户重建，请重新说明，Sir")
+    if notices:
+        _agent_notify("；".join(notices), spoken=True)
+    return changed
 
 
 def _agent_load_tasks() -> dict:
@@ -1454,6 +1539,10 @@ def _agent_load_tasks() -> dict:
             if AGENT_TASKS_PATH.exists():
                 data = json.loads(AGENT_TASKS_PATH.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and isinstance(data.get("tasks"), list):
+                    changed = _agent_bind_sources(data)
+                    changed = _agent_recover_redacted(data) or changed
+                    if changed:
+                        _agent_save_tasks(data)   # 迁移/重建状态落盘, 提示只给一次
                     return data
         except Exception as exc:
             print(f"[Agent] 任务记录读不出来, 从空开始: {exc}")
@@ -1619,14 +1708,22 @@ def _agent_persist(task: dict):
 
 # 执行状态机本体在 agent_core.py (只依赖标准库): 云主机上可以用假执行器跑批量评测,
 # 这里只提供"动手"和"落盘/播报"的具体实现。
-def _agent_perform(step):
-    """真执行一步: 返回 (成败, 话术, 可传递的结构化文本)。"""
-    _TL.action_ok = True
+def _agent_perform(step, task=None):
+    """真执行一步: 返回 (成败, 话术, 可传递的结构化文本)。
+
+    来源以任务为准: 步骤来源不一致时就地改写, 绝不跨源放行。
+    """
+    _TL.action_ok = False
     _TL.last_tool_text = ""      # 不把上一步的回读带到这一步, 免得误触发视觉核实
+    if step.get("status") == AGENT_STEP_REBUILD or step.get("redacted"):
+        return False, "这一步已标为待用户重建：参数在保存时被脱敏，需要您重新说明后才能执行，Sir", ""
     # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
     _TL.agent_context = True
     _TL.agent_external_ok = bool(step.get("external_ok"))
-    src = step.get("source") or "local"
+    task_src = _source_label((task or {}).get("source") or "") if isinstance(task, dict) else ""
+    src = task_src or _source_label(step.get("source") or "local")
+    if _source_label(step.get("source") or "") != src:
+        step["source"] = src
     _TL.agent_task_source = src
     plan = {"action": step.get("action"), "args": step.get("args", {}),
             "say": step.get("say", "")}
@@ -1637,7 +1734,7 @@ def _agent_perform(step):
             accepts_source = False
         text = (_perform_plan(plan, source=src) if accepts_source
                 else _perform_plan(plan))
-        return bool(getattr(_TL, "action_ok", True)), text, getattr(_TL, "last_tool_text", "")
+        return bool(getattr(_TL, "action_ok", False)), text, getattr(_TL, "last_tool_text", "")
     finally:
         _TL.agent_context = False
         _TL.agent_external_ok = False
@@ -1708,6 +1805,7 @@ _RUNNER = agent_core.TaskRunner(
     pre_write=_agent_pre_write,
     repair=_agent_repair_wrapper,
     verify=_agent_visual_verify_hook,
+    guard_text=_agent_guard_text,
 )
 
 
@@ -1717,6 +1815,8 @@ def _agent_busy() -> bool:
 
 def _agent_start(task: dict) -> dict:
     """把任务丢进后台执行器, 立即返回一句"开始执行"——调用方线程不阻塞。"""
+    if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
+        return {"say": "任务里有参数已脱敏的步骤，需要您重新说明后才能执行，Sir"}
     started, _gen = _RUNNER.start(task)
     if not started:
         return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
@@ -1933,7 +2033,7 @@ def _agent_execute_step(step, note=""):
         step["result"] = _perform_plan({"action": step.get("action"),
                                         "args": step.get("args", {}),
                                         "say": step.get("say", "")})
-        step["status"] = "done" if bool(getattr(_TL, "action_ok", True)) else "failed"
+        step["status"] = "done" if bool(getattr(_TL, "action_ok", False)) else "failed"
     except Exception as exc:
         step["result"] = f"执行失败: {exc}"
         step["status"] = "failed"
@@ -1960,8 +2060,13 @@ def _agent_repair_step(task, step, error_text):
         return None, reason
     scope = agent_scope_of(action, plan.get("args"))
     danger = bool(fixed.get("danger")) or bool(plan.get("danger")) or scope == AGENT_SCOPE_ASK
+    guard = str(plan.get("guard_desc") or fixed.get("guard_desc") or "").strip()
+    if not guard:
+        guard = _agent_guard_text({"action": action, "args": plan.get("args", {}),
+                                   "say": plan.get("say", "")})
     return {"action": action, "args": plan.get("args", {}),
-            "say": plan.get("say", ""), "scope": scope, "danger": danger}, ""
+            "say": plan.get("say", ""), "guard_desc": guard,
+            "scope": scope, "danger": danger}, ""
 
 
 def _agent_loop(task: dict, gen: int):
@@ -1979,6 +2084,7 @@ def _agent_loop(task: dict, gen: int):
         pre_write=_agent_pre_write,
         repair=_agent_repair_wrapper,
         verify=_agent_visual_verify_hook,
+        guard_text=_agent_guard_text,
     )
     runner._gen = gen   # 代号对齐, 不会被误判成"已被新任务取代"
     runner._run(task, gen)
@@ -2012,6 +2118,9 @@ def agent_approve(index: int = -1, source="") -> dict:
         task = tasks[drafts[-1]]
         if not _agent_source_allows(task, source):
             return
+        if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
+            picked["say"] = "任务里有参数已脱敏的步骤，请先重新说明那一步，Sir"
+            return
         task["state"] = "approved"
         picked["task"] = task
     _agent_update_tasks(update)
@@ -2030,12 +2139,22 @@ def agent_continue(source="") -> dict:
             if not _agent_source_allows(task, source):
                 picked["say"] = "这个任务不是当前来源发起的, 我不能放行, Sir"
                 return
+            if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
+                picked["say"] = "有步骤的参数已脱敏，需要您重建后才能放行，Sir"
+                return
             released = []
             task["state"] = "approved"
+            task_src = _source_label(task.get("source") or "local")
             for index, step in enumerate(task.get("steps", [])):
                 if step.get("status") != "waiting":
                     continue
+                if _source_label(step.get("source") or "") != task_src:
+                    step["source"] = task_src   # 以任务来源为准
                 scope = agent_scope_of(step.get("action"), step.get("args") or {})
+                if step.pop("source_mismatch", False):
+                    picked["say"] = _agent_reask(task, step, index, scope,
+                                                 "这一步的来源与任务来源不一致") + "（已按任务来源纠正）"
+                    return
                 fingerprint = _agent_step_fingerprint(step)
                 approved_fp = step.get("approved_fingerprint")
                 old_scope = step.get("approved_scope") or step.get("scope")
@@ -4461,6 +4580,22 @@ def _open_app_verify_status(action_ok):
     return "fail" if not action_ok and verify == "ok" else verify
 
 
+_AGENT_DISPATCH_ACTIONS = {
+    "screenshot", "volume", "brightness", "lock", "shutdown", "restart",
+    "cancel_shutdown", "type_text", "press_key", "click", "open_folder",
+    "search_file",
+}
+
+
+def _unverified_say(action, say):
+    """派发类动作只确认"已经发出指令", 不冒充核实过结果。"""
+    text = str(say or "")
+    if action in _AGENT_DISPATCH_ACTIONS and not any(
+            k in text for k in ("未核验", "未核实")):
+        return f"{text}（未核验）"
+    return text
+
+
 def _perform_plan(plan, source=""):
     """只执行动作并返回最终话术；异步工作线程不会在这里碰 UI。
 
@@ -4836,7 +4971,7 @@ def _perform_plan(plan, source=""):
             "summary": say,
             "data": data,
         })
-    return say
+    return _unverified_say(action, say)
 
 
 def _async_worker(plan, command_id, status_done, source=""):
