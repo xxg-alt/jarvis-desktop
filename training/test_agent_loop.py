@@ -494,6 +494,189 @@ finally:
     jarvis._agent_start = REAL_START
 
 
+# ── 11. 崩溃恢复: 执行前已落 started, 恢复标结果未知, 绝不重放 ──
+try:
+    class Crash(BaseException):
+        """模拟进程硬中断: 不是 Exception, _run 的普通异常兜底抓不到。"""
+        pass
+
+    crash_ledger = TMP / "crash_ledger.json"
+    perform_snapshots = []
+
+    def crash_persist(task):
+        crash_ledger.write_text(json.dumps({"tasks": [snapshot(task)]},
+                                           ensure_ascii=False), encoding="utf-8")
+
+    def crashing_perform(step, task=None):
+        perform_snapshots.append(snapshot(task))
+        raise Crash("模拟进程在执行器中崩溃")
+
+    runner, calls = build(script([]), perform=crashing_perform,
+                          persist=crash_persist, budget={"max_steps": 4})
+    crash_task = make_task("崩溃恢复", [
+        {"action": "write_file", "args": {"name": "a.md", "content": "正文"},
+         "say": "写文件", "scope": jarvis.AGENT_SCOPE_NOTIFY}])
+    try:
+        runner._run(crash_task, 0)
+    except Crash:
+        pass
+
+    at_perform = perform_snapshots[0]
+    check(at_perform["steps"][0]["status"] == "started"
+          and at_perform["budget_used"]["steps"] == 1,
+          "11a 调执行器前: 步已标 started 且步数预算已计入账本")
+    on_disk = json.loads(crash_ledger.read_text(encoding="utf-8"))["tasks"][0]
+    check(on_disk["steps"][0]["status"] == "started",
+          "11b 崩溃时账本停在 started, 没有假装 pending 或 done")
+
+    loop_ledger = jarvis.AGENT_TASKS_PATH
+    jarvis.AGENT_TASKS_PATH = crash_ledger
+    while not jarvis._AGENT_EVENTS.empty():
+        jarvis._AGENT_EVENTS.get()
+    try:
+        recovered = jarvis._agent_load_tasks()["tasks"][0]
+        rec_step = recovered["steps"][0]
+        check(rec_step["status"] == jarvis.AGENT_STEP_UNKNOWN
+              and "结果未知" in rec_step.get("result", "")
+              and "需核实" in rec_step.get("unknown_note", "")
+              and recovered["state"] == "waiting_user"
+              and recovered.get("stop_reason") == "needs_verification",
+              "11c 恢复后 started 步一律标结果未知/需核实, 任务挂起不续跑")
+        notices = []
+        while not jarvis._AGENT_EVENTS.empty():
+            notices.append(jarvis._AGENT_EVENTS.get())
+        check(any("结果未知" in text and "未重跑" in text for text in notices),
+              "11d 用户听到结果未知、未重跑的说明")
+
+        replayed = []
+
+        def no_run(t):
+            replayed.append(t)
+            return {"say": "不该被调用"}
+
+        jarvis._agent_start = no_run
+        res = jarvis.agent_continue(source="local")
+        check(not replayed and "需核实" in res.get("say", "")
+              and json.loads(crash_ledger.read_text(encoding="utf-8"))["tasks"][0]
+              ["steps"][0]["status"] == jarvis.AGENT_STEP_UNKNOWN,
+              "11e 放行也不能重放结果未知步, 账本状态不变")
+    finally:
+        jarvis._agent_start = REAL_START
+        jarvis.AGENT_TASKS_PATH = loop_ledger
+
+    # 修复重跑同样先落 started
+    last_persist, attempts, at_repair = [], [], []
+
+    def fail_then_crash(step, task=None):
+        attempts.append(step["action"])
+        if len(attempts) == 1:
+            return False, "原始失败", ""
+        at_repair.append(last_persist[-1])
+        raise Crash("修复重跑时崩溃")
+
+    def capture(task):
+        last_persist.append(snapshot(task))
+
+    def fake_repair(task, step, error_text):
+        return {"action": "web_search", "args": {"query": "改"}, "say": "重试",
+                "scope": jarvis.AGENT_SCOPE_FREE}, ""
+
+    runner, calls = build(script([]), perform=fail_then_crash, repair=fake_repair,
+                          persist=capture)
+    repair_task = make_task("修复崩溃", [
+        {"action": "open_file", "args": {"name": "x"}, "say": "x"}])
+    try:
+        runner._run(repair_task, 0)
+    except Crash:
+        pass
+    snap = at_repair[0]
+    check(len(attempts) == 2 and snap["steps"][0]["status"] == "started"
+          and snap["steps"][0].get("repair_attempted") is True
+          and snap["budget_used"]["steps"] == 2,
+          "11f 修复重跑执行前也先落 started, 重跑步与修复调用同池计费")
+finally:
+    jarvis.AGENT_TASKS_PATH = TMP / "agent_tasks.json"
+    jarvis._agent_start = REAL_START
+
+
+# ── 12. 指纹: 完整参数值哈希 / 提问空白归一化 ──
+try:
+    prefix = "前200字完全一样" * 30
+    fp_a = agent_core.step_fingerprint(
+        {"action": "web_search", "args": {"query": prefix + "北京"}})
+    fp_b = agent_core.step_fingerprint(
+        {"action": "web_search", "args": {"query": prefix + "上海"}})
+    check(fp_a != fp_b, "12a 前200字相同、后缀不同的查询不误判为打转")
+
+    check(agent_core.step_fingerprint(
+              {"action": "web_search", "args": {"query": "a  b"}})
+          != agent_core.step_fingerprint(
+              {"action": "web_search", "args": {"query": "a b"}}),
+          "12b 步骤参数不压空白, 值全量入哈希")
+    check(agent_core.step_fingerprint(
+              {"action": "web_search", "args": {"q": "x", "n": 1}})
+          == agent_core.step_fingerprint(
+              {"action": "web_search", "args": {"n": 1, "q": "x"}}),
+          "12c 只做类型明确的规范化: 字典键排序后等价")
+
+    outcomes = [next_step("write_file", {"name": "a.md", "content": prefix + "北京"}, "写北京"),
+                next_step("write_file", {"name": "b.md", "content": prefix + "上海"}, "写上海"),
+                {"kind": "finish", "say": "两条都写了", "llm_calls": 1}]
+    runner, calls = build(script(outcomes))
+    task = make_task("长内容不误判")
+    runner._run(task, 0)
+    check(len(calls["perform"]) == 2 and task.get("stop_reason") == "finish"
+          and task.get("conclusion") == "两条都写了",
+          "12d 前200字相同后缀不同的两个内容先后执行, 没有被打转检测拦下")
+
+    check(agent_core.ask_fingerprint(" 选 A   还是 B？ ")
+          == agent_core.ask_fingerprint("选 A 还是 B？"),
+          "12e 提问指纹先空白归一化再哈希")
+finally:
+    pass
+
+
+# ── 13. 预算拆开 + 预算退出不许冒充 done ──
+try:
+    budget = {"max_steps": 1, "max_llm_calls": 12}
+    check(agent_core.TaskRunner._step_budget_reason(
+              budget, {"steps": 1, "llm_calls": 0}, 0.0) == "budget_steps"
+          and agent_core.TaskRunner._llm_budget_reason(
+              budget, {"steps": 1, "llm_calls": 0}, 0.0) is None,
+          "13a 步数耗尽只挡执行, 不挡 LLM 调用")
+    budget = {"max_steps": 8, "max_llm_calls": 1}
+    check(agent_core.TaskRunner._llm_budget_reason(
+              budget, {"steps": 7, "llm_calls": 1}, 0.0) == "budget_llm"
+          and agent_core.TaskRunner._step_budget_reason(
+              budget, {"steps": 7, "llm_calls": 1}, 0.0) is None,
+          "13b LLM 调用耗尽只挡决策/修复, 不挡执行")
+
+    outcomes = [next_step("web_search", {"query": "1"}, "一"),
+                next_step("web_search", {"query": "2"}, "二"),
+                next_step("web_search", {"query": "3"}, "三"),
+                {"kind": "finish", "say": "假装完成", "llm_calls": 1}]
+    runner, calls = build(script(outcomes), budget={"max_llm_calls": 3})
+    task = make_task("成功后预算耗尽")
+    runner._run(task, 0)
+    check(len(calls["perform"]) == 3 and task["state"] == "failed"
+          and task.get("stop_reason") == "budget_llm"
+          and task.get("budget_exhausted") is True
+          and "假装完成" not in task.get("conclusion", ""),
+          "13c 三步成功后因 LLM 预算退出: 落失败+原因, 不冒充普通 done")
+
+    runner, calls = build(script([{"kind": "finish", "say": "假装完成", "llm_calls": 1}]),
+                          budget={"max_steps": 2})
+    task = make_task("步数满后不收尾", [
+        {"action": "web_search", "args": {"query": "一"}, "say": "一"},
+        {"action": "web_search", "args": {"query": "二"}, "say": "二"}])
+    runner._run(task, 0)
+    check(task["state"] == "failed" and task.get("stop_reason") == "budget_steps"
+          and "假装完成" not in task.get("conclusion", ""),
+          "13d 步数预算已满后 decide 即使给 finish, 也不许落普通 done")
+finally:
+    pass
+
+
 jarvis.AGENT_TASKS_PATH = REAL_TASKS_PATH
 jarvis._agent_start = REAL_START
 llm_brain._provider_chat = REAL_CHAT

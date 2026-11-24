@@ -16,7 +16,8 @@
     perform(step) -> (ok, result_text, tool_text)
         真正执行一步。ok 必须是布尔真值，不能靠话术字符串猜。
     persist(task)
-        任务状态变了就落盘；每步之后都会调一次，崩溃也不丢进度。
+        任务状态变了就落盘；调用 perform 之前先把步骤标 started 连同预算落盘，
+        每步之后也落一次。崩溃时账本停在 started, 恢复层必须按"结果未知"处理。
     notify(text, spoken)
         spoken=False 只上字幕（进度不吵人）；spoken=True 才进播报队列。
     scope_of(step) -> "free" | "notify" | "ask"
@@ -49,6 +50,8 @@
     budget  可选：{"max_steps", "max_llm_calls", "max_seconds"} 覆盖默认值。
         步数、LLM 调用、时长和打转检测是任务级统一预算；修复重跑与修复调用
         也计入同一池。任务自带 budget/budget_used 优先, 挂起/续跑不重置。
+        "能否再执行一步"与"能否再调 LLM/修复"分开判定；预算耗尽一律落
+        failed + stop_reason(budget_*), 不进普通 done 分支冒充完成。
 """
 
 import hashlib
@@ -62,6 +65,11 @@ import time
 SCOPE_FREE = "free"
 SCOPE_NOTIFY = "notify"
 SCOPE_ASK = "ask"
+
+STEP_PENDING = "pending"
+# 执行器调用前先落盘的状态: 崩溃恢复时一律转"结果未知, 需核实", 绝不重放。
+STEP_STARTED = "started"
+STEP_UNKNOWN = "unknown"
 
 STATE_DRAFT = "draft"
 STATE_APPROVED = "approved"
@@ -92,17 +100,31 @@ HISTORY_LIMIT = 12
 
 
 def _canonical(value):
-    """args 归一化: 键排序、空白压平、长串截断, 只用于指纹/展示, 不改执行参数。"""
+    """指纹规范化: 只做类型明确的归一化(字典键排序/元组转列表), 不压空白不截断。"""
     if isinstance(value, dict):
         return {str(k): _canonical(value[k])
                 for k in sorted(value, key=lambda x: str(x))}
     if isinstance(value, (list, tuple)):
         return [_canonical(v) for v in value]
+    return value
+
+
+def _display(value, limit=200):
+    """仅供日志/历史展示: 在规范化基础上限长截断, 绝不参与指纹哈希。"""
     if isinstance(value, str):
-        return re.sub(r"\s+", " ", value.strip())[:200]
+        return value[:limit]
+    if isinstance(value, dict):
+        return {k: _display(v, limit) for k, v in _canonical(value).items()}
+    if isinstance(value, list):
+        return [_display(v, limit) for v in value]
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:200]
+    return str(value)[:limit]
+
+
+def _normalize_whitespace(text) -> str:
+    """提问指纹专用: 压平空白再去首尾, 同一句话的排版差异不算打转。"""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def _digest(payload) -> str:
@@ -112,15 +134,15 @@ def _digest(payload) -> str:
 
 
 def step_fingerprint(step) -> str:
-    """打转判定用的 (action, 归一化 args) 指纹。"""
+    """打转判定用的 (action, 完整 args) 指纹; 只键排序, 值一律全量入哈希。"""
     step = step if isinstance(step, dict) else {}
     return _digest({"action": str(step.get("action") or ""),
                     "args": step.get("args") or {}})
 
 
 def ask_fingerprint(question) -> str:
-    """反复问同一句也算打转, 与步骤指纹共用一份去重集合。"""
-    return "ask:" + _digest({"question": str(question or "")})
+    """反复问同一句也算打转; 与步骤指纹共用去重集合, 但先归一化空白再哈希。"""
+    return "ask:" + _digest({"question": _normalize_whitespace(question)})
 
 
 def new_task(goal, steps, note=None):
@@ -283,6 +305,16 @@ class TaskRunner:
         except Exception:
             return str((step or {}).get("say") or (step or {}).get("action") or "")
 
+    def _begin_step(self, task, step):
+        """调用执行器之前先落盘"该步已开始+步数预算已计入"。
+
+        崩溃时账本里留下的就是 started; 恢复方必须把它当"结果未知, 需核实",
+        绝不因为看到 pending/没结果就重放一次有副作用的动作。
+        """
+        step["status"] = STEP_STARTED
+        step.pop("unknown_note", None)
+        self._safe_persist(task)
+
     # ── 动态决策 / 任务级预算辅助 ──
     def _dynamic_enabled(self) -> bool:
         try:
@@ -310,25 +342,46 @@ class TaskRunner:
         used["seconds"] = round(self._elapsed(base_seconds, t0), 3)
 
     @staticmethod
-    def _budget_reason(budget, used, elapsed, need_llm=False):
-        """返回卡住的预算名；调用方负责如实说明并收尾。"""
+    def _time_budget_reason(budget, elapsed):
         try:
-            if int(used.get("steps") or 0) >= int(budget.get("max_steps", MAX_STEPS)):
-                return "budget_steps"
-            if (need_llm and int(used.get("llm_calls") or 0)
-                    >= int(budget.get("max_llm_calls", MAX_LLM_CALLS))):
-                return "budget_llm"
             if float(elapsed) >= float(budget.get("max_seconds", MAX_SECONDS)):
                 return "budget_time"
         except (TypeError, ValueError):
-            return None
+            pass
+        return None
+
+    @classmethod
+    def _step_budget_reason(cls, budget, used, elapsed):
+        """能否再执行一步: 只看步数与时长, 不管 LLM 调用数。"""
+        reason = cls._time_budget_reason(budget, elapsed)
+        if reason:
+            return reason
+        try:
+            if int(used.get("steps") or 0) >= int(budget.get("max_steps", MAX_STEPS)):
+                return "budget_steps"
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @classmethod
+    def _llm_budget_reason(cls, budget, used, elapsed):
+        """能否再调 LLM/修复: 只看调用次数与时长, 不管已成功几步。"""
+        reason = cls._time_budget_reason(budget, elapsed)
+        if reason:
+            return reason
+        try:
+            if (int(used.get("llm_calls") or 0)
+                    >= int(budget.get("max_llm_calls", MAX_LLM_CALLS))):
+                return "budget_llm"
+        except (TypeError, ValueError):
+            pass
         return None
 
     def _append_history(self, task, step, index, ok, text, tool_text):
         """真实观察入 history：工具数据显式标记为不可信并限长。"""
         step = step if isinstance(step, dict) else {}
         try:
-            args = json.dumps(_canonical(step.get("args") or {}),
+            args = json.dumps(_display(step.get("args") or {}, 300),
                               ensure_ascii=False, default=str)[:300]
         except Exception:
             args = str(step.get("args") or "")[:300]
@@ -417,9 +470,21 @@ class TaskRunner:
             step["say"] = f"{step['say']}（{guard}）" if step["say"] else guard
         return step
 
+    def _stop_if_budget_exhausted(self, task, budget, used, base_seconds, t0):
+        """收尾前最后一道闸: 预算耗尽就落失败+原因, 不许冒充普通完成。"""
+        elapsed = self._elapsed(base_seconds, t0)
+        reason = (self._step_budget_reason(budget, used, elapsed)
+                  or self._llm_budget_reason(budget, used, elapsed))
+        if not reason:
+            return False
+        self._close_elapsed(used, base_seconds, t0)
+        self._stop_budget(task, reason, budget, used)
+        return True
+
     def _stop_budget(self, task, reason, budget, used):
         task["state"] = STATE_FAILED
         task["stop_reason"] = reason
+        task["budget_exhausted"] = True
         task["budget_used"] = used
         self._safe_persist(task)
         goal = str(task.get("goal") or "")
@@ -456,8 +521,15 @@ class TaskRunner:
 
     def _decide_round(self, task, budget, used, base_seconds, t0):
         """一步之后问一次大脑。返回 True=循环继续；False=本轮已收尾/挂起。"""
-        self._safe_persist(task)   # 真实结果先落盘, 再喂给大脑
         elapsed = self._elapsed(base_seconds, t0)
+        # 决策点两类预算都要挡: 步数用完时连 finish 都不许落进普通 done 冒充完成。
+        reason = (self._step_budget_reason(budget, used, elapsed)
+                  or self._llm_budget_reason(budget, used, elapsed))
+        if reason:
+            self._close_elapsed(used, base_seconds, t0)   # 预算耗尽: 落失败+原因, 不走普通 done
+            self._stop_budget(task, reason, budget, used)
+            return False
+        self._safe_persist(task)   # 真实结果先落盘, 再喂给大脑
         out = self._call_decide(
             self._decide_context(task, budget, used, elapsed,
                                  {"source": str(task.get("source") or "")}))
@@ -551,14 +623,14 @@ class TaskRunner:
 
                 index = next((n for n, s in enumerate(steps)
                               if s.get("status") == "pending"), None)
-                if dynamic:
-                    reason = self._budget_reason(
-                        budget, used, self._elapsed(base_seconds, t0),
-                        need_llm=(index is None))
+                if dynamic and index is not None:
+                    reason = self._step_budget_reason(
+                        budget, used, self._elapsed(base_seconds, t0))
                     if reason:
                         self._close_elapsed(used, base_seconds, t0)
                         self._stop_budget(task, reason, budget, used)
                         return
+                # index 为 None 时的 LLM 预算在 _decide_round 入口单独判定
                 if index is None:
                     if dynamic:
                         if not self._decide_round(task, budget, used, base_seconds, t0):
@@ -600,6 +672,7 @@ class TaskRunner:
 
                 if dynamic:
                     used["steps"] = int(used.get("steps") or 0) + 1
+                self._begin_step(task, step)   # 已开始+预算已计入先落盘, 崩溃也不重放
                 try:
                     ok, text, tool_text = self._call_perform(step, task)
                     if self._verify is not None:
@@ -617,8 +690,10 @@ class TaskRunner:
                 # 动态模式下修复调用(1次 LLM)+重跑(1步)都从同一预算池扣, 不叠加新循环。
                 if (not ok and self._repair is not None
                         and not step.get("repair_attempted")):
-                    exhausted = bool(dynamic and self._budget_reason(
-                        budget, used, self._elapsed(base_seconds, t0), need_llm=True))
+                    elapsed_now = self._elapsed(base_seconds, t0) if dynamic else 0.0
+                    exhausted = bool(dynamic and (
+                        self._step_budget_reason(budget, used, elapsed_now)
+                        or self._llm_budget_reason(budget, used, elapsed_now)))
                     if exhausted:
                         step["result"] = f"{step.get('result') or ''}；修复未采用（预算已用尽）"
                     else:
@@ -659,8 +734,8 @@ class TaskRunner:
                                          "say": fixed.get("say") or "",
                                          "guard_desc": fixed.get("guard_desc") or "",
                                          "scope": fixed.get("scope") or SCOPE_FREE})
-                            step["status"] = "pending"
                             step["repaired"] = True
+                            self._begin_step(task, step)   # 修复重跑同样先落 started
                             try:
                                 ok, text, tool_text = self._call_perform(step, task)
                             except Exception as exc:
@@ -688,6 +763,9 @@ class TaskRunner:
                 if self._skip:
                     with self._lock:
                         self._skip = False
+                    if dynamic and self._stop_if_budget_exhausted(
+                            task, budget, used, base_seconds, t0):
+                        return
                     for rest in steps[i + 1:]:
                         if rest.get("status") == "pending":
                             rest["status"] = "skipped"
@@ -698,6 +776,9 @@ class TaskRunner:
 
             failed = [i for i, s in enumerate(steps) if s.get("status") == STATE_FAILED]
             done_n = sum(1 for s in steps if s.get("status") == STATE_DONE)
+            if dynamic and self._stop_if_budget_exhausted(
+                    task, budget, used, base_seconds, t0):
+                return
             task["state"] = STATE_FAILED if failed and done_n == 0 else STATE_DONE
             self._safe_persist(task)
             fix_note = (("；" + "；".join(f"第{n}步经修复完成" for n in repaired_nums))

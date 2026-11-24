@@ -1211,6 +1211,9 @@ AGENT_MAX_SECONDS = agent_core.MAX_SECONDS
 AGENT_STATES = ("draft", "approved", "running", "waiting_user", "done", "failed", "cancelled")
 # 保存时被脱敏过的未执行步, 重启后不能拿空参数照跑: 先转成这个状态等用户重建。
 AGENT_STEP_REBUILD = "needs_rebuild"
+# 执行器调用前落盘的 started 步, 崩溃后不知道副作用有没有发生: 只能标"结果未知, 需核实"。
+AGENT_STEP_STARTED = agent_core.STEP_STARTED
+AGENT_STEP_UNKNOWN = agent_core.STEP_UNKNOWN
 
 # 三级权限: 越界才问, 圈内直接干。agent 连续执行时每一步套这个格子,
 # 计划审批已经放行的圈内操作不再逐条弹确认 —— 否则 agent 名存实亡。
@@ -1651,7 +1654,8 @@ def _agent_recover_redacted(data) -> bool:
         for index, step in enumerate(task.get("steps", [])):
             if not _agent_step_redacted(step):
                 continue
-            if step.get("status") in ("done", AGENT_STEP_REBUILD):
+            if step.get("status") in ("done", AGENT_STEP_REBUILD,
+                                      AGENT_STEP_STARTED, AGENT_STEP_UNKNOWN):
                 continue
             step["redacted"] = True
             step["status"] = AGENT_STEP_REBUILD
@@ -1671,6 +1675,40 @@ def _agent_recover_redacted(data) -> bool:
     return changed
 
 
+def _agent_recover_started(data) -> bool:
+    """崩溃恢复: 已开始未完成的步一律标"结果未知, 需核实", 绝不重放有副作用的动作。
+
+    与第 0 轮脱敏重建同一哲学: 账本停在 started 就说明执行器可能已经动过手,
+    没拿到结果就不能装作没发生过。清掉旧放行标记, 挂起等用户核实/重建。
+    """
+    changed = False
+    notices = []
+    for task in (data or {}).get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        nums = []
+        for index, step in enumerate(task.get("steps", [])):
+            if not isinstance(step, dict) or step.get("status") != AGENT_STEP_STARTED:
+                continue
+            step["status"] = AGENT_STEP_UNKNOWN
+            step["result"] = "结果未知，需核实：执行中断，副作用是否已发生未确认"
+            step["unknown_note"] = "结果未知，需核实：执行器已启动但没拿到结果，请勿直接重跑，先核实实际状态"
+            step.pop("external_ok", None)
+            step.pop("approved_fingerprint", None)
+            step.pop("approved_scope", None)
+            nums.append(index + 1)
+            changed = True
+        if nums:
+            if task.get("state") in (None, "draft", "approved", "running", "waiting_user"):
+                task["state"] = "waiting_user"
+            task["stop_reason"] = "needs_verification"
+            notices.append(f"任务「{task.get('goal', '')}」第 {'、'.join(str(n) for n in nums)} 步"
+                           "在开始执行后中断，结果未知、需核实，已挂起，未重跑那一步，Sir")
+    if notices:
+        _agent_notify("；".join(notices), spoken=True)
+    return changed
+
+
 def _agent_load_tasks() -> dict:
     with _AGENT_TASKS_LOCK:
         try:
@@ -1678,6 +1716,7 @@ def _agent_load_tasks() -> dict:
                 data = json.loads(AGENT_TASKS_PATH.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and isinstance(data.get("tasks"), list):
                     changed = _agent_bind_sources(data)
+                    changed = _agent_recover_started(data) or changed  # started 优先, 不许降级成重建
                     changed = _agent_recover_redacted(data) or changed
                     if changed:
                         _agent_save_tasks(data)   # 迁移/重建状态落盘, 提示只给一次
@@ -1855,6 +1894,9 @@ def _agent_perform(step, task=None):
     _TL.last_tool_text = ""      # 不把上一步的回读带到这一步, 免得误触发视觉核实
     if step.get("status") == AGENT_STEP_REBUILD or step.get("redacted"):
         return False, "这一步已标为待用户重建：参数在保存时被脱敏，需要您重新说明后才能执行，Sir", ""
+    # started 是"本次调用执行器时"的正常状态; 恢复层已把它转成 unknown, 这里只挡 unknown。
+    if step.get("status") == AGENT_STEP_UNKNOWN:
+        return False, "这一步结果未知、需核实：执行曾中断，未确认副作用前不能重跑，Sir", ""
     # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
     _TL.agent_context = True
     _TL.agent_external_ok = bool(step.get("external_ok"))
@@ -1960,6 +2002,9 @@ def _agent_start(task: dict) -> dict:
     """把任务丢进后台执行器, 立即返回一句"开始执行"——调用方线程不阻塞。"""
     if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
         return {"say": "任务里有参数已脱敏的步骤，需要您重新说明后才能执行，Sir"}
+    if any(s.get("status") in (AGENT_STEP_STARTED, AGENT_STEP_UNKNOWN)
+           for s in task.get("steps", [])):
+        return {"say": "任务里有结果未知、需核实的步骤，未确认副作用前不会重跑，Sir"}
     started, _gen = _RUNNER.start(task)
     if not started:
         return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
@@ -2264,6 +2309,10 @@ def agent_approve(index: int = -1, source="") -> dict:
         if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
             picked["say"] = "任务里有参数已脱敏的步骤，请先重新说明那一步，Sir"
             return
+        if any(s.get("status") in (AGENT_STEP_STARTED, AGENT_STEP_UNKNOWN)
+               for s in task.get("steps", [])):
+            picked["say"] = "任务里有结果未知、需核实的步骤，请先核实那一步的真实状态，Sir"
+            return
         task["state"] = "approved"
         picked["task"] = task
     _agent_update_tasks(update)
@@ -2284,6 +2333,10 @@ def agent_continue(source="") -> dict:
                 return
             if any(s.get("status") == AGENT_STEP_REBUILD for s in task.get("steps", [])):
                 picked["say"] = "有步骤的参数已脱敏，需要您重建后才能放行，Sir"
+                return
+            if any(s.get("status") in (AGENT_STEP_STARTED, AGENT_STEP_UNKNOWN)
+                   for s in task.get("steps", [])):
+                picked["say"] = "有步骤结果未知、需核实，未确认副作用前不能放行重跑，Sir"
                 return
             released = []
             task["state"] = "approved"
