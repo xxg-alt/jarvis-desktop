@@ -7,14 +7,18 @@
 安全: 关机/重启/关闭软件等动作必须二次确认; Gemini 只能返回白名单动作
 """
 import argparse
+import copy
 import ctypes
 import datetime
+import hashlib
+import inspect
 import json
 import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -1102,8 +1106,38 @@ _AGENT_FREE_ACTIONS = {"chat", "open_app", "open_file", "open_url", "open_folder
                        "set_screenshot_dir", "peek_screen", "remember", "forget_memory",
                        "file_manage:read", "file_manage:list", "file_manage:search",
                        "inspect_system"}
-_AGENT_NOTIFY_ACTIONS = {"write_file", "file_manage:move", "volume", "brightness",
-                         "type_text", "press_key", "click", "click_screen"}
+_AGENT_NOTIFY_ACTIONS = {"write_file", "volume", "brightness",
+                          "type_text", "press_key", "click", "click_screen"}
+
+_AGENT_SCOPE_RANK = {AGENT_SCOPE_FREE: 0, AGENT_SCOPE_NOTIFY: 1, AGENT_SCOPE_ASK: 2}
+
+
+def _agent_scope_rank(scope) -> int:
+    return _AGENT_SCOPE_RANK.get(str(scope or ""), 0)
+
+
+def _agent_step_fingerprint(step) -> str:
+    """放行绑定的是当时的 action/args; 步骤被改过就不能沿用旧放行。"""
+    payload = {"action": step.get("action"), "args": step.get("args") or {}}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _agent_guard_text(step) -> str:
+    """确认话术里的具体内容: 具体命令/路径优先, 没有就退回步骤说明。"""
+    guard = str((step or {}).get("guard_desc") or "").strip()
+    if guard:
+        return guard
+    args = (step or {}).get("args") or {}
+    action = str((step or {}).get("action") or "")
+    if action == "file_manage":
+        return f"移动文件：{args.get('src') or ''} → {args.get('dst') or '下载'}"
+    if action == "run_powershell":
+        return f"执行命令：{args.get('command') or ''}"[:120]
+    if action == "write_file":
+        return f"写入文档：{args.get('name') or ''}" + (f"（{args.get('folder')}）" if args.get("folder") else "")
+    return str((step or {}).get("say") or action or "该步骤")
 
 
 def agent_scope_of(action: str, args=None) -> str:
@@ -1368,24 +1402,95 @@ def _md_to_docx(md_path: Path):
         return None
 
 
+_AGENT_TASKS_LOCK = threading.RLock()
+
+
+def _agent_mask_text(text, limit=160) -> str:
+    """账本脱敏: 具体路径、令牌和长参数只留骨架, 不写原文。"""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    s = re.sub(r"(?i)\b(token|password|passwd|secret|api[_-]?key)\b\s*[:=]?\s+[\"']?[^\s\"']+",
+               r"\1=<已脱敏>", s)
+    s = re.sub(r"(?i)\b(token|password|passwd|secret|api[_-]?key)\b\s*[:=]\s*\S+",
+               r"\1=<已脱敏>", s)
+    s = re.sub(r"(?:[A-Za-z]:\\|\\\\[^\s\\]+|(?<=\s)/)[^\s'\"]+", "<路径已脱敏>", s)
+    return s[:limit]
+
+
+def _agent_redact_tasks(data) -> dict:
+    """只把要落盘的那份脱敏; 内存里的任务仍可用于本次执行。"""
+    out = copy.deepcopy(data)
+    tasks = out.get("tasks") if isinstance(out, dict) else None
+    if not isinstance(tasks, list):
+        return {"tasks": []}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task["source"] = _source_label(task.get("source") or "local")
+        for step in task.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            args = step.get("args")
+            if not isinstance(args, dict):
+                continue
+            content = args.pop("content", None)
+            if isinstance(content, str):
+                args["content_len"] = len(content)
+                args["content_sha256"] = hashlib.sha256(
+                    content.encode("utf-8")).hexdigest()[:16]
+                args["content_redacted"] = True
+            command = args.pop("command", None)
+            if isinstance(command, str):
+                args["command_masked"] = _agent_mask_text(command, 120)
+                args["command_redacted"] = True
+            for key in ("result", "guard_desc", "say"):
+                if isinstance(step.get(key), str):
+                    step[key] = _agent_mask_text(step[key], 300)
+    return out
+
+
 def _agent_load_tasks() -> dict:
-    try:
-        if AGENT_TASKS_PATH.exists():
-            data = json.loads(AGENT_TASKS_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-    except Exception as exc:
-        print(f"[Agent] 任务记录读不出来, 从空开始: {exc}")
-    return {"tasks": []}
+    with _AGENT_TASKS_LOCK:
+        try:
+            if AGENT_TASKS_PATH.exists():
+                data = json.loads(AGENT_TASKS_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("tasks"), list):
+                    return data
+        except Exception as exc:
+            print(f"[Agent] 任务记录读不出来, 从空开始: {exc}")
+        return {"tasks": []}
 
 
 def _agent_save_tasks(data: dict):
-    try:
-        AGENT_TASKS_PATH.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception as exc:
-        print(f"[Agent] 任务记录写不进去: {exc}")
+    """临时文件 + 原子替换 + 写锁: 崩在半途也不会留下半个账本。"""
+    with _AGENT_TASKS_LOCK:
+        tmp_path = None
+        try:
+            AGENT_TASKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix=".agent_tasks_", suffix=".tmp",
+                                            dir=str(AGENT_TASKS_PATH.parent), text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(_agent_redact_tasks(data), fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, AGENT_TASKS_PATH)
+            tmp_path = None
+        except Exception as exc:
+            print(f"[Agent] 任务记录写不进去: {exc}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
+def _agent_update_tasks(update) -> object:
+    """读-改-写在同一把锁内完成; update 的返回值原样透出。"""
+    with _AGENT_TASKS_LOCK:
+        data = _agent_load_tasks()
+        result = update(data)
+        _agent_save_tasks(data)
+        return result
 
 
 def agent_tasks_text() -> str:
@@ -1411,7 +1516,7 @@ def agent_tasks_text() -> str:
     return "; ".join(lines)
 
 
-def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict:
+def agent_draft_plan(goal: str, steps: list = None, config: dict = None, source="") -> dict:
     """把一个目标拆成步骤清单存成待审批任务; steps 为空时调用大模型拆解。
 
     返回给 UI 的结构: {task, say} —— 展示用, 不执行。
@@ -1425,6 +1530,7 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
     if not steps:
         return {"error": "步骤格式不对", "say": "任务步骤的格式我读不懂, 您换个说法试试"}
 
+    src = _input_source(source)
     # 归一 + 预判权限: 审批界面要一眼看出哪几步会动系统
     # 同时拦"参数不全被静默降级成 chat": 这种步骤执行了也只是一句废话, 宁可剔除
     from llm_brain import sanitize_plan
@@ -1443,8 +1549,12 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
         scope = agent_scope_of(action, plan.get("args"))
         needs_ask = needs_ask or scope == AGENT_SCOPE_ASK
         scopes.append(scope)
+        guard = str(plan.get("guard_desc") or s.get("guard_desc") or "").strip()
+        say = str(plan.get("say", "") or "")
+        if scope == AGENT_SCOPE_ASK and guard and guard not in say:
+            say = f"{say}（{guard}）" if say else guard
         norm_steps.append({"action": action, "args": plan.get("args", {}),
-                           "say": plan.get("say", "")})
+                           "say": say, "guard_desc": guard, "source": src})
 
     # 一步可执行的都没有: 不要把空任务立出来, 直接把规划器那句话回给用户
     if not norm_steps or all(s["action"] == "chat" for s in norm_steps):
@@ -1456,7 +1566,9 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
         "goal": str(goal or "")[:200],
         "state": "draft",
         "created": time.strftime("%Y-%m-%d %H:%M"),
+        "source": src,
         "steps": [{"action": s["action"], "args": s["args"], "say": s["say"],
+                   "guard_desc": s["guard_desc"], "source": s["source"],
                    "status": "pending", "scope": sc}
                   for s, sc in zip(norm_steps, scopes)],
     }
@@ -1464,9 +1576,7 @@ def agent_draft_plan(goal: str, steps: list = None, config: dict = None) -> dict
         task["note"] = "计划里含高危步骤, 审批时会单独标出"
     if dropped:
         task["dropped"] = dropped[:5]
-    data = _agent_load_tasks()
-    data.setdefault("tasks", []).append(task)
-    _agent_save_tasks(data)
+    _agent_update_tasks(lambda data: data.setdefault("tasks", []).append(task))
 
     text = f"任务已立项待审批「{task['goal']}」, 共 {len(task['steps'])} 步"
     if needs_ask:
@@ -1495,16 +1605,16 @@ def _agent_notify(text: str, spoken: bool = False):
 
 def _agent_persist(task: dict):
     """按 (goal, created) 身份把任务写回任务文件; 找不到就追加。"""
-    data = _agent_load_tasks()
-    tasks = data.get("tasks", [])
-    ident = (task.get("goal"), task.get("created"))
-    for i, t in enumerate(tasks):
-        if (t.get("goal"), t.get("created")) == ident:
-            tasks[i] = task
-            break
-    else:
-        tasks.append(task)
-    _agent_save_tasks({**data, "tasks": tasks})
+    def update(data):
+        tasks = data.setdefault("tasks", [])
+        ident = (task.get("goal"), task.get("created"))
+        for i, t in enumerate(tasks):
+            if (t.get("goal"), t.get("created")) == ident:
+                tasks[i] = task
+                break
+        else:
+            tasks.append(task)
+    _agent_update_tasks(update)
 
 
 # 执行状态机本体在 agent_core.py (只依赖标准库): 云主机上可以用假执行器跑批量评测,
@@ -1516,10 +1626,17 @@ def _agent_perform(step):
     # 让执行器知道"现在是 agent 在跑": 白名单外的写入只有在审批放行过的时候才允许
     _TL.agent_context = True
     _TL.agent_external_ok = bool(step.get("external_ok"))
+    src = step.get("source") or "local"
+    _TL.agent_task_source = src
+    plan = {"action": step.get("action"), "args": step.get("args", {}),
+            "say": step.get("say", "")}
     try:
-        text = _perform_plan({"action": step.get("action"),
-                              "args": step.get("args", {}),
-                              "say": step.get("say", "")})
+        try:
+            accepts_source = "source" in inspect.signature(_perform_plan).parameters
+        except (TypeError, ValueError):
+            accepts_source = False
+        text = (_perform_plan(plan, source=src) if accepts_source
+                else _perform_plan(plan))
         return bool(getattr(_TL, "action_ok", True)), text, getattr(_TL, "last_tool_text", "")
     finally:
         _TL.agent_context = False
@@ -1865,52 +1982,103 @@ def _agent_loop(task: dict, gen: int):
     )
     runner._gen = gen   # 代号对齐, 不会被误判成"已被新任务取代"
     runner._run(task, gen)
-def agent_approve(index: int = -1) -> dict:
+def _agent_source_allows(task, source="") -> bool:
+    """任务的发起来源和放行来源必须一致 (与高危确认同一套来源隔离口径)。"""
+    return _source_label((task or {}).get("source") or "local") == _input_source(source)
+
+
+def _agent_reask(task, step, index, scope, say) -> str:
+    """步骤在挂起期间被改过: 旧放行作废, 带着新内容重新问一遍。"""
+    step["scope"] = scope
+    step["status"] = "waiting"
+    step.pop("external_ok", None)
+    step.pop("approved_fingerprint", None)
+    step.pop("approved_scope", None)
+    task["state"] = "waiting_user"
+    detail = _agent_guard_text(step)
+    _agent_notify(f"任务「{task.get('goal', '')}」第 {index + 1} 步改成了新的高危操作: "
+                  f"{detail}。说「继续任务」重新放行, 说「停」中止", spoken=True)
+    return f"{say}（改成新的高危操作: {detail}）, 请重新放行"
+
+
+def agent_approve(index: int = -1, source="") -> dict:
     """把最新的 draft 任务交给后台执行器, 立即返回, 不阻塞指令线程。"""
-    data = _agent_load_tasks()
-    tasks = data.get("tasks", [])
-    drafts = [i for i, t in enumerate(tasks) if t.get("state") == "draft"]
-    if not drafts:
-        return {"say": "没有待审批的任务, 先说「帮我做某某」让它立项"}
-    task = tasks[drafts[-1]]
-    task["state"] = "approved"
-    _agent_save_tasks(data)
-    return _agent_start(task)
-
-
-def agent_continue() -> dict:
-    """waiting_user 的任务放行当前 ask 步骤, 交给后台执行器续跑。"""
-    data = _agent_load_tasks()
-    for task in data.get("tasks", []):
-        if task.get("state") != "waiting_user":
-            continue
+    picked = {}
+    def update(data):
+        tasks = data.get("tasks", [])
+        drafts = [i for i, t in enumerate(tasks) if t.get("state") == "draft"]
+        if not drafts:
+            return
+        task = tasks[drafts[-1]]
+        if not _agent_source_allows(task, source):
+            return
         task["state"] = "approved"
-        for step in task.get("steps", []):
-            if step.get("status") == "waiting":
-                # 高危步骤既然被用户点名放行, 降级为 notify (留痕但不逐条弹确认)
-                was_ask = step.get("scope") == AGENT_SCOPE_ASK
+        picked["task"] = task
+    _agent_update_tasks(update)
+    if not picked:
+        return {"say": "没有待审批的任务, 先说「帮我做某某」让它立项"}
+    return _agent_start(picked["task"])
+
+
+def agent_continue(source="") -> dict:
+    """waiting_user 的任务放行当前 ask 步骤; 放行前按当前 action/args 重算权限。"""
+    picked = {}
+    def update(data):
+        for task in data.get("tasks", []):
+            if task.get("state") != "waiting_user":
+                continue
+            if not _agent_source_allows(task, source):
+                picked["say"] = "这个任务不是当前来源发起的, 我不能放行, Sir"
+                return
+            released = []
+            task["state"] = "approved"
+            for index, step in enumerate(task.get("steps", [])):
+                if step.get("status") != "waiting":
+                    continue
+                scope = agent_scope_of(step.get("action"), step.get("args") or {})
+                fingerprint = _agent_step_fingerprint(step)
+                approved_fp = step.get("approved_fingerprint")
+                old_scope = step.get("approved_scope") or step.get("scope")
+                changed = approved_fp is not None and fingerprint != approved_fp
+                if changed and (scope == AGENT_SCOPE_ASK or
+                                _agent_scope_rank(scope) > _agent_scope_rank(old_scope)):
+                    picked["say"] = _agent_reask(task, step, index, scope,
+                                                 "这一步在等确认期间被改过")
+                    return
+                step["scope"] = (AGENT_SCOPE_NOTIFY if scope == AGENT_SCOPE_ASK else scope)
                 step["status"] = "pending"
-                step["scope"] = AGENT_SCOPE_NOTIFY
-                if was_ask and step.get("action") == "write_file":
-                    # 写白名单外目录这一步已被用户放行, 只对本次执行有效
+                step["approved_fingerprint"] = fingerprint
+                step["approved_scope"] = scope
+                if scope == AGENT_SCOPE_ASK and step.get("action") == "write_file":
                     step["external_ok"] = True
-        _agent_save_tasks(data)
-        return _agent_start(task)
-    return {"say": "没有在等确认的任务"}
+                else:
+                    step.pop("external_ok", None)
+                released.append(_agent_guard_text(step))
+            picked["task"] = task
+            picked["released"] = released
+            return
+        picked["say"] = "没有在等确认的任务"
+    _agent_update_tasks(update)
+    if not picked.get("task"):
+        return {"say": picked["say"]}
+    res = _agent_start(picked["task"])
+    details = "；".join(picked.get("released") or [])
+    if details:
+        res["say"] += "；已放行: " + details
+    return res
 
 
 def agent_cancel() -> dict:
     """作废所有未完成任务; 在跑的那个会立刻请求停止。"""
     _agent_stop()
-    data = _agent_load_tasks()
-    changed = False
-    for task in data.get("tasks", []):
-        if task.get("state") in ("draft", "approved", "running", "waiting_user"):
-            task["state"] = "cancelled"
-            changed = True
-    if changed:
-        _agent_save_tasks(data)
-    return {"say": "任务已全部作废, Sir" if changed else "没有进行中的任务"}
+    state = {"changed": False}
+    def update(data):
+        for task in data.get("tasks", []):
+            if task.get("state") in ("draft", "approved", "running", "waiting_user"):
+                task["state"] = "cancelled"
+                state["changed"] = True
+    _agent_update_tasks(update)
+    return {"say": "任务已全部作废, Sir" if state["changed"] else "没有进行中的任务"}
 
 
 def _peek_question_from_text(text, followup=False):
@@ -3017,7 +3185,9 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
 
     sensitive_confirmed 只代表用户点过头, 不能绕过发图前的窗口/敏感性复检:
     确认绑定的窗口变了或复检仍敏感, 就退回正常检查流程 (该提示提示、该跳过跳过)。
+    成败位来自这里每一步的真实结果, 跳过/失败都是 False, 不靠话术猜。
     """
+    _TL.peek_ok = False
     try:
         from llm_brain import query_vision
     except Exception as exc:
@@ -3041,8 +3211,10 @@ def _peek_screen(question="", allow_confirm=True, sensitive_confirmed=False,
                 second = None
             if second:
                 print(f"[看屏] {size} → 第二遍 {len(second)} 字 (图像未落盘)", flush=True)
+                _TL.peek_ok = True
                 return second
         answer = first or "屏幕我看清了, 但没想出该怎么答, Sir。"
+        _TL.peek_ok = bool(first)
         print(f"[看屏] {size} → {len(answer)} 字 (图像未落盘)", flush=True)
         return answer
     except Exception as exc:
@@ -4298,7 +4470,9 @@ def _perform_plan(plan, source=""):
     action = plan.get("action")
     args = plan.get("args", {}) or {}
     say = plan.get("say", "好的")
-    _TL.action_ok = True
+    source = source or getattr(_TL, "agent_task_source", "")
+    _TL.action_ok = False      # 不许默认成功: 每个分支都从自己的真实结果回填
+    _TL.peek_ok = False
     _TL.last_tool_text = ""
     _TL.open_app_verify = "ok"
     _TL.open_app_verify_reason = ""
@@ -4306,7 +4480,7 @@ def _perform_plan(plan, source=""):
 
     try:
         if action == "chat":
-            pass
+            _TL.action_ok = bool(str(say).strip())
         elif action == "remember":
             text = str(args.get("text") or "")
             res = memory_store.get_store().add(text, kind=args.get("kind") or "fact",
@@ -4362,14 +4536,15 @@ def _perform_plan(plan, source=""):
                         verify = "unverified"
                         verify_reason = "实际打开的是同名文档"
                         actual_is_doc = True
-            if len(names) <= 1 and getattr(_TL, "agent_context", False):
-                # agent 步骤要靠成败位判断是否需要修复; 无法核验也不能当成功
+            if len(names) <= 1:
+                # 无法核验也不能当成功, 直连和 agent 走同一口径
                 _TL.action_ok = (verify == "ok")
             _TL.open_app_verify = verify
             _TL.open_app_verify_reason = verify_reason
             _TL.open_app_actual_is_doc = actual_is_doc
         elif action == "open_file":
             success, say = _open_document(args.get("name") or args.get("exe") or "")
+            _TL.action_ok = bool(success)
         elif action == "write_file":
             # 写文档: 默认落工作区, 也可指定 桌面/文档/下载 或子目录;
             # 越是白名单外的路径, 越必须由 agent 审批流程放行 (direct 指令由用户自己说的, 视为已授权)
@@ -4423,7 +4598,7 @@ def _perform_plan(plan, source=""):
         elif action == "open_url":
             url = str(args.get("url", "")).strip()
             if is_safe_url(url):
-                webbrowser.open(url)
+                _TL.action_ok = bool(webbrowser.open(url))
             else:
                 say = "这个链接不是普通网址, 我只打开 http 或 https, Sir"
         elif action == "web_search":
@@ -4436,9 +4611,11 @@ def _perform_plan(plan, source=""):
                 print(f"[联网搜索失败] {exc}")
             if answered:
                 say = answered
+                _TL.action_ok = True
             else:
                 from urllib.parse import quote
-                webbrowser.open("https://www.baidu.com/s?wd=" + quote(query))
+                _TL.action_ok = bool(webbrowser.open(
+                    "https://www.baidu.com/s?wd=" + quote(query)))
         elif action in ("file_manage", "inspect_system", "run_powershell"):
             # 第二步接入的三个真实系统工具：统一走 system_tools，结果再转成口吻
             try:
@@ -4467,7 +4644,8 @@ def _perform_plan(plan, source=""):
                 else:
                     res = run_powershell(args.get("command"))
 
-                if res.get("ok"):
+                _TL.action_ok = bool(res.get("ok"))
+                if _TL.action_ok:
                     say = _format_tool_say(action, res)
                     _TL.last_tool_text = _tool_data_text(action, res)
                 else:
@@ -4496,12 +4674,14 @@ def _perform_plan(plan, source=""):
                         names.append(fname)
                     parts.append(f"【片段{i + 1} · {fname}】\n{hit['text']}")
                 answer = query_llm_answer(query, "\n\n".join(parts), CONFIG)
+                _TL.action_ok = bool(str(answer or "").strip())
                 if any(name in answer for name in names):
                     say = answer
                 else:
                     say = f"{answer}（出自{'、'.join(names[:2])}）"
         elif action == "open_folder":
             os.startfile(args["path"])  # Windows only
+            _TL.action_ok = not DRY_RUN
         elif action == "search_file":
             query = args.get("query", "")
             # 1) 先在桌面/开始菜单的软件清单里找: 支持中英文别名和拼音模糊
@@ -4514,10 +4694,12 @@ def _perform_plan(plan, source=""):
             if hit:
                 os.startfile(hit["path"])
                 say = f"找到了, 已打开{hit['name']}"
+                _TL.action_ok = True
             else:
                 # 2) 再按文件名找文档: 归一化 + 精确优先, 多个候选开最新的
                 if _document_candidates(query):
                     success, say = _open_document(query)
+                    _TL.action_ok = bool(success)
                 else:
                     guess = suggestions(query) if suggestions else []
                     if guess:
@@ -4537,7 +4719,7 @@ def _perform_plan(plan, source=""):
                     ui_bridge.emit_state("IDLE")
                 except Exception:
                     pass
-            _TL.action_ok = True
+            _TL.action_ok = bool(getattr(_TL, "peek_ok", False))
         elif action == "click_screen":
             # 看屏点击: 定位→点一下→再拍一张据实播报; 安全护栏在 _click_screen 内。
             if ui_bridge is not None:
@@ -4556,15 +4738,14 @@ def _perform_plan(plan, source=""):
             target, why = _resolve_screenshot_target(args.get("dir") or "")
             if target is None:
                 say = why          # 解析不了就反问, 绝不猜目录乱建
-                _TL.action_ok = True
             else:
                 CONFIG["screenshot_dir"] = str(target)
                 saved = save_user_config({"screenshot_dir": str(target)})
+                _TL.action_ok = bool(saved)
                 if saved:
                     say = f"好，以后截图都存到 {target}，Sir（以前的旧截图没动）"
                 else:
                     say = f"目录我改到 {target} 了，但这次没写进配置文件，重启后会恢复原样"
-                _TL.action_ok = True
                 print(f"[截图目录] 已改为 {target}", flush=True)
         elif action == "screenshot":
             import pyautogui
@@ -4574,6 +4755,7 @@ def _perform_plan(plan, source=""):
             if ui_bridge is not None and vision_on:
                 ui_bridge.emit_state("PERCEIVING")
             pyautogui.screenshot().save(str(fp))
+            _TL.action_ok = not DRY_RUN
             # 现阶段还没有视觉识别, 先用"当前活动窗口"当扫描目标框
             # 视觉感知关闭时仍会截图，但不再短暂切换感知状态或绘制扫描框。
             if ui_bridge is not None and vision_on:
@@ -4598,28 +4780,40 @@ def _perform_plan(plan, source=""):
                 # 近似: 先静音取消并按到0附近再往上加 (每按一次约2%)
                 for _ in range(50): pyautogui.press("volumedown")
                 for _ in range(int(args["value"] // 2)): pyautogui.press("volumeup")
+            else:
+                _TL.action_ok = False
+                return say
+            _TL.action_ok = not DRY_RUN
         elif action == "brightness":
             ps = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{args['value']})"
             _run(["powershell", "-Command", ps])
+            _TL.action_ok = not DRY_RUN
         elif action == "lock":
             ctypes.windll.user32.LockWorkStation()
+            _TL.action_ok = not DRY_RUN
         elif action == "shutdown":
             _run(["shutdown", "/s", "/t", "60"]); say = "60秒后关机, 说取消关机可以反悔"
+            _TL.action_ok = not DRY_RUN
         elif action == "restart":
             _run(["shutdown", "/r", "/t", "60"]); say = "60秒后重启, 说取消关机可以反悔"
+            _TL.action_ok = not DRY_RUN
         elif action == "cancel_shutdown":
             _run(["shutdown", "/a"])
+            _TL.action_ok = not DRY_RUN
         elif action == "type_text":
             import pyautogui, pyperclip
             speak(say); time.sleep(3)
             pyperclip.copy(args["text"]); pyautogui.hotkey("ctrl", "v")
             say = "已输入"
+            _TL.action_ok = not DRY_RUN
         elif action == "press_key":
             import pyautogui; pyautogui.press(args["key"])
+            _TL.action_ok = not DRY_RUN
         elif action == "click":
             import pyautogui
             if args.get("double"): pyautogui.doubleClick()
             else: pyautogui.click()
+            _TL.action_ok = not DRY_RUN
         else:
             say = "这个动作我暂时做不了"
             _TL.action_ok = False
@@ -4861,20 +5055,30 @@ def _agent_interrupt(command: str):
     return False
 
 
-def _agent_control_command(command: str):
+def _agent_control_command(command: str, source=""):
     """识别 agent 任务控制指令。返回 (kind, goal) 或 None。
 
-    立项触发词刻意带"任务/安排/帮我做"这类字眼, 避免普通聊天误触发。
+    放行/审批必须和任务同源; 遥控一句「继续任务」放不了本地任务的危险步。
     """
     t = str(command or "").strip()
     low = t.lower().replace(" ", "")
     if any(w in low for w in ("任务进展", "任务状态", "任务清单")):
         return ("status", "")
     if low in ("继续任务", "放行任务", "任务继续", "确认继续"):
+        tasks = _agent_load_tasks().get("tasks", [])
+        waiting = next((x for x in tasks if x.get("state") == "waiting_user"), None)
+        if waiting and not _agent_source_allows(waiting, source):
+            print("[Agent] 跨来源放行被拒绝", flush=True)
+            return None
         return ("continue", "")
     if low in ("取消任务", "作废任务", "任务作废", "停止任务"):
         return ("cancel", "")
     if low in ("执行任务", "开始任务", "审批通过", "任务开始", "批准任务"):
+        tasks = _agent_load_tasks().get("tasks", [])
+        draft = next((x for x in tasks if x.get("state") == "draft"), None)
+        if draft and not _agent_source_allows(draft, source):
+            print("[Agent] 跨来源审批被拒绝", flush=True)
+            return None
         return ("approve", "")
     m = re.search(r"(?:帮我做|安排一个任务|安排任务|立项|帮我完成)(.+)", t)
     if m:
@@ -4992,22 +5196,22 @@ def _handle_command_inner(command, command_id, source=""):
         return
 
     # Agent 任务控制（本地规则, 不进大模型: 这些词必须 100% 可靠）
-    agent_cmd = _agent_control_command(command)
+    agent_cmd = _agent_control_command(command, source)
     if agent_cmd:
         kind, goal = agent_cmd
         if kind == "status":
             speak(agent_tasks_text())
         elif kind == "approve":
-            res = agent_approve()
+            res = agent_approve(source=source)
             speak(res.get("say", ""))
         elif kind == "continue":
-            res = agent_continue()
+            res = agent_continue(source=source)
             speak(res.get("say", ""))
         elif kind == "cancel":
             speak(agent_cancel().get("say", ""))
         elif kind == "draft":
             ui_bridge.emit_state("ACTING") if ui_bridge is not None else None
-            res = agent_draft_plan(goal)
+            res = agent_draft_plan(goal, source=source)
             speak(res.get("say", "任务立项失败, 您说说具体要做什么"))
         if ui_bridge is not None:
             ui_bridge.emit_state("IDLE")
