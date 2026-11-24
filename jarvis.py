@@ -764,7 +764,8 @@ _GUARD_YES = ("确认", "确定", "确认执行", "确定执行", "好的", "好
               "对", "嗯", "同意", "执行", "关吧", "继续", "没问题", "行", "y", "yes")
 _GUARD_NO = ("取消", "算了", "不用", "不要", "别", "不关", "停下", "停", "不做", "免了",
              "不", "n", "no")
-_GUARD_PUNCT = re.compile(r"[。！？!?，,.、\s]")
+# ASR/输入法会吐出小号标点 (﹐﹑), 不能因为这些就把"确定﹑确订﹐确D"判成非纯答复
+_GUARD_PUNCT = re.compile(r"[。！？!?，,.、﹐﹑；;：:\s]")
 
 _CONFIRM_ASR = {"确订": "确定", "缺定": "确定", "确d": "确定", "却定": "确定"}
 _CONFIRM_YES = ("没问题", "确定", "确认", "好的", "是的", "看吧", "点吧", "继续",
@@ -794,7 +795,7 @@ def classify_confirmation_answer(text):
     if no_hit:
         rest = compact.replace(no_hit, "")
         return "none" if any(word in rest for word in _CONFIRM_YES) else "deny"
-    clause = _GUARD_PUNCT.sub("", re.split(r"[，,。！？!?、；;]", raw, maxsplit=1)[0])
+    clause = _GUARD_PUNCT.sub("", re.split(r"[，,。！？!?、﹐﹑；;]", raw, maxsplit=1)[0])
     rest, seen_core = clause, False
     while rest:
         core = next((word for word in _CONFIRM_YES if rest.startswith(word)), None)
@@ -1997,8 +1998,8 @@ def _parse_rules(text, peek_followup=False):
     if q is not None:
         return {"action": "peek_screen", "args": {"question": q}, "say": "我看看屏幕"}
 
-    # 截图 (含口语"截个图")
-    if "截图" in t or "截屏" in t or "截个图" in t:
+    # 截图 (含口语"截个图"; ASR 同音字走拼音兜底, 不逐句打补丁)
+    if _screenshot_intent(raw):
         return {"action": "screenshot", "say": "已截图, 保存在图片文件夹的贾维斯截图里"}
 
     # 静音/音量
@@ -2035,6 +2036,17 @@ def _parse_rules(text, peek_followup=False):
             w in t for w in ("今天", "明天", "后天", "怎么样", "多少度", "下雨", "温度", "预报")):
         query = raw.strip().rstrip("。！？!?，, ")
         return {"action": "web_search", "args": {"query": query}, "say": "我查一下天气"}
+
+    # 点名歌名的播放请求: 走本机音乐客户端, 不用音乐网页顶替 (与规划通道同一口径)。
+    m = re.search(r"^(?:帮我|给我|请)?(?:播|播放)(.+)$", raw)
+    if m and any(w in raw for w in ("歌", "这首", "曲")):
+        song = m.group(1).strip().rstrip("。！？!?，, ")
+        song = re.sub(r"^(?:一下|那首|这首)", "", song).strip()
+        song = re.sub(r"(?:这首歌|这首|歌曲)$", "", song).strip()
+        if song:
+            app = str(CONFIG.get("music_app") or "酷狗音乐").strip() or "酷狗音乐"
+            return {"action": "open_app", "args": {"exe": "", "name": app},
+                    "say": f"打开{app}了，说歌名我在里面帮你搜", "music_query": song}
 
     # 读取文件内容: 读取/读一下/念一下 + 带扩展名的文件名 (本地直通, 不必等大模型)
     m = re.search(r"(?:读取|读一下|读下|念一下|朗读)(.+)", raw)
@@ -2079,7 +2091,7 @@ def _parse_rules(text, peek_followup=False):
         return {"action": "chat", "say": say}
 
     # 打开软件 / 打开文档
-    m = re.search(r"(?:打开|启动|运行)(.+)", raw)
+    m = re.search(r"(?:重开|重新打开|再打开|打开|启动|运行)(.+)", raw)
     if m:
         target = m.group(1).strip()
         tl = target.lower().replace(" ", "")
@@ -2148,7 +2160,11 @@ _CHAT_SIGNAL_RE = re.compile(
     r"你觉得|你认为|你怎么看|聊聊|聊天|讲讲|讲个|讲一下|故事|笑话|陪我|说说|谈谈|"
     r"累|开心|难过|伤心|无聊|焦虑|压力|睡不着|失眠|饿了|好烦|郁闷|高兴|生气|"
     r"怎么办|划不划算|值不值|建议|什么意思|什么梗|为什么|是什么|是怎么|"
-    r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少"
+    r"介绍一下|解释一下|科普|原理|区别|好奇|在吗|干嘛|想你|谢谢你|辛苦了|厉害|聪明|多少|"
+    # 能力提问/状态答疑/称呼偏好/打招呼/泛泛承接: 都是说话, 不是操作电脑。
+    # 带操作动词的句子先被 _CMD_VETO_RE 拦走, 这里不会把正经指令聊废。
+    r"你好|哈喽|Hello|hello|报告一下|升级情况|习惯|记忆|能不能|可不可以|能根据|"
+    r"可以修改|能修改|叫我|称呼|很清楚|应该.{0,6}吧"
 )
 
 
@@ -2276,7 +2292,7 @@ _PEEK_HINT_WORDS = ("看屏", "看看屏幕", "看一下屏幕", "看下屏幕",
                     "界面", "窗口", "截图看一下", "截个图看看", "截图看看", "截图看下")
 # peek 节流: 必须"屏幕/界面"这类载体 + 看/显示/是什么这类意图同时出现;
 # 或者紧接上一次 peek 的下一句, 用"这段/这个/上面"+内容名词指代屏幕上的东西。
-_PEEK_SURFACE_WORDS = ("屏幕", "屏上", "界面", "窗口", "页面")
+_PEEK_SURFACE_WORDS = ("屏幕", "屏上", "界面", "窗口", "页面", "桌面", "画面")
 _PEEK_VIEW_WORDS = ("看", "显示", "是什么", "有什么", "什么意思", "什么", "识别", "写", "读", "展示")
 _PEEK_FOLLOW_DEICTIC = ("这段", "这个", "上面", "这行")
 _PEEK_FOLLOW_CONTENT = ("代码", "文字", "报错", "按钮", "图", "内容")
@@ -2466,11 +2482,18 @@ def _unfill(text) -> str:
 
 def is_capability_question(text) -> bool:
     low = _unfill(text)
-    if not _CAPABILITY_RE.match(low):
+    if _CAPABILITY_RE.match(low):
+        if "吗" in low or low.endswith(("?", "？", "呢")):
+            return True
+        return low.startswith("你还能")
+    # 能力提问也可能埋在"还有一个问题就是,你现在可以修改…了吧"这类引导语后面。
+    # 只有"能/可以 + 能力动词"再加疑问语气才算; 明确操作意图先由 parse_command 放行。
+    if not re.search(
+            r"(?:你(?:现在|此刻)?|现在)?(?:能不能|可不可以|可以|能|会不会)"
+            r"(?:帮我)?(?:修改|改|读取|读写|写入|删除|记住|看|识别|访问|控制|"
+            r"改变|创建|新建|生成|操作|播放)", low):
         return False
-    if "吗" in low or low.endswith(("?", "？", "呢")):
-        return True
-    return low.startswith("你还能")
+    return bool("吗" in low or "吧" in low or low.endswith(("?", "？", "呢")))
 
 
 def _explicit_intent(text) -> bool:
@@ -3317,7 +3340,326 @@ def _looks_conversational(command: str) -> bool:
     text = str(command or "")
     if _CMD_VETO_RE.search(text):
         return False
-    return bool(_CHAT_SIGNAL_RE.search(text))
+    if _CHAT_SIGNAL_RE.search(text):
+        return True
+    # "你现在正在识别图片内容吧" 这类状态疑问/既成事实确认, 也是说话。
+    return bool(re.search(r"(?:正在|已经|现在).{0,12}吧$", text))
+
+
+# ═══════════════════════════════════════════════════════════════
+# 对话方式机制: 意图持续 / 短追问接上文 / 反馈收尾
+# 只修机制, 不背用户原句。判定一律复用上面的可测层:
+# parse_command(本地解析+路由)、classify_confirmation_answer(确认判定)、
+# _peek_question_from_text / _click_intent(看屏/点击意图)。
+# ═══════════════════════════════════════════════════════════════
+_TASK_TTL = 180.0          # "还是这件事"的短窗口; 跨时段自然失效
+_CURRENT_TASK = {"action": "", "target": "", "result": "", "status": "", "ts": 0.0, "source": ""}
+_TASK_VERB = {
+    "open_app": "打开", "click_screen": "点击", "peek_screen": "看屏",
+    "screenshot": "截图", "search_file": "找", "web_search": "搜索",
+    "open_url": "打开", "open_file": "打开", "shutdown": "关机",
+}
+_ABILITY_TALK_RE = re.compile(
+    r"能力边界|我能读取你的文件|给出修改后的全文|直接写成新文档|"
+    r"没法(?:直接)?改动|重写一份|只能新建文档"
+)
+_FEEDBACK_RE = re.compile(
+    r"做得(?:很)?好|干得(?:很)?好|太棒|干得好|不错|很好|厉害了|谢谢|感谢|"
+    r"(?:已经|现在|总算|终于)(?:进去|好了|成了|可以了|完成|搞定|成功|进去了)|"
+    r"搞定了|可以了|成功了|办好了|成了"
+)
+_HALF_UTTERANCE_RE = re.compile(r"(?:让我|我要|我想|帮我|给我|想让|请你|你说)[，,。！？!?\s]*$")
+_FOLLOWUP_RE = re.compile(
+    r"(?:点|看|做|截|弄|搞)(?:了|的)?(?:没有|没|吗)|"
+    r"(?:还是|还是说|还是没)?(?:无反应|没反应|没有反应|没动静|没效果|不反应)|"
+    r"(?:好了|完成|搞定|成功|生效)(?:了)?(?:没有|没|吗)|"
+    r"哪个动作|什么动作|做的什么|上(?:一)?轮(?:做|干)了什么|"
+    r"(?:您|你)?再确认一下|再确认一下|"
+    r"有(?:没有|没)(?:反应|效果|成功|生效)"
+)
+_LOOK_NOW_RE = re.compile(r"赶快看|赶紧看|快看|马上看|立刻看|看一下|看下|看看|看到|看一眼")
+_INTENT_KEEP_RE = re.compile(
+    r"进入|点击|点一下|点开|点进|按一下|按钮|看一下|看看|截图|打开|启动|播放|再点"
+)
+_OPERATE_CURRENT_RE = re.compile(r"进入|点击|点一下|点开|点进|按一下|按钮|再点|点它|按它")
+_REOPEN_APP_RE = re.compile(r"重开|重新打开|重新启动|重新开启|再打开|再启动|打开|启动|开启|开一下")
+_NEW_REQUEST_RE = re.compile(
+    r"打开|启动|重开|重新|截图|截屏|播放|搜索|搜一下|查找|找出|关机|记住|记一下|"
+    r"写(?:文档|篇|一段|一份|个)|设置"
+)
+
+
+def reset_dialogue_state():
+    _CURRENT_TASK.update(action="", target="", result="", status="", ts=0.0, source="")
+
+
+def current_task_snapshot():
+    return dict(_CURRENT_TASK)
+
+
+def set_current_task(action="", target="", result="", status="open", ts=None, source=""):
+    _CURRENT_TASK.update(
+        action=str(action or ""), target=str(target or ""),
+        result=str(result or "")[:200], status=str(status or "open"),
+        ts=float(ts if ts is not None else time.time()),
+        source=_source_label(source) if source else str(_CURRENT_TASK.get("source") or ""),
+    )
+
+
+def _task_fresh():
+    return (bool(_CURRENT_TASK.get("action"))
+            and time.time() - float(_CURRENT_TASK.get("ts") or 0) <= _TASK_TTL)
+
+
+def _mark_task_done():
+    if _CURRENT_TASK.get("action"):
+        _CURRENT_TASK.update(status="done", result="已完成", ts=time.time())
+
+
+def is_feedback(text):
+    t = _GUARD_PUNCT.sub("", _tight(str(text or "")))
+    if not t:
+        return False
+    # "不错"是夸奖却带"不", 先摘掉再查否定词, 免得把夸奖当否定指令。
+    if any(w in t.replace("不错", "") for w in ("没", "不", "别", "未", "还")):
+        return False
+    return bool(_FEEDBACK_RE.search(t))
+
+
+def _feedback_remainder(text):
+    t = _GUARD_PUNCT.sub("", _FEEDBACK_RE.sub("", _tight(str(text or ""))))
+    return re.sub(r"^(?:了|的|吧|啊|呀|呢|嘛)+", "", t)
+
+
+def _has_new_request(text):
+    t = _GUARD_PUNCT.sub("", _tight(str(text or "")))
+    if not t:
+        return False
+    if _click_intent(text)[1] == "command":
+        return True
+    if _OPERATE_CURRENT_RE.search(t) or _LOOK_NOW_RE.search(t) or _screenshot_intent(t):
+        return True
+    return bool(_NEW_REQUEST_RE.search(t))
+
+
+def feedback_remainder(text):
+    raw = str(text or "")
+    if not is_feedback(raw):
+        return ""
+    rest = _feedback_remainder(raw)
+    return rest if rest and _has_new_request(rest) else ""
+
+
+def _plan_for_request(text, plan=None):
+    if plan is not None and str(plan.get("action") or "") not in ("", "chat"):
+        return plan
+    kind = classify_dialogue_turn(text, plan or {})
+    if kind == "action:peek_screen" or _LOOK_NOW_RE.search(text):
+        question = _peek_question_from_text(str(text or ""), followup=True) or str(text or "")
+        return {"action": "peek_screen", "args": {"question": question}, "say": "我看一眼屏幕，Sir"}
+    if kind == "action:click_screen" or _OPERATE_CURRENT_RE.search(str(text or "")):
+        target, _ = _click_intent(text)
+        return {"action": "click_screen", "args": {"target": target or "屏幕"},
+                "say": "我点一下，Sir"}
+    if kind == "action:screenshot":
+        return {"action": "screenshot", "args": {}, "say": "我截个图，Sir"}
+    return plan
+
+
+def _is_followup(text):
+    return bool(_FOLLOWUP_RE.search(_GUARD_PUNCT.sub("", _tight(str(text or "")))))
+
+
+def _is_pure_answer(text):
+    """确认判定器只在整句就是答复时算数: '识别'里的'别'不许当否定答复。"""
+    if classify_confirmation_answer(text) == "none":
+        return False
+    s = _GUARD_PUNCT.sub("", _tight(_asr_fix(str(text or ""))))
+    s = re.sub(r"^我(?:就|是|才)?(?:说|讲|选|答|回|道)(?:的是|了|过)?", "", s)
+    return 0 < len(s) <= 8
+
+
+def _screenshot_intent(text):
+    """截图意图: 语音把"截个图"听成"截个头"时, 用拼音兜住, 不逐句打补丁。"""
+    import difflib
+    low = _GUARD_PUNCT.sub("", _tight(_asr_fix(str(text or ""))))
+    if any(w in low for w in ("截图", "截屏", "截个图")):
+        return True
+    m = re.search(r"截(?:个|一|张)?([\u4e00-\u9fff])", low)
+    if not m:
+        return False
+    py = _pinyin(m.group(1))
+    return bool(py and py != m.group(1)
+                and difflib.SequenceMatcher(None, py, "tu").ratio() >= 0.75)
+
+
+def _ongoing_target():
+    t = _tight(_asr_fix(str(_CURRENT_TASK.get("target") or "")))
+    t = re.sub(r"^(?:那个|这个|就是|我的|一下)", "", t)
+    t = re.sub(r"(?:的按钮|按钮|图标|的页面|页面|的桌面|桌面)+$", "", t)
+    return t
+
+
+def _target_tokens(target):
+    toks = [name for name in list((CONFIG.get("apps") or {}).keys())
+            + ["微信", "酷狗音乐", "我的收藏", "收藏", "音乐", "播放器"]
+            if name in target]
+    return toks or re.findall(r"[A-Za-z]{2,}|[\u4e00-\u9fff]{2,4}", target)
+
+
+def _same_ongoing(text):
+    """同一意图的换说法: 归一化到 动作+目标 签名, 短窗口内算同一件事。"""
+    if not _task_fresh():
+        return False
+    low = _GUARD_PUNCT.sub("", _tight(_asr_fix(correct_asr_text(str(text or "")))))
+    low = re.sub(
+        r"^(?:我说的是|我说|我说的|就是|那个|那么|所以|嗯|呃|哦|算了|然后|确定并|确定|取消)",
+        "", low)
+    if _REOPEN_APP_RE.search(low) or not _OPERATE_CURRENT_RE.search(low):
+        return False
+    if not _INTENT_KEEP_RE.search(low):
+        return False
+    target = _ongoing_target()
+    if not target:
+        return False
+    py = _pinyin(low)
+    for tok in _target_tokens(target):
+        if tok in low or (len(tok) >= 2 and _pinyin(tok) not in ("", tok) and _pinyin(tok) in py):
+            return True
+    return False
+
+
+def _ongoing_intent_kind(text):
+    """用户的意图类别 (不是执行策略): 同任务里的"进入/点它"就是点击意图。"""
+    if not _same_ongoing(text):
+        return ""
+    if _CURRENT_TASK.get("action") == "peek_screen":
+        return "peek_screen"
+    return "click_screen"
+
+
+def answer_followup(text):
+    """短追问接上文: 由上一动作记录作答, 不反问用户"您要确认什么"。"""
+    if not _task_fresh():
+        return "这句没有可追问的动作，Sir；您说一句要我做什么，我这就办"
+    act = str(_CURRENT_TASK.get("action") or "")
+    target = str(_CURRENT_TASK.get("target") or "")
+    result = str(_CURRENT_TASK.get("result") or "")
+    verb = _TASK_VERB.get(act, act)
+    obj = f"{target}" if target else ""
+    if _CURRENT_TASK.get("status") == "unverified":
+        return f"上一轮我{verb}了{obj}，结果还没核验；我先核一眼屏幕再答您，Sir"
+    return f"上一轮我{verb}了{obj}，{result or '已经执行'}"
+
+
+def _short_ack(text):
+    if is_feedback(str(text or "")):
+        return "好，收到，Sir"
+    return "好，Sir"
+
+
+def capability_gate(text, plan):
+    """能力话术语境门: 只有直接问能力才允许出场, 夸奖/状态报告一律收口。"""
+    if not plan or str(plan.get("action") or "") != "chat":
+        return plan
+    if not _ABILITY_TALK_RE.search(str(plan.get("say") or "")):
+        return plan
+    if is_capability_question(text):
+        return plan
+    print("[护栏] 非能力询问 → 收掉能力话术，只作短确认", flush=True)
+    out = dict(plan)
+    out["say"] = _short_ack(text)
+    return out
+
+
+def classify_dialogue_turn(text, plan=None):
+    """类别判定入口: 可测层 + 当前任务状态, 给语料考试和运行时共用。"""
+    raw = str(text or "")
+    routed = feedback_remainder(raw)
+    if routed:
+        raw, plan = routed, None
+    if plan is None:
+        try:
+            plan = parse_command(raw) or {}
+        except Exception:
+            plan = {}
+    action = str(plan.get("action") or "")
+    if _is_followup(raw):
+        return "followup"
+    if is_feedback(raw):
+        return "feedback"
+    # "截图看一下"是看屏不是存档; 动词在句尾的点击命令也不许被"截图"两个字带跑。
+    peek_look = any(w in raw for w in _SCREENSHOT_PEEK_WORDS)
+    if _screenshot_intent(raw) and not peek_look and not _CLICK_VERB_ANY_RE.search(raw):
+        return "action:screenshot"
+    if _click_intent(raw)[1] == "command":
+        return "action:click_screen"
+    if _LOOK_NOW_RE.search(raw):
+        return "action:peek_screen"
+    if _is_pure_answer(raw):
+        return "confirm"
+    if action and action != "chat":
+        return "action:" + action
+    if _HALF_UTTERANCE_RE.search(raw.strip()):
+        return "unknown"
+    kind = _ongoing_intent_kind(raw)
+    if kind:
+        return "action:" + kind
+    if action == "chat" or _looks_conversational(raw):
+        return "chitchat"
+    return "unknown"
+
+
+def escalate_repeated_intent(command, plan):
+    """意图持续: 同一件事重复出现时点明"还是这件事", 并换策略不原样重跑。"""
+    if not _same_ongoing(command):
+        return plan
+    target = _ongoing_target() or "屏幕"
+    if _CURRENT_TASK.get("action") == "open_app":
+        return {"action": "click_screen",
+                "args": {"target": f"{target}进入按钮"},
+                "say": f"还是这件事，我改点屏幕上的{target}进入按钮，Sir"}
+    if _CURRENT_TASK.get("action") in ("click_screen", "screenshot", "peek_screen"):
+        return {"action": "peek_screen",
+                "args": {"question": f"核验刚才的{target}是否已生效"},
+                "say": f"还是这件事，我先看一眼屏幕核验刚才那下，不盲目再点，Sir"}
+    return plan
+
+
+def _verify_last_action():
+    """未核验的上轮动作: 回复前先自己核验, 不许空谈或反问。"""
+    if not _task_fresh() or _CURRENT_TASK.get("status") != "unverified":
+        return
+    act = str(_CURRENT_TASK.get("action") or "")
+    if act not in ("click_screen", "screenshot", "peek_screen", "open_app"):
+        return
+    try:
+        out = _peek_screen(question=f"核验刚才的{_ongoing_target() or '操作'}是否已生效",
+                           allow_confirm=False,
+                           source=_source_label(_CURRENT_TASK.get("source")))
+        _CURRENT_TASK["result"] = str(out or "")[:200]
+        _CURRENT_TASK["status"] = "done"
+    except Exception as exc:
+        print(f"[核验] 没能核验上轮动作: {exc}", flush=True)
+
+
+def note_current_task(command, plan, reply="", source=""):
+    """执行完一轮后写回结果: 夸奖类反馈顺手把当前任务标记完成。"""
+    if is_feedback(str(command or "")):
+        _mark_task_done()
+        return
+    action = str((plan or {}).get("action") or "")
+    if not action or action == "chat":
+        return
+    args = (plan or {}).get("args") or {}
+    target = str(args.get("name") or args.get("target") or args.get("query")
+                 or args.get("folder") or "")
+    if action == "open_url":
+        target = target or str(args.get("url") or "")
+    ok = bool(getattr(_TL, "action_ok", True))
+    status = "unverified" if action == "click_screen" or not ok else "done"
+    set_current_task(action, target, str(reply or (plan or {}).get("say") or ""), status,
+                     source=source)
 
 
 def gemini_plan(command, memory_context=""):
@@ -4218,8 +4560,34 @@ def _handle_command_inner(command, command_id, source=""):
         speak(habit_question)
 
     # 1. 本地规则优先 (最快、最稳、不消耗 Token)
+    routed = feedback_remainder(command)
+    if routed:
+        command = routed
     plan = parse_command(command)
     plan_source = "local" if plan is not None else ""
+    if routed and (plan is None or str(plan.get("action") or "") == "chat"):
+        plan = _plan_for_request(command, plan)
+        plan_source = "local" if plan is not None else ""
+
+    # 1.2 对话方式机制: 反馈只收尾 / 短追问由上轮动作记录回答 / 同意图换策略。
+    # 传 {} 占住 plan 位, 免得 classify_dialogue_turn 再跑一次 parse_command 消耗看屏指代状态。
+    kind = classify_dialogue_turn(command, plan if plan is not None else {})
+    if kind == "feedback":
+        _mark_task_done()
+        speak(_short_ack(command))
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+    if kind == "followup":
+        _verify_last_action()
+        speak(answer_followup(command))
+        if ui_bridge is not None:
+            ui_bridge.emit_state("IDLE")
+        return
+    escalated = escalate_repeated_intent(command, plan)
+    if escalated is not plan:
+        plan = escalated
+        plan_source = "local"
 
     # 1.5 自由对话通道: 规则不认识、又明显是聊天/答疑的话, 别塞进规划通道硬凑 JSON,
     # 走 free_chat 正常说话 (带上下文和记忆); 聊天失败自动落回下面的规划通道。
@@ -4251,6 +4619,10 @@ def _handle_command_inner(command, command_id, source=""):
                 plan_source = "llm"
         except Exception as e:
             print(f"[AI 模块调用异常] {e}")
+    # 能力类话术只许在直接问能力时出场; 夸奖/状态报告被上面的收尾分支吃掉,
+    # 这里再兜一层: 模型自己背出能力说明时也只留一句短确认。
+    if plan is not None and plan_source == "llm":
+        plan = capability_gate(command, plan)
 
     # 3. 兼容原有 Gemini 兜底
     if plan is None:
@@ -4276,6 +4648,7 @@ def _handle_command_inner(command, command_id, source=""):
     try:
         async_started = execute_plan(plan, command_id=command_id, source=source)
     finally:
+        note_current_task(command, plan, (plan or {}).get("say", ""), source=source)
         MEMORY.record_turn(command, plan,
                            source=getattr(_TL, "command_source", None) or plan_source or "unresolved")
         # 同步动作已经结束；异步工具仍由主循环等待最终结果。
