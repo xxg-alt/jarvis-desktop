@@ -111,6 +111,33 @@ def test_batch_move():
     print("4. move_file 批量移动 + 部分失败如实报 OK")
 
 
+def test_batch_cap_and_mixed_roots():
+    # 深审点名: 超过 50 个源路径绝不许静默截断 -> sanitize 整步拒绝
+    many = [f"/x/inbox/f{i}.jpg" for i in range(51)]
+    st = llm_brain.sanitize_plan({"action": "move_file",
+                                  "args": {"src": many, "dst": "/x/inbox/images"},
+                                  "say": "移"})
+    assert st["action"] == "chat" and "50" in st["say"], st
+    # 执行器兜底: 51 个真文件整批拒绝, 一个都不动
+    tmp = tempfile.mkdtemp()
+    inbox = os.path.join(tmp, "inbox")
+    os.makedirs(inbox)
+    names = [f"f{i}.jpg" for i in range(51)]
+    for n in names:
+        open(os.path.join(inbox, n), "w").write("x")
+    jarvis._file_tools.configure_file_roots([tmp])
+    r = system_tools.move_file(src=[os.path.join(inbox, n) for n in names],
+                               dst=os.path.join(inbox, "images"))
+    assert not r["ok"] and len(os.listdir(inbox)) == 51, r
+    # 批次里混入授权根外的路径: 整体不如实报成功, 根外文件不许动
+    outside = os.path.join(tempfile.mkdtemp(), "secret.txt")
+    open(outside, "w").write("x")
+    r2 = system_tools.move_file(src=[os.path.join(inbox, "f0.jpg"), outside],
+                                dst=os.path.join(inbox, "images"))
+    assert not r2["ok"] and os.path.exists(outside), r2
+    print("6. 批量上限整批拒绝 + 混入根外路径不如实报成功 OK")
+
+
 def test_temperature_retry():
     calls = []
 
@@ -147,5 +174,6 @@ if __name__ == "__main__":
     test_agent_continue_newest_waiting()
     test_sanitize_list_src()
     test_batch_move()
+    test_batch_cap_and_mixed_roots()
     test_temperature_retry()
     print("全部通过 (真项目实测回归: 脱敏误判/放行取最新/批量移动/temperature 兼容)")

@@ -373,6 +373,10 @@ def move_file(src=None, dst=None, overwrite=False) -> dict:
         items = [s for s in src if str(s or "").strip()]
         if not items:
             return _result(False, "没给我要移动的文件。")
+        if len(items) > 50:
+            # 与 sanitize 同口径的兜底: 超量整批拒绝, 一个都不动,
+            # 绝不出现"移了一部分却报全成功"。
+            return _result(False, "一次移动的文件超过 50 个，请分批处理，这次一个都没动。")
         if len(items) == 1:
             return _move_one_file(items[0], dst, overwrite=overwrite)
         results = [_move_one_file(s, dst, overwrite=overwrite) for s in items]
