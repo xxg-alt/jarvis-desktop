@@ -52,8 +52,8 @@
         步数、LLM 调用、时长和打转检测是任务级统一预算；修复重跑、修复调用
         与界面失败取证也计入同一池。任务自带 budget/budget_used 优先,
         挂起/续跑不重置。"能否再执行一步"与"能否再调 LLM/修复"分开判定；
-        预算耗尽只有收尾裁定明确 finish 才能 done; 其它情况仍落 failed +
-        stop_reason(budget_*), 不进普通 done 分支冒充完成。
+        LLM 预算耗尽不再决策；仅步数用尽且所有已执行步成功、无未完成步时，
+        已获准调用的 decide 返回 finish 可落 done，其余预算退出仍落 failed。
     evidence(task, step, signals) -> dict 可选：界面失败的取证回调（调用方用
         已有看屏能力做只读核实）。取证次数与一次 LLM 调用同池计费。
     clock() -> float 可选：单调时钟，卡住上报用；默认 time.monotonic。
@@ -905,83 +905,8 @@ class TaskRunner:
     @staticmethod
     def _closing_eligible(task):
         steps = [s for s in task.get("steps") or [] if isinstance(s, dict)]
-        if any(s.get("status") in (STEP_STARTED, STEP_UNKNOWN) for s in steps):
-            return False
-        completed = [s for s in steps
-                     if s.get("status") in (STATE_DONE, STATE_FAILED)]
-        return (bool(completed)
-                and not any(s.get("status") == STATE_FAILED for s in completed)
-                and completed[-1].get("status") == STATE_DONE)
-
-    def _closing_decide(self, task, reason, budget, used, base_seconds, t0):
-        if (task.get("closing_decide_used")
-                or not self._closing_eligible(task)):
-            return False
-
-        task["closing_decide_used"] = True
-        self._close_elapsed(used, base_seconds, t0)
-        task["budget_used"] = used
-        self._safe_persist(task)  # 一生一次标记先落盘, 覆盖调用期间崩溃
-
-        elapsed = self._elapsed(base_seconds, t0)
-        context = self._decide_context(
-            task, budget, used, elapsed,
-            {"source": str(task.get("source") or "")})
-        rule = "预算已耗尽，收尾裁定只允许 finish 或 ask，禁止派发新步骤。"
-        context["closing_decide"] = {
-            "allowed_kinds": ["finish", "ask"],
-            "budget_reason": reason,
-            "rule": rule,
-        }
-        context["next_hint"] = rule
-        context["forced_route"] = {"choices": ["ask", "finish"], "rule": rule}
-        out = self._call_decide(context)
-        try:
-            calls = max(1, min(100, int(out.get("llm_calls", 1))))
-        except (TypeError, ValueError):
-            calls = 1
-        used["llm_calls"] = self._as_int(used.get("llm_calls")) + calls
-        self._close_elapsed(used, base_seconds, t0)
-        task["budget_used"] = used
-        self._safe_persist(task)
-
-        kind = out.get("kind")
-        if kind == "finish":
-            say = str(out.get("say") or out.get("text") or "").strip()[:2000]
-            if say:
-                for step in task.get("steps") or []:
-                    if isinstance(step, dict) and step.get("status") == STEP_PENDING:
-                        step["status"] = "skipped"
-                task.pop("pending_question", None)
-                task.pop("budget_exhausted", None)
-                task["state"] = STATE_DONE
-                task["stop_reason"] = "finish"
-                task["conclusion"] = say
-                self._safe_persist(task)
-                self._safe_notify(say, spoken=True)
-                return True
-        elif kind == "ask":
-            question = str(out.get("question") or "").strip()[:500]
-            if question:
-                for step in task.get("steps") or []:
-                    if isinstance(step, dict) and step.get("status") == STEP_PENDING:
-                        step["status"] = "skipped"
-                seen = task.setdefault("_seen_fingerprints", [])
-                fp = ask_fingerprint(question)
-                if fp in seen:
-                    self._spin_finish(task, "提问")
-                    return True
-                seen.append(fp)
-                task.pop("budget_exhausted", None)
-                task["state"] = STATE_WAITING
-                task["pending_question"] = question
-                self._safe_persist(task)
-                self._safe_notify(question, spoken=True)
-                return True
-
-        # next_step is intentionally not normalized or appended in this path.
-        self._stop_budget(task, reason, budget, used)
-        return True
+        return (any(s.get("status") == STATE_DONE for s in steps)
+                and all(s.get("status") in (STATE_DONE, "skipped") for s in steps))
 
     def _handle_budget_exhaustion(self, task, budget, used, base_seconds, t0,
                                   dynamic):
@@ -990,10 +915,6 @@ class TaskRunner:
                   or (self._llm_budget_reason(budget, used, elapsed) if dynamic else None))
         if not reason:
             return False
-        if (dynamic and reason in ("budget_steps", "budget_llm")
-                and self._closing_decide(task, reason, budget, used,
-                                         base_seconds, t0)):
-            return True
         self._close_elapsed(used, base_seconds, t0)
         task["budget_used"] = used
         self._stop_budget(task, reason, budget, used)
@@ -1006,26 +927,17 @@ class TaskRunner:
         task["budget_used"] = used
         self._safe_persist(task)
         goal = str(task.get("goal") or "")
+        remaining = ("已执行步骤都成功完成，只是预算用完没能正式收尾，已停下, Sir"
+                     if self._closing_eligible(task)
+                     else "卡在还没做完的地方, 已停下, Sir")
         if reason == "budget_steps":
-            steps = [s for s in task.get("steps") or [] if isinstance(s, dict)]
-            executed = [s for s in steps
-                        if s.get("status") in (STATE_DONE, STATE_FAILED)]
-            all_closed = (bool(executed)
-                          and all(s.get("status") == STATE_DONE for s in executed)
-                          and all(s.get("status") in (STATE_DONE, "skipped")
-                                  for s in steps))
-            if all_closed:
-                msg = (f"任务「{goal}」已跑满步数预算 "
-                       f"({used.get('steps')}/{budget.get('max_steps', MAX_STEPS)} 步), "
-                       "已执行步骤都成功完成，只是没能正式收尾，已停下, Sir")
-            else:
-                msg = (f"任务「{goal}」已跑满步数预算 "
-                       f"({used.get('steps')}/{budget.get('max_steps', MAX_STEPS)} 步), "
-                       "卡在还没做完的地方, 已停下, Sir")
+            msg = (f"任务「{goal}」已跑满步数预算 "
+                   f"({used.get('steps')}/{budget.get('max_steps', MAX_STEPS)} 步), "
+                   f"{remaining}")
         elif reason == "budget_llm":
             msg = (f"任务「{goal}」已用完 LLM 调用预算 "
                    f"({used.get('llm_calls')}/{budget.get('max_llm_calls', MAX_LLM_CALLS)} 次), "
-                   "卡在让大脑决定下一步, 已停下, Sir")
+                   f"{remaining}")
         else:
             msg = (f"任务「{goal}」已超过时长预算 "
                    f"({used.get('seconds')}s/{budget.get('max_seconds', MAX_SECONDS)}s), "
@@ -1063,12 +975,11 @@ class TaskRunner:
     def _decide_round(self, task, budget, used, base_seconds, t0):
         """一步之后问一次大脑。返回 True=循环继续；False=本轮已收尾/挂起。"""
         elapsed = self._elapsed(base_seconds, t0)
-        # 决策点两类预算都要挡: 步数用完时连 finish 都不许落进普通 done 冒充完成。
-        reason = (self._step_budget_reason(budget, used, elapsed)
-                  or self._llm_budget_reason(budget, used, elapsed))
+        # decide 始终受 LLM/时长预算限制；步数只在收尾或执行新步时判定。
+        reason = self._llm_budget_reason(budget, used, elapsed)
         if reason:
-            self._handle_budget_exhaustion(
-                task, budget, used, base_seconds, t0, dynamic=True)
+            self._close_elapsed(used, base_seconds, t0)
+            self._stop_budget(task, reason, budget, used)
             return False
         self._safe_persist(task)   # 真实结果先落盘, 再喂给大脑
         forced = self._forced_route(task)
@@ -1100,6 +1011,12 @@ class TaskRunner:
         kind = out.get("kind")
         seen = task.setdefault("_seen_fingerprints", [])
         if kind == "finish":
+            reason = self._step_budget_reason(
+                budget, used, self._elapsed(base_seconds, t0))
+            if reason and not (reason == "budget_steps" and self._closing_eligible(task)):
+                self._close_elapsed(used, base_seconds, t0)
+                self._stop_budget(task, reason, budget, used)
+                return False
             say = str(out.get("say") or out.get("text") or "").strip()[:2000]
             if not say:
                 self._decide_invalid(task, "收尾结论是空的")
@@ -1110,6 +1027,12 @@ class TaskRunner:
             self._safe_persist(task)
             report_stage()
             self._safe_notify(say, spoken=True)
+            return False
+        reason = self._step_budget_reason(
+            budget, used, self._elapsed(base_seconds, t0))
+        if reason:
+            self._close_elapsed(used, base_seconds, t0)
+            self._stop_budget(task, reason, budget, used)
             return False
         if kind == "ask":
             question = str(out.get("question") or "").strip()[:500]

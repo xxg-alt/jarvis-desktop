@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""收尾裁定回归：步数用尽时，已完成的动态任务仍有一次正式收尾机会。"""
+"""收尾裁定回归：仅放行已完成动态任务的 finish，LLM 预算不豁免。"""
 import copy
 import sys
 from pathlib import Path
@@ -70,7 +70,7 @@ def run_dynamic(outcomes, max_steps, perform=None, persist=None,
     return task, runner, calls
 
 
-# T1: N 次真实步骤打满步数后，closing decide 返回 finish。
+# T1: N 次真实步骤打满步数后，普通 decide 返回 finish。
 try:
     n = 3
     task, _, calls = run_dynamic(
@@ -81,56 +81,65 @@ try:
           and task.get("conclusion") == "N 步都办好了",
           "T1 步数恰好用完时，收尾裁定 finish -> done/finish（修前会是 failed/budget_steps）")
     check(len(calls["perform"]) == n
-          and calls["decide"][-1].get("closing_decide", {}).get("allowed_kinds")
-          == ["finish", "ask"],
-          "T1 只执行 N 步，最后一次 decide 明确是 finish/ask 收尾裁定")
+          and len(calls["decide"]) == n + 1
+          and calls["decide"][-1]["budget"]["remaining_steps"] == 0,
+          "T1 只执行 N 步，最后一次普通 decide 如实看到步数已满")
 finally:
     pass
 
 
-# Closing through the LLM-call gate also accepts finish and ask normally.
+# LLM 预算用尽后不再调用 decide；步数豁免也不能用于 ask。
 try:
     task, _, calls = run_dynamic(
         [next_step(1), {"kind": "finish", "say": "调用预算下完成", "llm_calls": 1}],
         10, max_llm_calls=1)
-    check(task.get("state") == agent_core.STATE_DONE
-          and task.get("stop_reason") == "finish"
-          and task.get("budget_used", {}).get("llm_calls") == 2,
-          "补充：LLM 预算触发的收尾 finish 仍计入真实调用")
+    check(task.get("state") == agent_core.STATE_FAILED
+          and task.get("stop_reason") == "budget_llm"
+          and task.get("budget_used", {}).get("llm_calls") == 1
+          and len(calls["decide"]) == 1,
+          "补充：LLM 预算已满时不再问大脑，不额外调用 finish")
+    check(any("已执行步骤都成功完成" in text and "没能正式收尾" in text
+              and "卡在还没做完" not in text
+              for text, spoken in calls["notify"] if spoken),
+          "补充：LLM 预算退出如实报告步骤已完成、未能正式收尾")
 
     task, _, calls = run_dynamic(
         [next_step(1), {"kind": "ask", "question": "还需要确认哪一项？",
                         "llm_calls": 1}],
         1)
-    check(task.get("state") == agent_core.STATE_WAITING
-          and task.get("pending_question") == "还需要确认哪一项？"
-          and task.get("stop_reason") is None
-          and calls["decide"][-1].get("closing_decide", {}).get("allowed_kinds")
-          == ["finish", "ask"],
-          "补充：收尾 ask 正常挂起等待用户")
+    check(task.get("state") == agent_core.STATE_FAILED
+          and task.get("stop_reason") == "budget_steps"
+          and not task.get("pending_question")
+          and len(calls["decide"]) == 2,
+          "补充：步数已满时 ask 不享受 finish 的收尾放行")
+    check(any("已执行步骤都成功完成" in text and "没能正式收尾" in text
+              and "卡在还没做完" not in text
+              for text, spoken in calls["notify"] if spoken),
+          "补充：步数预算退出保留步骤已完成、未能正式收尾的如实文案")
 finally:
     pass
 
 
-# T2: closing decide 返回 next_step 时，执行层丢弃它并保留原预算失败。
+# T2: 步数满后普通 decide 返回 next_step，新步不执行并落预算失败。
 try:
     n = 2
-    closing = next_step("不该执行")
+    extra_step = next_step("不该执行")
     task, _, calls = run_dynamic(
-        [next_step(i) for i in range(n)] + [closing], n)
+        [next_step(i) for i in range(n)] + [extra_step], n)
     check(task.get("state") == agent_core.STATE_FAILED
           and task.get("stop_reason") == "budget_steps"
-          and len(calls["perform"]) == n,
-          "T2 收尾裁定误派 next_step -> failed/budget_steps，且新步没有执行")
+          and len(calls["perform"]) == n
+          and len(calls["decide"]) == n + 1,
+          "T2 步数满后 next_step -> failed/budget_steps，且新步没有执行")
     check(len(task.get("steps", [])) == n
           and all(step.get("status") == agent_core.STATE_DONE
                   for step in task["steps"]),
-          "T2 收尾裁定的 next_step 没有进入任务步骤账本")
+          "T2 超预算的新步没有进入任务步骤账本")
 finally:
     pass
 
 
-# T3: 最后一步失败时不得用 closing finish 冒充完成。
+# T3: 最后一步失败时不得用 finish 冒充完成。
 try:
     performed = []
 
@@ -145,49 +154,63 @@ try:
           and task.get("stop_reason") == "budget_steps"
           and task.get("conclusion") != "不应收尾"
           and len(performed) == 1,
-          "T3 末步失败且步数打满 -> failed，不给 finish 收尾机会")
-    check(len(calls["decide"]) == 1
-          and "closing_decide" not in calls["decide"][0],
-          "T3 失败步不触发收尾裁定 decide")
+          "T3 末步失败且步数打满 -> failed，finish 不能冒充完成")
+    check(len(calls["decide"]) == 2
+          and calls["decide"][-1]["completed"][-1]["status"] == agent_core.STATE_FAILED,
+          "T3 普通 decide 看到失败结果，返回 finish 仍被步数闸门挡住")
+    check(any("卡在还没做完的地方" in text
+              for text, spoken in calls["notify"] if spoken),
+          "T3 有失败步时仍如实报告未完成")
 finally:
     pass
 
 
-# T4: closing_decide_used 落盘后恢复，不能再次调用 decide；收尾调用照常记账。
+# 有 pending/结果未知/历史失败步时，步数满后的 finish 不能掩盖它们。
 try:
-    persisted = []
-
-    def save(task):
-        persisted.append(copy.deepcopy(task))
-
-    n = 1
-    task, _, first_calls = run_dynamic(
-        [next_step(1), next_step("收尾裁定不许执行")], 10, persist=save,
-        max_llm_calls=1)
-    restored = copy.deepcopy(persisted[-1])
-    second_decides = []
-
-    def should_not_decide(context):
-        second_decides.append(context)
-        return {"kind": "finish", "say": "不该再次调用", "llm_calls": 1}
-
-    runner2, second_calls = build(
-        should_not_decide, budget={"max_steps": 10, "max_llm_calls": 1})
-    runner2._run(restored, 0)
-    check(restored.get("closing_decide_used") is True
-          and not second_decides
-          and restored.get("state") == agent_core.STATE_FAILED
-          and restored.get("stop_reason") == "budget_llm",
-          "T4 恢复后再次预算关停不重复触发 closing decide")
-    check(restored.get("budget_used", {}).get("llm_calls") == n + 1
-          and len(first_calls["decide"]) == n + 1
-          and not second_calls["decide"],
-          "T4 llm_calls 包含收尾裁定那一次调用")
+    for status in (agent_core.STEP_PENDING, agent_core.STEP_STARTED,
+                   agent_core.STEP_UNKNOWN, agent_core.STATE_FAILED):
+        runner, calls = build(
+            lambda context: {"kind": "finish", "say": "不应收尾", "llm_calls": 1},
+            budget={"max_steps": 2})
+        task = agent_core.new_task("未完成步不许收尾", [
+            {"action": "remember", "args": {"n": 1}, "status": status},
+            {"action": "remember", "args": {"n": 2}, "status": agent_core.STATE_DONE},
+        ])
+        task["budget_used"] = {"steps": 2, "llm_calls": 0, "seconds": 0.0}
+        runner._run(task, 0)
+        check(task.get("state") == agent_core.STATE_FAILED
+              and task.get("stop_reason") == "budget_steps"
+              and task["steps"][0]["status"] == status
+              and not calls["perform"]
+              and len(calls["decide"]) == (0 if status == agent_core.STEP_PENDING else 1),
+              f"补充：存在 {status} 步时不得因末步成功就放行 finish，pending 在执行前拦")
 finally:
     pass
 
 
-# T5: dynamic 关闭时不走 closing decide，固定计划仍按预算失败。
+# T4: 步数满后的收尾 decide 照常计入 LLM 调用，不虚报执行步数。
+try:
+    n = 2
+    task, _, calls = run_dynamic(
+        [next_step(i) for i in range(n)]
+        + [{"kind": "finish", "say": "预算内正式收尾", "llm_calls": 1}],
+        n, max_llm_calls=n + 1)
+    check(task.get("state") == agent_core.STATE_DONE
+          and task.get("stop_reason") == "finish"
+          and task.get("budget_used", {}).get("llm_calls") == n + 1
+          and len(calls["decide"]) == n + 1
+          and calls["persist"][-1]["budget_used"]["llm_calls"] == n + 1,
+          "T4 llm_calls 包含步数满后正常获准的那次收尾调用，且已落盘")
+    check(task["budget_used"]["steps"] == n
+          and len(task["steps"]) == n and len(calls["perform"]) == n
+          and calls["decide"][-1]["budget"]["used_steps"] == n
+          and calls["decide"][-1]["budget"]["remaining_llm_calls"] == 1,
+          "T4 收尾只花 LLM 调用，不增加或虚报真实执行步数")
+finally:
+    pass
+
+
+# T5: dynamic 关闭时不调用 decide，固定计划仍按预算失败。
 try:
     calls = {"perform": [], "decide": []}
 
@@ -217,7 +240,7 @@ try:
           and task.get("stop_reason") == "budget_steps"
           and len(calls["perform"]) == 2
           and not calls["decide"],
-          "T5 dynamic 关闭时打满步数仍 failed/budget_steps，不调用 closing decide")
+          "T5 dynamic 关闭时打满步数仍 failed/budget_steps，不调用 decide")
 finally:
     pass
 
