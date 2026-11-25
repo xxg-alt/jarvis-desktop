@@ -220,7 +220,8 @@ def failure_signal_snapshot(perform_signals=None, exception=None, step=None,
     out = {}
     if isinstance(perform_signals, dict):
         for key in ("kind", "code", "errno", "returncode", "http_status",
-                    "verification", "exception_type", "exception", "source"):
+                    "verification", "exception_type", "exception", "source",
+                    "reason_code"):
             if key in perform_signals and perform_signals[key] is not None:
                 out[key] = perform_signals[key]
     if isinstance(verify_signals, dict):
@@ -255,7 +256,7 @@ def classify_failure(signals=None) -> str:
     if key in _VERIFICATION_CATEGORY:
         return _VERIFICATION_CATEGORY[key]
 
-    for name in ("kind", "code"):
+    for name in ("kind", "code", "reason_code"):
         value = str(sig.get(name) or "").strip().lower()
         if value in _SIGNAL_CATEGORY:
             return _SIGNAL_CATEGORY[value]
@@ -486,7 +487,7 @@ class TaskRunner:
         if isinstance(value, (tuple, list)) and len(value) >= 3:
             signals = value[3] if len(value) > 3 and isinstance(value[3], dict) else None
             return value[0], value[1], value[2], signals
-        return False, "", "", {"kind": "execution_failed"}
+        return False, "", "", {"kind": "malformed_outcome"}
 
     def _now(self):
         try:
@@ -621,7 +622,6 @@ class TaskRunner:
             self._safe_persist(task)
             return
         used["evidence"] = self._as_int(used.get("evidence")) + 1
-        used["llm_calls"] = self._as_int(used.get("llm_calls")) + 1
         self._safe_persist(task)
         try:
             raw = self._evidence(task, step, dict(signals or {}))
@@ -634,6 +634,11 @@ class TaskRunner:
             evidence = {"ok": raw[0], "text": raw[1], "skipped": False}
         else:
             evidence = {"ok": bool(raw), "text": str(raw or ""), "skipped": False}
+        actual_calls = evidence.get("llm_calls")
+        if actual_calls is None:
+            actual_calls = 0 if evidence.get("skipped") else 1
+        used["llm_calls"] = (self._as_int(used.get("llm_calls"))
+                             + max(0, self._as_int(actual_calls)))
         self._append_evidence_history(task, step, index, evidence)
         self._safe_persist(task)
 
@@ -660,11 +665,17 @@ class TaskRunner:
             return
         seen.append(key)
         reports["last_report_success"] = successes
-        done = str((step or {}).get("say") or (step or {}).get("action") or "上一步")[:120]
-        pending = next((s for s in task.get("steps") or []
-                        if isinstance(s, dict) and s.get("status") == STEP_PENDING), None)
-        upcoming = str((pending or {}).get("say") or (pending or {}).get("action")
-                       or task.get("next_hint") or "收尾")[:120]
+        done_step = next((s for s in reversed(task.get("steps") or [])
+                          if isinstance(s, dict) and s.get("status") == STATE_DONE), None)
+        done = str((done_step or {}).get("say") or (done_step or {}).get("action")
+                   or "上一步")[:120]
+        upcoming = str((step or {}).get("say") or (step or {}).get("action") or "")
+        if not upcoming:
+            pending = next((s for s in task.get("steps") or []
+                            if isinstance(s, dict) and s.get("status") == STEP_PENDING), None)
+            upcoming = str((pending or {}).get("say") or (pending or {}).get("action")
+                           or task.get("next_hint") or "收尾")
+        upcoming = upcoming[:120]
         text = f"阶段「{label}」：已做完{done}；接下来{upcoming}"
         task["stage_report"] = {"stage": label, "text": text, "at_success": successes}
         self._safe_persist(task)
@@ -679,13 +690,22 @@ class TaskRunner:
             return
         if waiting:
             raw = task.get("waiting_since")
-            since = float(now if raw is None else raw)
+            current = time.time()
+            since = float(current if raw is None else raw)
             kind = "waiting"
         else:
             raw = task.get("last_progress_at")
-            since = float(now if raw is None else raw)
+            current = now
+            since = float(current if raw is None else raw)
+            if since > current:
+                since = current
+                task["last_progress_at"] = current
             kind = "no_progress"
-        waited = now - since
+        waited = current - since
+        if waiting and waited < 0:
+            waited = 0.0
+            task["waiting_since"] = current
+            self._safe_persist(task)
         if waited < threshold:
             return
         detail = str((step or {}).get("say") or (step or {}).get("action")
@@ -959,12 +979,17 @@ class TaskRunner:
         step_stage = raw_step.get("stage") if isinstance(raw_step, dict) else ""
         stage = str(out.get("stage") or out.get("goal_segment") or out.get("phase")
                     or step_stage or "").strip()[:200]
+        stage_changed = False
         if stage:
             task["next_hint"] = str(out.get("next_hint") or out.get("next") or "")[:200]
         if stage and stage != str(task.get("decided_stage") or ""):
             task["decided_stage"] = stage
-            self._stage_report(task, trigger="stage")
+            stage_changed = True
         self._safe_persist(task)
+
+        def report_stage(new_step=None):
+            if stage_changed:
+                self._stage_report(task, step=new_step, trigger="stage")
 
         kind = out.get("kind")
         seen = task.setdefault("_seen_fingerprints", [])
@@ -977,6 +1002,7 @@ class TaskRunner:
             task["stop_reason"] = "finish"
             task["conclusion"] = say
             self._safe_persist(task)
+            report_stage()
             self._safe_notify(say, spoken=True)
             return False
         if kind == "ask":
@@ -992,6 +1018,7 @@ class TaskRunner:
             task["state"] = STATE_WAITING
             task["pending_question"] = question
             self._safe_persist(task)
+            report_stage()
             self._safe_notify(question, spoken=True)
             return False
         if kind == "next_step":
@@ -1008,6 +1035,7 @@ class TaskRunner:
                 return False
             seen.append(fp)
             task.setdefault("steps", []).append(step)
+            report_stage(step)
             self._safe_persist(task)   # 新步先落账, 再走同一条权限闸门
             return True
         self._decide_invalid(task, f"决策结果无法识别({str(kind or '空')[:40]})")
@@ -1032,7 +1060,7 @@ class TaskRunner:
             now = self._now()
             task.setdefault("last_progress_at", now)
             if task.get("state") == STATE_WAITING:
-                task.setdefault("waiting_since", now)
+                task.setdefault("waiting_since", time.time())
             pending_q = str(task.pop("pending_question", "") or "").strip()
             if pending_q:
                 self._append_history(task, {"action": "ask", "args": {}, "say": pending_q},
@@ -1073,7 +1101,7 @@ class TaskRunner:
                     if dynamic:
                         if not self._decide_round(task, budget, used, base_seconds, t0):
                             return
-                        self._stage_report(task)
+                        self._stage_report(task, step=steps[-1] if steps else None)
                         continue
                     break
                 i, step = index, steps[index]
@@ -1082,7 +1110,7 @@ class TaskRunner:
                     task["state"] = STATE_WAITING
                     step["status"] = "waiting"
                     if dynamic:
-                        task.setdefault("waiting_since", self._now())
+                        task.setdefault("waiting_since", time.time())
                         self._close_elapsed(used, base_seconds, t0)
                         self._check_stuck(task, self._now(), budget, step=step,
                                           waiting=True)
@@ -1104,7 +1132,7 @@ class TaskRunner:
                         self._update_action_streak(task, step, True)
                         self._append_history(task, step, i, True,
                                              str(step.get("say") or "已回话"), "")
-                        self._stage_report(task, step=step)
+                        self._stage_report(task)
                     self._safe_persist(task)
                     continue
 

@@ -1925,17 +1925,37 @@ def _agent_visual_verify_hook(task, step, ok, text, tool_text):
 def _agent_failure_evidence(task, step, signals):
     """界面失败后的只读取证: 仍用已有 peek_screen, 不新增动作, 不做任何点击。"""
     if _sensitive_window_hit():
-        return {"ok": False, "skipped": True, "text": "",
+        return {"ok": False, "skipped": True, "text": "", "llm_calls": 0,
                 "reason": "敏感画面跳过取证（护栏未放行）"}
     target = str((step or {}).get("say") or (step or {}).get("action") or "刚才的操作")[:120]
     question = f"界面失败取证：屏幕上实际看到了什么？核验「{target}」是否已生效"
+    counted = {"n": 0}
     try:
-        text = _peek_screen(question, allow_confirm=False,
-                            source=str((task or {}).get("source") or "local"))
+        import llm_brain
+        real_vision = llm_brain.query_vision
+        real_locate = llm_brain.query_vision_locate
+
+        def counted_vision(*a, **kw):
+            counted["n"] += 1
+            return real_vision(*a, **kw)
+
+        def counted_locate(*a, **kw):
+            counted["n"] += 1
+            return real_locate(*a, **kw)
+
+        llm_brain.query_vision = counted_vision
+        llm_brain.query_vision_locate = counted_locate
+        try:
+            text = _peek_screen(question, allow_confirm=False,
+                                source=str((task or {}).get("source") or "local"))
+        finally:
+            llm_brain.query_vision = real_vision
+            llm_brain.query_vision_locate = real_locate
         return {"ok": bool(getattr(_TL, "peek_ok", False)), "skipped": False,
-                "text": str(text or ""), "reason": ""}
+                "text": str(text or ""), "llm_calls": counted["n"], "reason": ""}
     except Exception as exc:
         return {"ok": False, "skipped": True, "text": "",
+                "llm_calls": counted["n"],
                 "reason": f"取证调用异常: {type(exc).__name__}"}
 
 
@@ -1997,6 +2017,89 @@ _RUNNER = agent_core.TaskRunner(
 )
 
 
+def _agent_waiting_stuck_threshold(task=None) -> float:
+    """与 agent_core._stuck_seconds 同口径: stuck_minutes*60, 默认 5 分钟。"""
+    task = task if isinstance(task, dict) else {}
+    raw = task.get("stuck_minutes")
+    if raw is None:
+        budget = task.get("budget")
+        raw = (budget or {}).get("stuck_minutes", agent_core.STUCK_MINUTES)
+    try:
+        return max(0.0, float(raw) * 60.0)
+    except (TypeError, ValueError):
+        return float(agent_core.STUCK_MINUTES) * 60.0
+
+
+def _agent_waiting_stuck_scan(now=None) -> list:
+    """单轮扫描 waiting_user 卡住上报 (看守线程与测试都直接调它)。
+
+    只管等确认这一种卡法: 运行中无进展仍由执行循环里的 _check_stuck 负责。
+    账本改动走加锁的 _agent_update_tasks, 上报只发一次。
+    """
+    current = time.time() if now is None else float(now)
+    notices = []
+
+    def update(data):
+        for task in data.get("tasks", []):
+            if not isinstance(task, dict) or task.get("state") != agent_core.STATE_WAITING:
+                continue
+            if task.get("stuck_reported"):
+                continue
+            threshold = _agent_waiting_stuck_threshold(task)
+            if threshold <= 0:
+                continue
+            try:
+                since = float(task.get("waiting_since"))
+            except (TypeError, ValueError):
+                continue
+            waited = current - since
+            if waited < 0:
+                task["waiting_since"] = current
+                continue
+            if waited < threshold:
+                continue
+            goal = str(task.get("goal") or "")[:60]
+            step = next((s for s in task.get("steps") or []
+                         if isinstance(s, dict) and s.get("status") == "waiting"), None)
+            detail = str((step or {}).get("say") or (step or {}).get("action")
+                         or task.get("pending_question") or "下一步")[:120]
+            text = (f"任务「{goal}」卡在等您确认：{detail}，"
+                    f"已等待 {int(waited // 60)} 分钟，仍在等放行或停止，Sir")
+            task["stuck_reported"] = {"kind": "waiting",
+                                      "waited_seconds": round(waited, 1), "text": text}
+            notices.append(text)
+        return notices
+
+    notices = _agent_update_tasks(update)
+    for text in notices:
+        _agent_notify(text, spoken=True)
+    return notices
+
+
+_AGENT_WAIT_WATCHDOG_THREAD = None
+
+
+def _agent_wait_watchdog_loop():
+    while True:
+        time.sleep(30.0)
+        try:
+            _agent_waiting_stuck_scan()
+        except Exception as exc:
+            print(f"[Agent 等待看守] 扫描失败: {exc}")
+
+
+def _agent_ensure_wait_watchdog():
+    """首个智能体任务启动时惰性拉起一次; 守护线程不拦进程退出。"""
+    global _AGENT_WAIT_WATCHDOG_THREAD
+    thread = _AGENT_WAIT_WATCHDOG_THREAD
+    if thread is not None and thread.is_alive():
+        return
+    thread = threading.Thread(target=_agent_wait_watchdog_loop,
+                              name="agent-wait-watchdog", daemon=True)
+    _AGENT_WAIT_WATCHDOG_THREAD = thread
+    thread.start()
+
+
 def _agent_busy() -> bool:
     return _RUNNER.busy()
 
@@ -2011,6 +2114,7 @@ def _agent_start(task: dict) -> dict:
     started, _gen = _RUNNER.start(task)
     if not started:
         return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
+    _agent_ensure_wait_watchdog()
     total = len(task.get("steps", []))
     return {"say": f"开始执行任务「{task.get('goal', '')}」, 共 {total} 步。要中止就说「停」"}
 

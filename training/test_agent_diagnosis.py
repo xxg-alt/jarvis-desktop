@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 import agent_core
 import jarvis
+import llm_brain
 
 fails = []
 
@@ -379,12 +381,228 @@ try:
     runner._run(task, 0)
     check(task["state"] == agent_core.STATE_WAITING and not spoken(calls, "卡在"),
           "4e 刚挂起时还没到上报阈值, 不提前轰炸")
+    task["waiting_since"] = time.time() - 120.0
     now2["t"] = 120.0
     runner._run(task, 0)
     waiting = spoken(calls, "等您确认")
     check(len(waiting) == 1 and "仍在等放行" in waiting[0]
           and task["stuck_reported"]["kind"] == "waiting",
           "4f 等待确认超时只推一条, 说清卡在哪/等什么")
+finally:
+    pass
+
+
+try:
+    runner, calls = build(script([]))
+    done_step = {"action": "list_dir", "args": {}, "say": "列出文件",
+                 "status": agent_core.STATE_DONE}
+    new_step = {"action": "move_file", "args": {}, "say": "移动图片",
+                "status": agent_core.STEP_PENDING}
+    task = make_task("阶段准确")
+    task["steps"] = [done_step, new_step]
+    task["decided_stage"] = "整理阶段"
+    task["next_hint"] = "旧兜底文案"
+    runner._stage_report(task, step=new_step, trigger="stage")
+    text = (task.get("stage_report") or {}).get("text", "")
+    check("列出文件" in text and "移动图片" in text and "旧兜底文案" not in text,
+          "修1a 阶段汇报用最后完成步说已做完、用传入新步说接下来, 不再兜底糊弄")
+    check(any(t == text and flag for t, flag in calls["notify"]),
+          "修1a 汇报仍走既有播报通道")
+
+    def stage_decide(context):
+        return {"kind": "next_step", "llm_calls": 1, "stage": "搬运阶段",
+                "step": {"action": "move_file", "args": {}, "say": "移动图片"}}
+
+    runner2, calls2 = build(stage_decide)
+    task2 = make_task("阶段切换", [{"action": "list_dir", "args": {}, "say": "列出文件"}])
+    runner2._run(task2, 0)
+    stage_texts = [t for t, flag in calls2["notify"]
+                   if flag and t.startswith("阶段「")]
+    check(any("列出文件" in t and "移动图片" in t for t in stage_texts),
+          "修1b 阶段切换在新步确定后发出, 文案同时含已完成步与新步")
+finally:
+    pass
+
+
+try:
+    old_path, old_notify = jarvis.AGENT_TASKS_PATH, jarvis._agent_notify
+    notices = []
+    jarvis.AGENT_TASKS_PATH = LEDGER
+    jarvis._agent_notify = lambda text, spoken=False: notices.append((text, spoken))
+    try:
+        stuck_task = {"goal": "等确认任务", "state": "waiting_user", "source": "local",
+                      "waiting_since": time.time() - 400,
+                      "steps": [{"action": "move_file", "args": {"src": "a", "dst": "b"},
+                                 "say": "移动图片", "status": "waiting"}]}
+        LEDGER.write_text(json.dumps({"tasks": [stuck_task]}, ensure_ascii=False),
+                          encoding="utf-8")
+        first = jarvis._agent_waiting_stuck_scan()
+        saved = json.loads(LEDGER.read_text(encoding="utf-8"))["tasks"][0]
+        check(len(first) == 1 and "等确认任务" in first[0] and "移动图片" in first[0]
+              and bool(notices) and notices[-1] == (first[0], True),
+              "修2a 看守扫到超时 waiting_user 任务, 经 _agent_notify 播报目标与在等什么")
+        check(saved.get("stuck_reported", {}).get("kind") == "waiting",
+              "修2a 卡住标记随账本落盘")
+        check(not jarvis._agent_waiting_stuck_scan() and len(notices) == 1,
+              "修2b 再扫一轮不重复上报")
+
+        fresh = json.loads(LEDGER.read_text(encoding="utf-8"))
+        fresh["tasks"].append({"goal": "刚等上", "state": "waiting_user", "source": "local",
+                               "waiting_since": time.time() - 10,
+                               "steps": [{"action": "move_file", "args": {},
+                                          "say": "刚挂起", "status": "waiting"}]})
+        LEDGER.write_text(json.dumps(fresh, ensure_ascii=False), encoding="utf-8")
+        check(not jarvis._agent_waiting_stuck_scan() and len(notices) == 1,
+              "修2c 只等了 10 秒的 waiting_user 任务不上报")
+
+        off = json.loads(LEDGER.read_text(encoding="utf-8"))
+        off["tasks"].append({"goal": "阈值关闭", "state": "waiting_user", "source": "local",
+                             "waiting_since": time.time() - 400, "stuck_minutes": 0,
+                             "steps": [{"action": "move_file", "args": {},
+                                        "say": "关阈值", "status": "waiting"}]})
+        LEDGER.write_text(json.dumps(off, ensure_ascii=False), encoding="utf-8")
+        check(not jarvis._agent_waiting_stuck_scan() and len(notices) == 1,
+              "修2c 卡住阈值<=0 时不启用")
+    finally:
+        jarvis.AGENT_TASKS_PATH, jarvis._agent_notify = old_path, old_notify
+finally:
+    pass
+
+try:
+    jarvis._agent_ensure_wait_watchdog()
+    watchdog = jarvis._AGENT_WAIT_WATCHDOG_THREAD
+    check(watchdog is not None and watchdog.is_alive() and watchdog.daemon
+          and watchdog.name == "agent-wait-watchdog",
+          "修2d 看守线程惰性启动且为 daemon, 每 30 秒一轮")
+finally:
+    pass
+
+
+try:
+    ui_step = {"action": "click_screen", "args": {}, "say": "点保存"}
+
+    def counted_evidence(task, step, signals):
+        return {"ok": True, "skipped": False, "text": "三次视觉", "llm_calls": 3}
+
+    runner, calls = build(script([]), evidence=counted_evidence)
+    used = {"evidence": 0, "llm_calls": 0}
+    runner._maybe_evidence(make_task("次数记账"), ui_step, 0,
+                           agent_core.FAILURE_UI_UNEXPECTED, {}, {}, used,
+                           0.0, time.monotonic(), True)
+    check(used["evidence"] == 1 and used["llm_calls"] == 3,
+          "修3a 取证按回调实际调用数记账(+3), 取证次数仍按次计")
+
+    def skipped_evidence(task, step, signals):
+        return {"ok": False, "skipped": True, "text": "", "llm_calls": 0,
+                "reason": "敏感画面跳过"}
+
+    runner2, calls2 = build(script([]), evidence=skipped_evidence)
+    used2 = {"evidence": 0, "llm_calls": 0}
+    runner2._maybe_evidence(make_task("跳过记账"), ui_step, 0,
+                            agent_core.FAILURE_UI_UNEXPECTED, {}, {}, used2,
+                            0.0, time.monotonic(), True)
+    check(used2["evidence"] == 1 and used2["llm_calls"] == 0,
+          "修3b 回调报 skipped+llm_calls=0 时不加调用数")
+
+    old_vision, old_locate = llm_brain.query_vision, llm_brain.query_vision_locate
+    old_hit, old_peek = jarvis._sensitive_window_hit, jarvis._peek_screen
+    try:
+        jarvis._sensitive_window_hit = lambda: False
+        fake_vision = lambda *a, **kw: "一遍"
+        fake_locate = lambda *a, **kw: "定位"
+        llm_brain.query_vision = fake_vision
+        llm_brain.query_vision_locate = fake_locate
+
+        def fake_peek(*a, **kw):
+            jarvis._TL.peek_ok = True
+            llm_brain.query_vision("一遍", "b64", {})
+            llm_brain.query_vision_locate("定位", "b64", {})
+            llm_brain.query_vision("二遍", "b64", {})
+            return "三次调用"
+
+        jarvis._peek_screen = fake_peek
+        out = jarvis._agent_failure_evidence({"source": "local"}, ui_step, {})
+        check(out.get("llm_calls") == 3 and not out.get("skipped"),
+              "修3c 取证回调统计 _peek_screen 期间的真实视觉调用次数")
+        check(llm_brain.query_vision is fake_vision
+              and llm_brain.query_vision_locate is fake_locate,
+              "修3c 计数包装用完还原, 不污染全局")
+    finally:
+        jarvis._sensitive_window_hit, jarvis._peek_screen = old_hit, old_peek
+        llm_brain.query_vision, llm_brain.query_vision_locate = old_vision, old_locate
+finally:
+    pass
+
+
+try:
+    reason = "permission_denied"
+    snap = agent_core.failure_signal_snapshot(perform_signals={"reason_code": reason})
+    check(snap.get("reason_code") == reason,
+          "修4a reason_code 进了失败信号快照")
+    check(agent_core.classify_failure(snap) == agent_core.FAILURE_PERMISSION_DENIED,
+          "修4a 只带 reason_code 的失败信号也能分出对应类别")
+    check(agent_core.classify_failure({"result_text": "权限被拒、文件不存在"})
+          == agent_core.FAILURE_UNKNOWN,
+          "修4b 只有普通话术文本仍判未知, 不按文本猜")
+finally:
+    pass
+
+
+try:
+    ok, text, tool_text, signals = agent_core.TaskRunner._unpack_outcome("垃圾")
+    check((ok, text, tool_text) == (False, "", "")
+          and signals.get("kind") == "malformed_outcome"
+          and signals.get("kind") not in agent_core._SIGNAL_CATEGORY,
+          "修5a 解包无效结果不再伪造 execution_failed 信号")
+    check(agent_core.classify_failure(signals) == agent_core.FAILURE_UNKNOWN,
+          "修5a 无其他真实信号时落到未知")
+    ok2, _, _, real = agent_core.TaskRunner._unpack_outcome(
+        (False, "失败", "", {"kind": "execution_failed"}))
+    check(agent_core.classify_failure(real) == agent_core.FAILURE_ACTION,
+          "修5b 执行器真给的 kind 仍按原类别分")
+finally:
+    pass
+
+
+try:
+    runner, calls = build(script([]), clock=lambda: 12345.0, stuck_minutes=5)
+    task = make_task("墙钟等待")
+    task["waiting_since"] = time.time() - 400
+    runner._check_stuck(task, 12345.0, {}, waiting=True)
+    check(task.get("stuck_reported", {}).get("kind") == "waiting"
+          and any("等您确认" in t for t, flag in calls["notify"] if flag),
+          "修6a 墙钟 waiting_since 400 秒前、阈值 300 秒时触发等待卡住上报")
+
+    runner2, calls2 = build(script([]), clock=lambda: 9876543.0, stuck_minutes=5)
+    task2 = make_task("单调无关")
+    task2["waiting_since"] = time.time() - 400
+    runner2._check_stuck(task2, 9876543.0, {}, waiting=True)
+    check(task2.get("stuck_reported", {}).get("kind") == "waiting",
+          "修6b 注入的单调 now 取任意值都不影响等待判断")
+
+    runner3, calls3 = build(script([]), clock=lambda: 1.0, stuck_minutes=5)
+    task3 = make_task("时钟拨回")
+    future = time.time() + 60
+    task3["waiting_since"] = future
+    runner3._check_stuck(task3, 1.0, {}, waiting=True)
+    check(not task3.get("stuck_reported")
+          and abs(task3["waiting_since"] - time.time()) < 5,
+          "修6b 墙钟被拨回按刚开始等处理并刷新基线")
+
+    runner4, calls4 = build(script([]), clock=lambda: 10.0, stuck_minutes=1)
+    task4 = make_task("恢复无进展")
+    task4["last_progress_at"] = 1e9
+    runner4._check_stuck(task4, 10.0, {}, waiting=False)
+    check(not task4.get("stuck_reported") and task4.get("last_progress_at") == 10.0,
+          "修6b 落盘恢复的单调基线超前时重置后再算无进展")
+
+    runner5, calls5 = build(script([]), clock=lambda: 1000.0,
+                            stuck_minutes=5, ask_actions=("move_file",))
+    task5 = make_task("挂起存墙钟",
+                      [{"action": "move_file", "args": {}, "say": "移动图片"}])
+    runner5._run(task5, 0)
+    check(abs(task5["waiting_since"] - time.time()) < 5,
+          "修6a 挂起时 waiting_since 存的是墙钟, 不是注入的单调时钟")
 finally:
     pass
 
