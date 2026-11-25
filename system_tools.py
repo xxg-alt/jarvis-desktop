@@ -364,6 +364,31 @@ def write_file(path=None, name=None, content=None, folder=None,
 
 
 def move_file(src=None, dst=None, overwrite=False) -> dict:
+    """把白名单内的文件移动到指定目录(目录不存在自动建)。
+
+    src 可以是单个路径, 也可以是路径列表(同类文件一次多移, 一次确认):
+    列表时逐个搬, 全部成功才算成功, 结果里逐项交代。
+    """
+    if isinstance(src, (list, tuple)):
+        items = [s for s in src if str(s or "").strip()]
+        if not items:
+            return _result(False, "没给我要移动的文件。")
+        if len(items) > 50:
+            # 与 sanitize 同口径的兜底: 超量整批拒绝, 一个都不动,
+            # 绝不出现"移了一部分却报全成功"。
+            return _result(False, "一次移动的文件超过 50 个，请分批处理，这次一个都没动。")
+        if len(items) == 1:
+            return _move_one_file(items[0], dst, overwrite=overwrite)
+        results = [_move_one_file(s, dst, overwrite=overwrite) for s in items]
+        ok_all = all(r.get("ok") for r in results)
+        detail = "；".join(str(r.get("summary") or "") for r in results)
+        return _result(ok_all,
+                       f"批量移动 {len(items)} 个文件" + ("完成" if ok_all else "未全部完成") + f"：{detail}",
+                       {"action": "move_batch", "count": len(items)}, danger=True)
+    return _move_one_file(src, dst, overwrite=overwrite)
+
+
+def _move_one_file(src=None, dst=None, overwrite=False) -> dict:
     source = _inside(src)
     if source is None:
         return _result(False, "源文件不在授权目录里，我不动。")
