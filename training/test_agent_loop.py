@@ -664,15 +664,31 @@ try:
           and "假装完成" not in task.get("conclusion", ""),
           "13c 三步成功后因 LLM 预算退出: 落失败+原因, 不冒充普通 done")
 
-    runner, calls = build(script([{"kind": "finish", "say": "假装完成", "llm_calls": 1}]),
+    runner, calls = build(script([{"kind": "finish", "say": "两步完成", "llm_calls": 1}]),
                           budget={"max_steps": 2})
-    task = make_task("步数满后不收尾", [
+    task = make_task("步数满后正常收尾", [
+        {"action": "web_search", "args": {"query": "一"}, "say": "一"},
+        {"action": "web_search", "args": {"query": "二"}, "say": "二"}])
+    runner._run(task, 0)
+    check(task["state"] == "done" and task.get("stop_reason") == "finish"
+          and task.get("conclusion") == "两步完成"
+          and len(calls["perform"]) == 2 and len(calls["decide"]) == 1,
+          "13d 两步都成功且步数预算已满后 decide 给 finish, 正常落 done/finish")
+
+    def fail_last_step(step, task=None):
+        return step["args"]["query"] != "二", "最后一步失败", ""
+
+    runner, calls = build(script([{"kind": "finish", "say": "假装完成", "llm_calls": 1}]),
+                          perform=fail_last_step, budget={"max_steps": 2})
+    task = make_task("末步失败不许收尾", [
         {"action": "web_search", "args": {"query": "一"}, "say": "一"},
         {"action": "web_search", "args": {"query": "二"}, "say": "二"}])
     runner._run(task, 0)
     check(task["state"] == "failed" and task.get("stop_reason") == "budget_steps"
+          and [step["status"] for step in task["steps"]] == ["done", "failed"]
+          and len(calls["decide"]) == 1
           and "假装完成" not in task.get("conclusion", ""),
-          "13d 步数预算已满后 decide 即使给 finish, 也不许落普通 done")
+          "13e 末步失败且步数预算已满后 decide 给 finish, 仍落 failed/budget_steps")
 finally:
     pass
 
