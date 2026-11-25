@@ -316,6 +316,9 @@ AGENT_DECIDE_SYSTEM = """你是桌面助手贾维斯的多步任务大脑。用�
 {"kind":"ask","question":"确实需要用户本人回答的中文问题"}
 {"kind":"finish","say":"给用户的收尾结论"}
 规则：
+- 先看类别再选下一步：每步失败都有 failure_classification（失败类别+真实信号来源+界面取证结论），按类别换招；拿不到信号标未知，不许无类别盲重试。
+- forced_route 非空时，只准在「换类别/问用户/收尾报告」里选：换类别要给不同 action 的下一步，问用户给 ask，收尾给 finish；同类 action 连续失败 2 次后禁止第三次同类尝试。
+- 阶段切换时在输出里带 stage（目标段落名）和可选的 next_hint；每完成 3 步也会报一次阶段进展，同阶段不重复汇报。
 - 一次只给一步，且必须与目标直接相关；同样的动作+同样的参数已经做过就不许再做，系统会在第 2 次出现时判打转并强制收尾。
 - 只能用白名单动作：chat, open_app, open_file, open_url, web_search, web_read, list_dir, read_file, move_file, delete_file, write_file, inspect_system, run_powershell(只读命令), ask_doc, screenshot, peek_screen, click_screen, remember, forget_memory。
 - 参数要齐全：open_app 给 exe 和 name；read_file 给 path，list_dir 给 folder（可省略），move_file 给 src（完整路径，同类文件可给多个一次多移、一次至多 50 个）和 dst（目标目录，目录不存在会自动创建，不要写成文件路径），delete_file 给 path，web_read 给 url，write_file 给 name 和完整 content，web_search 给 query。缺参数的步会被系统剔除，等于没有可执行下一步。
@@ -349,6 +352,10 @@ def _agent_decide(context):
         "recent_entities": ctx.get("recent_entities", ""),
         "source": ctx.get("source", ""),
         "pending_question": ctx.get("pending_question", ""),
+        "failure_classification": ctx.get("failure_classification") or {},
+        "forced_route": ctx.get("forced_route") or {},
+        "stage": ctx.get("stage", ""),
+        "next_hint": ctx.get("next_hint", ""),
     }, ensure_ascii=False, default=str)[:6000]
     messages = [
         {"role": "system", "content": AGENT_DECIDE_SYSTEM},
@@ -1868,6 +1875,7 @@ def _agent_perform(step, task=None):
     """
     _TL.action_ok = False
     _TL.last_tool_text = ""      # 不把上一步的回读带到这一步, 免得误触发视觉核实
+    _TL.last_failure_signal = {}
     if step.get("status") == AGENT_STEP_REBUILD or step.get("redacted"):
         return False, "这一步已标为待用户重建：参数在保存时被脱敏，需要您重新说明后才能执行，Sir", ""
     # started 是"本次调用执行器时"的正常状态; 恢复层已把它转成 unknown, 这里只挡 unknown。
@@ -1890,7 +1898,20 @@ def _agent_perform(step, task=None):
             accepts_source = False
         text = (_perform_plan(plan, source=src) if accepts_source
                 else _perform_plan(plan))
-        return bool(getattr(_TL, "action_ok", False)), text, getattr(_TL, "last_tool_text", "")
+        ok = bool(getattr(_TL, "action_ok", False))
+        signals = {}
+        if not ok:
+            structured = getattr(_TL, "last_failure_signal", None)
+            if isinstance(structured, dict):
+                signals.update(structured)
+            verify = str(getattr(_TL, "open_app_verify", "") or "")
+            if verify == "fail":
+                signals["kind"] = "action_failed"
+        if ok:
+            step.pop("failure_signal", None)
+        else:
+            step["failure_signal"] = signals
+        return ok, text, getattr(_TL, "last_tool_text", "")
     finally:
         _TL.agent_context = False
         _TL.agent_external_ok = False
@@ -1911,6 +1932,43 @@ def _agent_repair_wrapper(task, step, error_text):
 def _agent_visual_verify_hook(task, step, ok, text, tool_text):
     """状态机的回读钩子: 晚绑定到视觉核实实现 (实现在看屏段落, 测试可整体替换)。"""
     return _agent_visual_verify(task, step, ok, text, tool_text)
+
+
+def _agent_failure_evidence(task, step, signals):
+    """界面失败后的只读取证: 仍用已有 peek_screen, 不新增动作, 不做任何点击。"""
+    if _sensitive_window_hit():
+        return {"ok": False, "skipped": True, "text": "", "llm_calls": 0,
+                "reason": "敏感画面跳过取证（护栏未放行）"}
+    target = str((step or {}).get("say") or (step or {}).get("action") or "刚才的操作")[:120]
+    question = f"界面失败取证：屏幕上实际看到了什么？核验「{target}」是否已生效"
+    counted = {"n": 0}
+    try:
+        import llm_brain
+        real_vision = llm_brain.query_vision
+        real_locate = llm_brain.query_vision_locate
+
+        def counted_vision(*a, **kw):
+            counted["n"] += 1
+            return real_vision(*a, **kw)
+
+        def counted_locate(*a, **kw):
+            counted["n"] += 1
+            return real_locate(*a, **kw)
+
+        llm_brain.query_vision = counted_vision
+        llm_brain.query_vision_locate = counted_locate
+        try:
+            text = _peek_screen(question, allow_confirm=False,
+                                source=str((task or {}).get("source") or "local"))
+        finally:
+            llm_brain.query_vision = real_vision
+            llm_brain.query_vision_locate = real_locate
+        return {"ok": bool(getattr(_TL, "peek_ok", False)), "skipped": False,
+                "text": str(text or ""), "llm_calls": counted["n"], "reason": ""}
+    except Exception as exc:
+        return {"ok": False, "skipped": True, "text": "",
+                "llm_calls": counted["n"],
+                "reason": f"取证调用异常: {type(exc).__name__}"}
 
 
 # ---------- 语音识别置信度闸门 ----------
@@ -1962,12 +2020,96 @@ _RUNNER = agent_core.TaskRunner(
     pre_write=_agent_pre_write,
     repair=_agent_repair_wrapper,
     verify=_agent_visual_verify_hook,
+    evidence=_agent_failure_evidence,
     guard_text=_agent_guard_text,
     decide=_agent_decide,
     sanitize=_agent_sanitize_step,
     context=_agent_decide_context,
     dynamic=_agent_dynamic_enabled,
 )
+
+
+def _agent_waiting_stuck_threshold(task=None) -> float:
+    """与 agent_core._stuck_seconds 同口径: stuck_minutes*60, 默认 5 分钟。"""
+    task = task if isinstance(task, dict) else {}
+    raw = task.get("stuck_minutes")
+    if raw is None:
+        budget = task.get("budget")
+        raw = (budget or {}).get("stuck_minutes", agent_core.STUCK_MINUTES)
+    try:
+        return max(0.0, float(raw) * 60.0)
+    except (TypeError, ValueError):
+        return float(agent_core.STUCK_MINUTES) * 60.0
+
+
+def _agent_waiting_stuck_scan(now=None) -> list:
+    """单轮扫描 waiting_user 卡住上报 (看守线程与测试都直接调它)。
+
+    只管等确认这一种卡法: 运行中无进展仍由执行循环里的 _check_stuck 负责。
+    账本改动走加锁的 _agent_update_tasks, 上报只发一次。
+    """
+    current = time.time() if now is None else float(now)
+    notices = []
+
+    def update(data):
+        for task in data.get("tasks", []):
+            if not isinstance(task, dict) or task.get("state") != agent_core.STATE_WAITING:
+                continue
+            if task.get("stuck_reported"):
+                continue
+            threshold = _agent_waiting_stuck_threshold(task)
+            if threshold <= 0:
+                continue
+            try:
+                since = float(task.get("waiting_since"))
+            except (TypeError, ValueError):
+                continue
+            waited = current - since
+            if waited < 0:
+                task["waiting_since"] = current
+                continue
+            if waited < threshold:
+                continue
+            goal = str(task.get("goal") or "")[:60]
+            step = next((s for s in task.get("steps") or []
+                         if isinstance(s, dict) and s.get("status") == "waiting"), None)
+            detail = str((step or {}).get("say") or (step or {}).get("action")
+                         or task.get("pending_question") or "下一步")[:120]
+            text = (f"任务「{goal}」卡在等您确认：{detail}，"
+                    f"已等待 {int(waited // 60)} 分钟，仍在等放行或停止，Sir")
+            task["stuck_reported"] = {"kind": "waiting",
+                                      "waited_seconds": round(waited, 1), "text": text}
+            notices.append(text)
+        return notices
+
+    notices = _agent_update_tasks(update)
+    for text in notices:
+        _agent_notify(text, spoken=True)
+    return notices
+
+
+_AGENT_WAIT_WATCHDOG_THREAD = None
+
+
+def _agent_wait_watchdog_loop():
+    while True:
+        time.sleep(30.0)
+        try:
+            _agent_waiting_stuck_scan()
+        except Exception as exc:
+            print(f"[Agent 等待看守] 扫描失败: {exc}")
+
+
+def _agent_ensure_wait_watchdog():
+    """首个智能体任务启动时惰性拉起一次; 守护线程不拦进程退出。"""
+    global _AGENT_WAIT_WATCHDOG_THREAD
+    thread = _AGENT_WAIT_WATCHDOG_THREAD
+    if thread is not None and thread.is_alive():
+        return
+    thread = threading.Thread(target=_agent_wait_watchdog_loop,
+                              name="agent-wait-watchdog", daemon=True)
+    _AGENT_WAIT_WATCHDOG_THREAD = thread
+    thread.start()
 
 
 def _agent_busy() -> bool:
@@ -1984,6 +2126,7 @@ def _agent_start(task: dict) -> dict:
     started, _gen = _RUNNER.start(task)
     if not started:
         return {"say": "已经有一个任务在跑了, 说「停」可以先停掉它"}
+    _agent_ensure_wait_watchdog()
     total = len(task.get("steps", []))
     return {"say": f"开始执行任务「{task.get('goal', '')}」, 共 {total} 步。要中止就说「停」"}
 
@@ -4931,6 +5074,7 @@ def _perform_plan(plan, source=""):
                     else:
                         err = (proc.stderr or proc.stdout or "").strip()
                         fail_reason = f"taskkill返回码{rc}" + (f": {err[:120]}" if err else "")
+                        _TL.last_failure_signal = {"returncode": rc}
                         print(f"[关闭程序失败] {exe}: {fail_reason}")
                 except Exception as exc:
                     fail_reason = str(exc)
@@ -5021,6 +5165,11 @@ def _perform_plan(plan, source=""):
                     res = run_powershell(args.get("command"))
 
                 _TL.action_ok = bool(res.get("ok"))
+                if not _TL.action_ok and isinstance(res, dict):
+                    _TL.last_failure_signal = {
+                        k: res[k] for k in ("errno", "code", "reason_code", "http_status")
+                        if k in res and isinstance(res[k], (int, str))
+                    }
                 if _TL.action_ok:
                     say = _format_tool_say(action, res)
                     _TL.last_tool_text = _tool_data_text(action, res)
@@ -5196,6 +5345,11 @@ def _perform_plan(plan, source=""):
     except Exception as e:
         say = f"执行失败了: {e}"
         _TL.action_ok = False
+        err = getattr(e, "errno", None)
+        _TL.last_failure_signal = {
+            "exception_type": type(e).__name__,
+            **({"errno": err} if isinstance(err, int) else {}),
+        }
         print(f"[执行失败] {action}: {e}")
     if action == "open_app":
         action_ok = bool(getattr(_TL, "action_ok", True))
